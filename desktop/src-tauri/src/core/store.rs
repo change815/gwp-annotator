@@ -91,9 +91,7 @@ impl Store {
         fs::create_dir_all(&requested_work_root)?;
         let work_root = fs::canonicalize(&requested_work_root)?;
         let work_root_metadata = fs::symlink_metadata(&work_root)?;
-        if is_link_or_reparse(&work_root_metadata.file_type())
-            || !work_root_metadata.file_type().is_dir()
-        {
+        if is_link_or_reparse(&work_root_metadata) || !work_root_metadata.file_type().is_dir() {
             return Err(CoreError::UnsafeDerivedPath);
         }
         let database_paths = DatabasePaths::in_work_root(&work_root);
@@ -444,7 +442,7 @@ impl Store {
 
         let metadata = fs::symlink_metadata(path)?;
         let file_type = metadata.file_type();
-        if is_link_or_reparse(&file_type) || !file_type.is_dir() {
+        if is_link_or_reparse(&metadata) || !file_type.is_dir() {
             return Err(CoreError::UnsafeDerivedPath);
         }
         self.resolved_parent_within_work_root(path).map(|_| ())
@@ -462,7 +460,7 @@ impl Store {
         match fs::symlink_metadata(destination) {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
-                if is_link_or_reparse(&file_type) || !file_type.is_file() {
+                if is_link_or_reparse(&metadata) || !file_type.is_file() {
                     return Err(CoreError::UnsafeDerivedPath);
                 }
                 Ok(())
@@ -530,7 +528,7 @@ fn ensure_safe_database_file(path: &Path) -> CoreResult<()> {
 
 fn validate_database_file_metadata(metadata: &fs::Metadata) -> CoreResult<()> {
     let file_type = metadata.file_type();
-    if is_link_or_reparse(&file_type) || !file_type.is_file() {
+    if is_link_or_reparse(metadata) || !file_type.is_file() {
         return Err(CoreError::UnsafeDerivedPath);
     }
     Ok(())
@@ -554,7 +552,7 @@ fn replace_temp_file_windows(temporary: &Path, destination: &Path) -> CoreResult
     let destination_exists = match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
-            if is_link_or_reparse(&file_type) || !file_type.is_file() {
+            if is_link_or_reparse(&metadata) || !file_type.is_file() {
                 return Err(CoreError::UnsafeDerivedPath);
             }
             true
@@ -807,16 +805,17 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn is_link_or_reparse(file_type: &fs::FileType) -> bool {
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    let file_type = metadata.file_type();
     if file_type.is_symlink() {
         return true;
     }
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::FileTypeExt;
+        use std::os::windows::fs::MetadataExt;
 
-        file_type.is_reparse_point()
+        metadata.file_attributes() & 0x400 != 0
     }
 
     #[cfg(not(windows))]
