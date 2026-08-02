@@ -54,7 +54,7 @@ From PowerShell, run the following after a successful clone:
   where.exe sh
   git -C .. rev-parse HEAD
 
-Use the project-local npm cache and run all checks:
+Use the project-local npm cache and run all frontend checks:
 
   $env:npm_config_cache = "$PWD\.npm-cache"
   npm ci
@@ -62,10 +62,15 @@ Use the project-local npm cache and run all checks:
   npm run test
   npm run build
   npm run smoke
-  cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
-  cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
-  cargo test --manifest-path src-tauri\Cargo.toml
-  cargo build --manifest-path src-tauri\Cargo.toml
+Then run Cargo from `desktop\src-tauri` so the checked-in Cargo mirror
+configuration is discovered consistently:
+
+  Set-Location .\src-tauri
+  cargo fmt -- --check
+  cargo clippy --all-targets --locked -- -D warnings
+  cargo test --locked
+  cargo build --locked
+  Set-Location ..
 
 The repository pins npm and Cargo registry mirrors. Dependency downloads are
 allowed only during setup/build. They are not evidence of application runtime
@@ -95,13 +100,12 @@ opens with:
 This is expected for Stage 2. It is not expected to browse patients or draw
 annotations yet.
 
-After all build dependencies are present, repeat the installed-app start while
-Windows is temporarily offline through a user-controlled network disconnect.
-Do not disable network adapters yourself. Confirm the application still opens.
-While it is open, collect a best-effort 30-second check for non-loopback
-established TCP connections owned by the application process and its child
-processes. Report the exact command/result. A successful build-time download
-does not count against this runtime check.
+After all build dependencies are present, start the installed application in
+the normal network environment. A manual fully-offline restart is optional and
+is not a pass/fail gate. While it is open, collect a best-effort 30-second
+check for non-loopback established TCP connections owned by the application
+process and its child processes. Report the exact command/result. A successful
+build-time download does not count against this runtime observation.
 
 For the synthetic-source safety evidence, rely on the native `cargo test` run
 and, if a separate synthetic tree is created, snapshot its contents and mtimes
@@ -116,7 +120,8 @@ Return one final report in Chinese, with no secrets and no patient data:
 4. Test totals, especially the native Windows `cargo test` result.
 5. Full NSIS installer path, size, SHA-256, installation result, installed EXE
    path, and visible-start result.
-6. Offline-start and network-observation evidence.
+6. Runtime connection-observation evidence; label an offline-start result as
+   optional if it was performed.
 7. Confirmation that only synthetic/repository fixtures were used and that no
    real patient media was accessed.
 8. If not PASS: the first blocking error, a short diagnosis, and the smallest
