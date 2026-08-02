@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="GWP">
+  <rect width="512" height="512" rx="96" fill="#1d4d6d"/>
+  <path d="M132 124h248v76h-58v-24H190v160h132v-52h58v104H132z" fill="#f7fbff"/>
+  <circle cx="350" cy="256" r="34" fill="#7ed0bb"/>
+</svg>

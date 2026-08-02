@@ -1,0 +1,48 @@
+# Patient source media must never enter version control.
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.dcm
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Common local data-root names. Keep clinical source directories outside this repository.
+/data/
+/dataset/
+/datasets/
+/media/
+/patient-data/
+/patients/
+/source-media/
+/cases/
+
+# Application work data and generated exports.
+annotations.sqlite3
+annotations.sqlite3-journal
+annotations.sqlite3-wal
+annotations.sqlite3-shm
+*.sqlite
+*.sqlite3
+captures/
+thumbnails/
+recovery/
+exports/
+
+# JavaScript, Rust, and Tauri build state.
+node_modules/
+dist/
+.npm-cache/
+.local-rust/
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Editor and operating-system files.
+.DS_Store
+Thumbs.db
+*.log
