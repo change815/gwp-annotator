@@ -70,6 +70,15 @@ pub struct RegionDraft {
     pub labels: BTreeMap<String, LabelValue>,
 }
 
+/// Saved drawing geometry contains only opaque IDs and normalized points, never source paths or
+/// display labels. It is safe to expose to the active local UI session.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SavedRegion {
+    pub region_id: String,
+    pub asset_id: String,
+    pub polygon_norm: Vec<PointNorm>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveFault {
     None,
@@ -319,6 +328,19 @@ impl Store {
         Ok(count as usize)
     }
 
+    pub(crate) fn representative_asset_ids(&self, case_id: &str) -> CoreResult<Vec<String>> {
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT asset_id FROM representative_assets WHERE case_id = ?1 ORDER BY selected_at ASC, asset_id ASC",
+        )?;
+        let rows = statement.query_map(params![case_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
+    }
+
     pub(crate) fn recorded_representative_count(&self, case_id: &str) -> CoreResult<usize> {
         self.verify_database_artifacts_safe()?;
         let connection = self
@@ -339,6 +361,40 @@ impl Store {
 
     pub(crate) fn region_label_count(&self) -> CoreResult<usize> {
         self.count_rows("region_label_values")
+    }
+
+    pub(crate) fn saved_regions_for_asset(&self, asset_id: &str) -> CoreResult<Vec<SavedRegion>> {
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT region_id, asset_id, polygon_norm_json
+             FROM regions
+             WHERE asset_id = ?1
+             ORDER BY created_at ASC, region_id ASC",
+        )?;
+        let rows = statement.query_map(params![asset_id], |row| {
+            let polygon_json: String = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                polygon_json,
+            ))
+        })?;
+        let mut regions = Vec::new();
+        for row in rows {
+            let (region_id, asset_id, polygon_json) = row?;
+            let polygon_norm =
+                serde_json::from_str(&polygon_json).map_err(|_| CoreError::Database)?;
+            regions.push(SavedRegion {
+                region_id,
+                asset_id,
+                polygon_norm,
+            });
+        }
+        Ok(regions)
     }
 
     pub(crate) fn template_snapshot_json(

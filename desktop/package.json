@@ -21,6 +21,9 @@
     "rust:check:windows": "sh scripts/check-windows-target.sh",
     "tauri:package": "sh scripts/with-local-tauri.sh build --bundles app"
   },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.0"
+  },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",
     "jsdom": "^26.1.0",

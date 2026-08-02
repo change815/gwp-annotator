@@ -18,6 +18,8 @@ pub enum CoreError {
     UnknownSessionItem,
     #[error("only image assets can be representative")]
     NotImageAsset,
+    #[error("source image is unsafe to open")]
+    UnsafeSourceAsset,
     #[error("a case can contain no more than two representative assets")]
     RepresentativeLimit,
     #[error("the asset is not currently selected as a representative asset")]

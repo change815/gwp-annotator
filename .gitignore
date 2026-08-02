@@ -2,6 +2,7 @@
 *.jpg
 *.jpeg
 *.png
+!desktop/src-tauri/icons/icon.png
 *.bmp
 *.tif
 *.tiff

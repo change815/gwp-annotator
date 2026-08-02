@@ -224,6 +224,175 @@ fn saved_regions_block_representative_deselection() {
 }
 
 #[test]
+fn local_ui_region_and_image_responses_are_deidentified_and_read_only() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    load_generic_template(&service);
+    service
+        .select_representative(&case.case_id, &asset.asset_id)
+        .expect("representative selection");
+    service
+        .save_confirmed_region(region_request(asset.asset_id.clone()))
+        .expect("confirmed region save");
+
+    let payload = service
+        .read_image_asset(&case.case_id, &asset.asset_id)
+        .expect("on-demand image payload");
+    let representatives = service
+        .representative_asset_ids(&case.case_id)
+        .expect("representative IDs");
+    let regions = service
+        .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+        .expect("saved regions");
+    let local_ui_json = serde_json::to_string(&(payload, representatives, regions))
+        .expect("local UI response serialization");
+
+    assert!(local_ui_json.contains(&asset.asset_id));
+    assert!(!local_ui_json.contains(&case.case_id));
+    assert!(!local_ui_json.contains("20240101_CASE-ALPHA"));
+    assert!(!local_ui_json.contains("ASSET-01.JPG"));
+    assert!(!local_ui_json.contains(fixture.source_root.to_string_lossy().as_ref()));
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_source_image_symlink_is_rejected_at_open_time() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    let original = fixture
+        .source_root
+        .join("CAMPUS-ALPHA")
+        .join("20240101_CASE-ALPHA")
+        .join("ASSET-01.JPG");
+    let target = fixture._temporary.path().join("OUTSIDE-SOURCE-TARGET");
+    fs::write(&target, b"must-not-be-returned").expect("target fixture");
+    fs::remove_file(&original).expect("replace source fixture");
+    symlink(&target, &original).expect("source replacement symlink");
+
+    assert!(matches!(
+        service.read_image_asset(&case.case_id, &asset.asset_id),
+        Err(CoreError::UnsafeSourceAsset)
+    ));
+    assert_eq!(
+        fs::read(&target).expect("target bytes"),
+        b"must-not-be-returned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_source_case_symlink_is_rejected_before_external_bytes_are_read() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    let original_case = fixture
+        .source_root
+        .join("CAMPUS-ALPHA")
+        .join("20240101_CASE-ALPHA");
+    let outside_case = fixture._temporary.path().join("OUTSIDE-CASE");
+    fs::create_dir_all(&outside_case).expect("external case fixture");
+    fs::write(outside_case.join("ASSET-01.JPG"), b"must-not-be-returned")
+        .expect("external media fixture");
+    fs::remove_dir_all(&original_case).expect("replace scanned case");
+    symlink(&outside_case, &original_case).expect("case replacement symlink");
+
+    assert!(matches!(
+        service.read_image_asset(&case.case_id, &asset.asset_id),
+        Err(CoreError::UnsafeSourceAsset)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_source_image_with_same_name_is_rejected_at_open_time() {
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    let original = fixture
+        .source_root
+        .join("CAMPUS-ALPHA")
+        .join("20240101_CASE-ALPHA")
+        .join("ASSET-01.JPG");
+    fs::remove_file(&original).expect("replace source fixture");
+    fs::write(&original, b"same-name-replacement").expect("replacement fixture");
+
+    assert!(matches!(
+        service.read_image_asset(&case.case_id, &asset.asset_id),
+        Err(CoreError::UnsafeSourceAsset)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn replaced_source_case_junction_is_rejected_before_asset_read() {
+    use std::process::Command;
+
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    let original_case = fixture
+        .source_root
+        .join("CAMPUS-ALPHA")
+        .join("20240101_CASE-ALPHA");
+    let outside_case = fixture._temporary.path().join("OUTSIDE-CASE");
+    fs::create_dir_all(&outside_case).expect("external case fixture");
+    fs::write(outside_case.join("ASSET-01.JPG"), b"must-not-be-returned")
+        .expect("external media fixture");
+    fs::remove_dir_all(&original_case).expect("replace scanned case");
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&original_case)
+        .arg(&outside_case)
+        .status()
+        .expect("create junction");
+    assert!(status.success(), "create source replacement junction");
+
+    assert!(matches!(
+        service.read_image_asset(&case.case_id, &asset.asset_id),
+        Err(CoreError::UnsafeSourceAsset)
+    ));
+}
+
+#[test]
+fn label_txt_descriptor_returns_the_backend_validated_template_ids() {
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let descriptor = service
+        .import_label_txt("*Field Alpha=Option Alpha|Option Beta", "template-alpha", 1)
+        .expect("label text import");
+
+    assert_eq!(descriptor.template.template_id, descriptor.template_id);
+    assert_eq!(descriptor.template.version, descriptor.version);
+    assert!(descriptor.template.fields[0].id.starts_with("field-"));
+    assert!(descriptor.template.fields[0].options[0]
+        .id
+        .starts_with("option-"));
+}
+
+#[test]
 fn save_is_atomic() {
     let fixture = fixture(1);
     let service = service(&fixture);

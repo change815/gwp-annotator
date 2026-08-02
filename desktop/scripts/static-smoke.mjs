@@ -3,9 +3,20 @@ import { extname, relative, resolve } from "node:path";
 
 const distRoot = resolve("dist");
 const html = await readFile(resolve(distRoot, "index.html"), "utf8");
+const tauriConfig = JSON.parse(await readFile(resolve("src-tauri/tauri.conf.json"), "utf8"));
 
 if (!html.includes('id="app"')) {
   throw new Error("Frontend mount point is missing.");
+}
+
+const csp = tauriConfig.app?.security?.csp;
+if (
+  typeof csp !== "string" ||
+  !csp.includes("connect-src 'none'") ||
+  !csp.includes("img-src 'self' asset: data:") ||
+  !csp.includes("media-src 'self' asset:")
+) {
+  throw new Error("Tauri CSP must allow data: only for on-demand image payloads and keep network disabled.");
 }
 
 const textExtensions = new Set([
@@ -31,7 +42,7 @@ for (const file of await listFiles(distRoot)) {
   }
 }
 
-process.stdout.write("frontend static smoke (all text dist files): PASS\n");
+process.stdout.write("frontend static smoke and CSP boundary: PASS\n");
 
 async function listFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });

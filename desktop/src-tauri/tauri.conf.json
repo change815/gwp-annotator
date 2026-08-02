@@ -19,12 +19,13 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'none'; img-src 'self' asset:; media-src 'self' asset:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src 'none'; img-src 'self' asset: data:; media-src 'self' asset:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
     "windows": {
       "webviewInstallMode": {
         "type": "offlineInstaller"

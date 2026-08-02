@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::error::{CoreError, CoreResult};
 use crate::core::ids::SharedSecretProvider;
-use crate::core::scan::{scan_data_root, LocalDisplayScan, PublicScan, ScanSession};
-use crate::core::store::{PointNorm, RecoveryState, RegionDraft, SaveFault, Store};
+use crate::core::scan::{
+    scan_data_root, ImageAssetData, LocalDisplayScan, PublicScan, ScanSession,
+};
+use crate::core::store::{PointNorm, RecoveryState, RegionDraft, SaveFault, SavedRegion, Store};
 use crate::core::template::{parse_label_txt, LabelTemplate, LabelValue};
 
 pub struct ProjectService {
@@ -34,6 +36,7 @@ pub struct TemplateDescriptor {
     pub template_id: String,
     pub version: u32,
     pub sha256: String,
+    pub template: LabelTemplate,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -192,6 +195,37 @@ impl ProjectService {
             .save_confirmed_region(&draft)
     }
 
+    pub fn read_image_asset(&self, case_id: &str, asset_id: &str) -> CoreResult<ImageAssetData> {
+        self.ensure_active_roots_separate()?;
+        let active = self.active()?;
+        active
+            .as_ref()
+            .ok_or(CoreError::NoActiveSession)?
+            .mapping
+            .image_asset_data(case_id, asset_id)
+    }
+
+    pub fn saved_regions_for_asset(
+        &self,
+        case_id: &str,
+        asset_id: &str,
+    ) -> CoreResult<Vec<SavedRegion>> {
+        self.ensure_active_roots_separate()?;
+        {
+            let active = self.active()?;
+            active
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .mapping
+                .persisted_image_asset(case_id, asset_id)?;
+        }
+        let store = self.active_store()?;
+        store
+            .as_ref()
+            .ok_or(CoreError::NoActiveSession)?
+            .saved_regions_for_asset(asset_id)
+    }
+
     pub fn save_confirmed_region_with_fault(
         &self,
         request: SaveRegionRequest,
@@ -244,6 +278,24 @@ impl ProjectService {
             .as_ref()
             .ok_or(CoreError::NoActiveSession)?
             .representative_count(case_id)
+    }
+
+    pub fn representative_asset_ids(&self, case_id: &str) -> CoreResult<Vec<String>> {
+        self.ensure_active_roots_separate()?;
+        {
+            let active = self.active()?;
+            active
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .mapping
+                .persisted_case(case_id)
+                .ok_or(CoreError::UnknownSessionItem)?;
+        }
+        let store = self.active_store()?;
+        store
+            .as_ref()
+            .ok_or(CoreError::NoActiveSession)?
+            .representative_asset_ids(case_id)
     }
 
     pub fn recorded_representative_count(&self, case_id: &str) -> CoreResult<usize> {
@@ -357,6 +409,7 @@ impl ProjectService {
             template_id: snapshot.template_id.clone(),
             version: snapshot.version,
             sha256: snapshot.sha256,
+            template: template.clone(),
         };
         self.templates
             .lock()

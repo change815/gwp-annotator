@@ -4,10 +4,11 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::core::error::CoreError;
-use crate::core::scan::{LocalDisplayScan, PublicScan};
+use crate::core::scan::{ImageAssetData, LocalDisplayScan, PublicScan};
 use crate::core::service::{
     ProjectService, RepresentativeSelection, SaveRegionRequest, TemplateDescriptor,
 };
+use crate::core::store::SavedRegion;
 
 pub struct AppState {
     pub service: ProjectService,
@@ -111,6 +112,38 @@ pub fn save_confirmed_region(
         .map_err(Into::into)
 }
 
+pub fn read_image_asset(
+    case_id: String,
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImageAssetData, CommandError> {
+    state
+        .service
+        .read_image_asset(&case_id, &asset_id)
+        .map_err(Into::into)
+}
+
+pub fn saved_regions_for_asset(
+    case_id: String,
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SavedRegion>, CommandError> {
+    state
+        .service
+        .saved_regions_for_asset(&case_id, &asset_id)
+        .map_err(Into::into)
+}
+
+pub fn representative_asset_ids(
+    case_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, CommandError> {
+    state
+        .service
+        .representative_asset_ids(&case_id)
+        .map_err(Into::into)
+}
+
 fn error_code(error: &CoreError) -> &'static str {
     match error {
         CoreError::InvalidCampusLayout => "INVALID_CAMPUS_LAYOUT",
@@ -118,6 +151,7 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::NoActiveSession => "NO_ACTIVE_SESSION",
         CoreError::UnknownSessionItem => "UNKNOWN_SESSION_ITEM",
         CoreError::NotImageAsset => "NOT_IMAGE_ASSET",
+        CoreError::UnsafeSourceAsset => "UNSAFE_SOURCE_ASSET",
         CoreError::RepresentativeLimit => "REPRESENTATIVE_LIMIT",
         CoreError::RepresentativeNotSelected => "REPRESENTATIVE_NOT_SELECTED",
         CoreError::AssetNotRepresentative => "ASSET_NOT_REPRESENTATIVE",
