@@ -234,10 +234,41 @@ canvas:focus-visible {
 .case-item,
 .region-item {
   display: grid;
-  justify-items: start;
   width: 100%;
-  min-height: 44px;
   text-align: left;
+}
+
+.case-item {
+  justify-items: start;
+  min-height: 44px;
+}
+
+.region-item {
+  gap: 0.35rem;
+  padding: 0.35rem;
+}
+
+.region-item > button:first-child {
+  width: 100%;
+  min-height: 32px;
+  text-align: left;
+}
+
+.region-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.region-actions button {
+  min-height: 27px;
+  padding: 0.18rem 0.35rem;
+  font-size: 0.76rem;
+}
+
+.region-actions button[data-action="delete-region"] {
+  border-color: #b42318;
+  color: #8a2118;
 }
 
 .case-item span,
@@ -412,6 +443,43 @@ canvas:focus-visible {
 .video-deferred strong {
   color: #485d6f;
   font-size: 1.15rem;
+}
+
+.video-player {
+  display: grid;
+  width: min(100%, 980px);
+  gap: 0.65rem;
+  padding: 0.8rem;
+  color: #354a5b;
+}
+
+.video-player video {
+  display: block;
+  width: 100%;
+  max-height: min(62vh, 680px);
+  background: #101820;
+}
+
+.video-player p {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.video-controls {
+  display: grid;
+  grid-template-columns: auto minmax(80px, 1fr) max-content auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.video-controls input[type="range"] {
+  width: 100%;
+}
+
+.video-controls output {
+  color: #475c6d;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .media-strip {
@@ -621,5 +689,13 @@ canvas:focus-visible {
 
   .template-meta input {
     width: min(15rem, 58vw);
+  }
+
+  .video-controls {
+    grid-template-columns: auto 1fr auto;
+  }
+
+  .video-controls output {
+    grid-column: 1 / -1;
   }
 }

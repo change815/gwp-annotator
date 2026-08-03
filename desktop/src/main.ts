@@ -51,6 +51,9 @@ export interface SavedRegion {
   region_id: string;
   asset_id: string;
   polygon_norm: PointNorm[];
+  template_id: string;
+  template_version: number;
+  labels: Record<string, LabelValue>;
 }
 
 export interface TemplateOption {
@@ -94,16 +97,59 @@ interface TemplateDescriptor {
   template: LabelTemplate;
 }
 
+interface CapturedFrame {
+  asset_id: string;
+  case_id: string;
+  parent_video_asset_id: string;
+  capture_time_millis: number;
+  width: number;
+  height: number;
+  size_bytes: number;
+}
+
+interface BackupResult {
+  case_id: string;
+  completed_at: number;
+  capture_count: number;
+}
+
+type RestoreStatus =
+  | "no_session"
+  | "restored"
+  | "saved_root_unavailable"
+  | "fixed_template_missing"
+  | "fixed_template_checksum_mismatch"
+  | "last_media_unavailable";
+
+interface StartupRestore {
+  status: RestoreStatus;
+  scan: PublicScan | null;
+  template: TemplateDescriptor | null;
+  current_case_id: string | null;
+  current_asset_id: string | null;
+}
+
 interface AppApi {
   chooseAndScanRoot(): Promise<PublicScan | null>;
+  currentScan(): Promise<PublicScan>;
+  restoreProjectSession(): Promise<StartupRestore>;
+  forgetLastPosition(): Promise<void>;
+  currentFixedTemplate(): Promise<TemplateDescriptor | null>;
   currentLocalDisplayScan(): Promise<LocalDisplayScan>;
   selectRepresentative(caseId: string, assetId: string): Promise<RepresentativeSelection>;
   deselectRepresentative(caseId: string, assetId: string): Promise<RepresentativeSelection>;
   representativeAssetIds(caseId: string): Promise<string[]>;
   readImageAsset(caseId: string, assetId: string): Promise<ImageAssetData>;
   savedRegionsForAsset(caseId: string, assetId: string): Promise<SavedRegion[]>;
-  importJsonTemplate(input: string): Promise<TemplateDescriptor>;
-  importLabelTxt(input: string, templateId: string, version: number): Promise<TemplateDescriptor>;
+  installFixedTomlTemplate(input: string): Promise<TemplateDescriptor>;
+  installFixedLabelTxt(input: string): Promise<TemplateDescriptor>;
+  updateRegionLabels(request: UpdateRegionLabelsRequest): Promise<void>;
+  deleteRegion(caseId: string, assetId: string, regionId: string): Promise<void>;
+  replaceRegion(request: ReplaceRegionRequest): Promise<void>;
+  captureVideoFrame(request: CaptureFrameRequest): Promise<CapturedFrame>;
+  completeCaseAndBackup(caseId: string): Promise<BackupResult>;
+  saveLastPosition(caseId: string, assetId: string): Promise<void>;
+  recordImageDimensions(caseId: string, assetId: string, width: number, height: number): Promise<void>;
   saveConfirmedRegion(request: SaveRegionRequest): Promise<void>;
 }
 
@@ -116,6 +162,30 @@ interface SaveRegionRequest {
   labels: Record<string, LabelValue>;
 }
 
+interface UpdateRegionLabelsRequest {
+  case_id: string;
+  asset_id: string;
+  region_id: string;
+  template_id: string;
+  template_version: number;
+  labels: Record<string, LabelValue>;
+}
+
+interface ReplaceRegionRequest {
+  case_id: string;
+  old_region_id: string;
+  replacement: SaveRegionRequest;
+}
+
+interface CaptureFrameRequest {
+  case_id: string;
+  video_asset_id: string;
+  capture_time_millis: number;
+  width: number;
+  height: number;
+  png_base64: string;
+}
+
 declare global {
   interface Window {
     __GWP_API__?: AppApi;
@@ -124,6 +194,10 @@ declare global {
 
 const tauriApi: AppApi = {
   chooseAndScanRoot: () => invoke<PublicScan | null>("choose_and_scan_root"),
+  currentScan: () => invoke<PublicScan>("current_scan"),
+  restoreProjectSession: () => invoke<StartupRestore>("restore_project_session"),
+  forgetLastPosition: () => invoke("forget_last_position"),
+  currentFixedTemplate: () => invoke<TemplateDescriptor | null>("current_fixed_template"),
   currentLocalDisplayScan: () => invoke<LocalDisplayScan>("current_local_display_scan"),
   selectRepresentative: (caseId, assetId) =>
     invoke<RepresentativeSelection>("select_representative", { caseId, assetId }),
@@ -135,10 +209,18 @@ const tauriApi: AppApi = {
     invoke<ImageAssetData>("read_image_asset", { caseId, assetId }),
   savedRegionsForAsset: (caseId, assetId) =>
     invoke<SavedRegion[]>("saved_regions_for_asset", { caseId, assetId }),
-  importJsonTemplate: (templateJson) =>
-    invoke<TemplateDescriptor>("import_json_template", { templateJson }),
-  importLabelTxt: (text, templateId, version) =>
-    invoke<TemplateDescriptor>("import_label_txt", { text, templateId, version }),
+  installFixedTomlTemplate: (templateToml) =>
+    invoke<TemplateDescriptor>("install_fixed_toml_template", { templateToml }),
+  installFixedLabelTxt: (text) =>
+    invoke<TemplateDescriptor>("install_fixed_label_txt", { text }),
+  updateRegionLabels: async (request) => invoke("update_region_labels", { request }),
+  deleteRegion: async (caseId, assetId, regionId) => invoke("delete_region", { caseId, assetId, regionId }),
+  replaceRegion: async (request) => invoke("replace_region", { request }),
+  captureVideoFrame: (request) => invoke<CapturedFrame>("capture_video_frame", { request }),
+  completeCaseAndBackup: (caseId) => invoke<BackupResult>("complete_case_and_backup", { caseId }),
+  saveLastPosition: async (caseId, assetId) => invoke("save_last_position", { caseId, assetId }),
+  recordImageDimensions: async (caseId, assetId, width, height) =>
+    invoke("record_image_dimensions", { caseId, assetId, width, height }),
   saveConfirmedRegion: async (request) => {
     await invoke("save_confirmed_region", { request });
   },
@@ -170,6 +252,11 @@ interface DraftRegion {
   points: PointNorm[];
 }
 
+interface EditLabelsDraft {
+  regionId: string;
+  values: Record<string, LabelValue>;
+}
+
 export interface CrosshairState {
   pointerInCanvas: boolean;
   x: number;
@@ -192,8 +279,15 @@ interface State {
   drawing: DraftRegion | null;
   labelDraft: DraftRegion | null;
   labelValues: Record<string, LabelValue>;
+  replaceRegionId: string | null;
+  editLabels: EditLabelsDraft | null;
   template: LabelTemplate | null;
   templateFileName: string | null;
+  videoTime: number;
+  videoDuration: number;
+  videoPlaying: boolean;
+  capturePending: boolean;
+  backupPending: boolean;
   crosshair: CrosshairState;
   message: string;
   messageKind: "info" | "error" | "success";
@@ -215,8 +309,15 @@ const initialState = (): State => ({
   drawing: null,
   labelDraft: null,
   labelValues: {},
+  replaceRegionId: null,
+  editLabels: null,
   template: null,
   templateFileName: null,
+  videoTime: 0,
+  videoDuration: 0,
+  videoPlaying: false,
+  capturePending: false,
+  backupPending: false,
   crosshair: { pointerInCanvas: false, x: 0, y: 0 },
   message: "请选择本地数据根目录。",
   messageKind: "info",
@@ -314,6 +415,13 @@ function formatError(error: unknown): string {
     NOT_IMAGE_ASSET: "只有图片可以作为代表图。",
     ASSET_NOT_REPRESENTATIVE: "请先选择当前图片为代表图。",
     TEMPLATE_NOT_LOADED: "请先加载标签模板。",
+    FIXED_TEMPLATE_MISSING: "固定标签模板不可用，请重新选择 label-template-v1.toml。",
+    FIXED_TEMPLATE_CHECKSUM_MISMATCH: "固定标签模板校验失败，请联系项目管理员后重新导入。",
+    SAVED_ROOT_UNAVAILABLE: "上次的数据目录不可用，请连接磁盘后重新选择。",
+    NOT_VIDEO_ASSET: "当前媒体不是 MP4 视频。",
+    INVALID_CAPTURE: "无法截取当前视频帧。请确认本机可播放该 MP4。",
+    REGION_NOT_FOUND: "该区域已不存在，请刷新后重试。",
+    REGION_NOT_ACTIVE: "该区域已被删除或替换，请刷新后重试。",
     INVALID_LABELS: "请完成所有必填标签。",
     INVALID_POLYGON: "圈选无效，请重新绘制闭合区域。",
   };
@@ -355,6 +463,47 @@ function selectedAsset(state: State): PublicAsset | null {
 function assetLabel(asset: PublicAsset, index: number): string {
   const kind = asset.media_kind === "image" ? "图片" : "MP4";
   return `${kind} ${String(index + 1).padStart(2, "0")}`;
+}
+
+export function formatVideoTime(value: number): string {
+  const seconds = Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function videoFrameToBase64(video: HTMLVideoElement): { pngBase64: string; width: number; height: number } | null {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+  if (width < 1 || height < 1) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  context.drawImage(video, 0, 0, width, height);
+  const dataUrl = canvas.toDataURL("image/png");
+  const prefix = "data:image/png;base64,";
+  return dataUrl.startsWith(prefix) ? { pngBase64: dataUrl.slice(prefix.length), width, height } : null;
+}
+
+const viewportStorageKey = "gwp-annotator-v02-viewport";
+
+function loadSavedViewport(caseId: string, assetId: string): ViewState | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(viewportStorageKey) ?? "null") as Partial<ViewState> & { caseId?: string; assetId?: string } | null;
+    if (!value || value.caseId !== caseId || value.assetId !== assetId) return null;
+    if (![value.zoom, value.panX, value.panY].every(Number.isFinite)) return null;
+    return { zoom: Math.min(8, Math.max(0.4, value.zoom as number)), panX: value.panX as number, panY: value.panY as number };
+  } catch {
+    return null;
+  }
+}
+
+function saveViewport(caseId: string, assetId: string, view: ViewState): void {
+  try {
+    localStorage.setItem(viewportStorageKey, JSON.stringify({ caseId, assetId, ...view }));
+  } catch {
+    // Viewport recovery is optional and must not block a saved annotation.
+  }
 }
 
 function randomRegionId(): string {
@@ -441,17 +590,16 @@ function mountMarkup(state: State): string {
       <header class="app-header">
         <div><h1 id="app-title">GWP Annotator</h1><p>本地医生标注工作台</p></div>
         <div class="header-actions">
-          <button type="button" data-action="choose-root">选择数据根目录</button>
+          <button type="button" data-action="choose-root">更换数据目录</button>
+          <button type="button" data-action="forget-position">忘记上次位置</button>
           <span class="offline-status" data-testid="offline-status">本地离线</span>
         </div>
       </header>
       <p class="notice ${state.messageKind}" role="status" aria-live="polite">${escapeHtml(state.message)}</p>
       <section class="template-strip" aria-label="标签模板">
         <strong>标签模板</strong>
-        <span>${state.template ? `${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。请先选择 JSON 或 label.txt 模板。"}</span>
-        <label class="file-button">加载模板<input data-action="template-file" type="file" accept=".json,.txt,application/json,text/plain" aria-label="加载标签模板"></label>
-        <label class="template-meta">模板 ID<input data-template-id value="template-local" maxlength="64" aria-label="label.txt 模板 ID"></label>
-        <label class="template-meta">版本<input data-template-version type="number" min="1" value="1" aria-label="label.txt 模板版本"></label>
+        <span>${state.template ? `固定模板：${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。首次请选择 label-template-v1.toml。"}</span>
+        ${state.template ? "" : `<label class="file-button">首次导入模板<input data-action="template-file" type="file" accept=".toml,.txt,text/plain" aria-label="首次导入标签模板"></label>`}
       </section>
       <div class="workspace-grid">
         <aside class="case-sidebar" aria-label="院区与病例">
@@ -480,11 +628,12 @@ function mountMarkup(state: State): string {
               <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 ? "disabled" : ""}>下一张</button>
               <button type="button" data-action="fit" ${isImage ? "" : "disabled"}>适配</button>
               <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
+              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
             </div>
           </div>
           <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""}" data-canvas-frame>
             ${!asset ? `<p class="empty-copy">从左侧选择病例。</p>` : ""}
-            ${asset?.media_kind === "video" ? `<div class="video-deferred"><strong>MP4</strong><p>视频将在下一阶段处理。当前不可播放、不可截帧、不可标注。</p></div>` : ""}
+            ${asset?.media_kind === "video" && currentCase ? `<div class="video-player"><video data-video-player preload="metadata" src="gwp-media://localhost/video/${encodeURIComponent(currentCase.case_id)}/${encodeURIComponent(asset.asset_id)}"></video><div class="video-controls"><button type="button" data-action="video-play">${state.videoPlaying ? "暂停" : "播放"}</button><input data-action="video-seek" type="range" min="0" max="${Math.max(state.videoDuration, 0)}" value="${Math.min(state.videoTime, state.videoDuration || 0)}" step="0.01" aria-label="视频进度"><output data-video-time>${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}</output><button type="button" data-action="capture-frame" ${state.capturePending ? "disabled" : ""}>${state.capturePending ? "正在截帧…" : "截取当前帧"}</button></div><p>截帧仅保存到本应用工作目录，并归属于当前病例；原始病例目录保持只读。</p></div>` : ""}
             ${isImage ? `<canvas data-drawing-canvas aria-label="图片标注画布" tabindex="0"></canvas>` : ""}
             ${isImage ? customCrosshairMarkup(crosshairVisible, state.crosshair.x, state.crosshair.y) : ""}
             ${state.imageLoading ? `<div class="loading-cover">正在读取图片…</div>` : ""}
@@ -499,7 +648,7 @@ function mountMarkup(state: State): string {
                 const isCurrent = index === state.assetIndex;
                 const toggle = item.media_kind === "image"
                   ? `<button type="button" class="representative-button" data-action="representative" data-asset-id="${escapeHtml(item.asset_id)}" ${representative && state.regions.some((region) => region.asset_id === item.asset_id) ? "title=\"已有保存区域，不能取消\"" : ""}>${representative ? "取消代表" : "设为代表"}</button>`
-                  : `<span class="deferred-badge">下一阶段</span>`;
+                  : `<span class="deferred-badge">可播放与截帧</span>`;
                 return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"}">${assetLabel(item, index)}</button>${toggle}</article>`;
               })
               .join("")}
@@ -512,7 +661,7 @@ function mountMarkup(state: State): string {
             ${state.regions
               .map(
                 (region, index) =>
-                  `<button type="button" class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}</button>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}">删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
@@ -523,13 +672,14 @@ function mountMarkup(state: State): string {
         <div class="modal-backdrop" data-action="cancel-draft">
           <section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="label-dialog-title" data-label-dialog tabindex="-1">
             <header><h2 id="label-dialog-title">填写区域标签</h2><button type="button" data-action="cancel-draft" aria-label="取消">取消</button></header>
-            <p>区域尚未保存。完成必填项后才可确认。</p>
+            <p>${state.replaceRegionId ? "将替换已保存区域；确认后旧区域保留操作记录但不再用于训练。" : "区域尚未保存。完成必填项后才可确认。"}</p>
             <form data-label-form>
               ${state.template.fields.map((field) => controlMarkup(field, state.labelValues[field.id])).join("")}
               <div class="dialog-actions"><button type="button" data-action="cancel-draft">取消</button><button type="submit" ${labelsMeetRequiredFields(state.template.fields, state.labelValues) ? "" : "disabled"}>OK</button></div>
             </form>
           </section>
         </div>` : ""}
+      ${state.editLabels && state.template ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit">取消</button></header><p>确认后会保留本次标签修正的操作记录。</p><form data-edit-label-form>${state.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id])).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit">取消</button><button type="submit" ${labelsMeetRequiredFields(state.template.fields, state.editLabels.values) ? "" : "disabled"}>确认修改</button></div></form></section></div>` : ""}
     </main>`;
 }
 
@@ -628,6 +778,12 @@ function startApp(target: HTMLDivElement): void {
       state.image = image;
       state.imageAssetId = requestedAsset;
       state.imageLoading = false;
+      void api.recordImageDimensions(requestedCase, requestedAsset, image.naturalWidth, image.naturalHeight).catch(() => {
+        if (selectedCase(state)?.case_id === requestedCase && selectedAsset(state)?.asset_id === requestedAsset) {
+          message("图片尺寸未能记录；不影响当前标注。", "info");
+          render();
+        }
+      });
     } catch (error) {
       if (selectedAsset(state)?.asset_id === requestedAsset) {
         state.imageLoading = false;
@@ -638,6 +794,9 @@ function startApp(target: HTMLDivElement): void {
   };
 
   const selectCase = async (caseId: string): Promise<void> => {
+    const previousCase = selectedCase(state);
+    const previousAsset = selectedAsset(state);
+    if (previousCase && previousAsset) saveViewport(previousCase.case_id, previousAsset.asset_id, state.view);
     const campus = selectedCampus(state);
     const nextCase = campus?.cases.find((item) => item.case_id === caseId);
     if (!nextCase) return;
@@ -646,23 +805,57 @@ function startApp(target: HTMLDivElement): void {
     state.representativeIds = new Set(await api.representativeAssetIds(nextCase.case_id));
     state.regions = [];
     state.selectedRegionId = null;
-    state.view = { zoom: 1, panX: 0, panY: 0 };
+    state.view = loadSavedViewport(nextCase.case_id, nextCase.assets[0]?.asset_id ?? "") ?? { zoom: 1, panX: 0, panY: 0 };
     state.drawing = null;
+    state.labelDraft = null;
+    state.editLabels = null;
+    state.replaceRegionId = null;
     state.crosshair.pointerInCanvas = false;
     await refreshRegions();
     await loadImage();
+    const asset = selectedAsset(state);
+    if (asset) await api.saveLastPosition(nextCase.case_id, asset.asset_id);
   };
 
   const selectAsset = async (index: number): Promise<void> => {
     const currentCase = selectedCase(state);
     if (!currentCase || index < 0 || index >= currentCase.assets.length) return;
+    const previousAsset = selectedAsset(state);
+    if (previousAsset) saveViewport(currentCase.case_id, previousAsset.asset_id, state.view);
     state.assetIndex = index;
-    state.view = { zoom: 1, panX: 0, panY: 0 };
+    state.view = loadSavedViewport(currentCase.case_id, currentCase.assets[index].asset_id) ?? { zoom: 1, panX: 0, panY: 0 };
     state.drawing = null;
     state.labelDraft = null;
+    state.editLabels = null;
+    state.replaceRegionId = null;
     state.crosshair.pointerInCanvas = false;
     await refreshRegions();
     await loadImage();
+    await api.saveLastPosition(currentCase.case_id, currentCase.assets[index].asset_id);
+  };
+
+  const applyScan = async (scan: PublicScan, preferredCaseId?: string | null, preferredAssetId?: string | null): Promise<void> => {
+    const local = await api.currentLocalDisplayScan();
+    state.campuses = mergeScans(scan, local);
+    const preferredCampus = state.campuses.find((campus) => campus.cases.some((item) => item.case_id === preferredCaseId));
+    const campus = preferredCampus ?? state.campuses[0];
+    state.campusCode = campus?.campusCode ?? null;
+    const activeCase = campus?.cases.find((item) => item.case_id === preferredCaseId) ?? campus?.cases[0];
+    if (!activeCase) {
+      render();
+      return;
+    }
+    state.caseId = activeCase.case_id;
+    state.assetIndex = Math.max(0, activeCase.assets.findIndex((asset) => asset.asset_id === preferredAssetId));
+    const restoredAsset = activeCase.assets[state.assetIndex];
+    state.view = restoredAsset ? loadSavedViewport(activeCase.case_id, restoredAsset.asset_id) ?? { zoom: 1, panX: 0, panY: 0 } : { zoom: 1, panX: 0, panY: 0 };
+    state.representativeIds = new Set(await api.representativeAssetIds(activeCase.case_id));
+    state.regions = [];
+    state.selectedRegionId = null;
+    await refreshRegions();
+    await loadImage();
+    const activeAsset = selectedAsset(state);
+    if (activeAsset) await api.saveLastPosition(activeCase.case_id, activeAsset.asset_id);
   };
 
   const draw = (canvas: HTMLCanvasElement): void => {
@@ -856,16 +1049,32 @@ function startApp(target: HTMLDivElement): void {
           render();
           return;
         }
-        const local = await api.currentLocalDisplayScan();
-        state.campuses = mergeScans(scan, local);
-        const firstCampus = state.campuses[0];
-        state.campusCode = firstCampus?.campusCode ?? null;
+        await applyScan(scan);
+        try {
+          const fixedTemplate = await api.currentFixedTemplate();
+          state.template = fixedTemplate?.template ?? null;
+          state.templateFileName = fixedTemplate ? "label-template-v1.toml" : null;
+        } catch (error) {
+          state.template = null;
+          state.templateFileName = null;
+          throw error;
+        }
         message(`已扫描 ${state.campuses.length} 个院区。`, "success");
-        await selectCase(firstCampus?.cases[0]?.case_id ?? "");
+        render();
       } catch (error) {
         message(formatError(error), "error");
         render();
       }
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="forget-position"]')?.addEventListener("click", async () => {
+      if (!window.confirm("忘记上次工作位置？下次启动将不再自动打开当前数据目录。")) return;
+      try {
+        await api.forgetLastPosition();
+        message("已忘记上次工作位置。当前已打开的数据不会关闭。", "success");
+      } catch (error) {
+        message(formatError(error), "error");
+      }
+      render();
     });
     target.querySelector<HTMLSelectElement>('[data-action="campus"]')?.addEventListener("change", async (event) => {
       state.campusCode = (event.currentTarget as HTMLSelectElement).value;
@@ -887,6 +1096,20 @@ function startApp(target: HTMLDivElement): void {
     target.querySelector<HTMLButtonElement>('[data-action="pan"]')?.addEventListener("click", () => {
       state.panMode = !state.panMode;
       state.crosshair.pointerInCanvas = false;
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.addEventListener("click", async () => {
+      const currentCase = selectedCase(state);
+      if (!currentCase || !window.confirm("确认完成本病例并创建可恢复备份？")) return;
+      state.backupPending = true;
+      render();
+      try {
+        const result = await api.completeCaseAndBackup(currentCase.case_id);
+        message(`病例已完成并备份（包含 ${result.capture_count} 张截帧）。`, "success");
+      } catch (error) {
+        message(formatError(error), "error");
+      }
+      state.backupPending = false;
       render();
     });
     target.querySelectorAll<HTMLButtonElement>('[data-action="representative"]').forEach((button) => {
@@ -918,21 +1141,52 @@ function startApp(target: HTMLDivElement): void {
         render();
       });
     });
+    target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.addEventListener("click", () => {
+      const regionId = target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.dataset.regionId;
+      const region = state.regions.find((item) => item.region_id === regionId);
+      if (!region) return;
+      state.editLabels = { regionId: region.region_id, values: structuredClone(region.labels) };
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="delete-region"]')?.addEventListener("click", async (event) => {
+      const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
+      const currentCase = selectedCase(state);
+      const asset = selectedAsset(state);
+      if (!regionId || !currentCase || !asset || !window.confirm("确认删除此区域？删除后不会用于训练，但会保留操作记录。")) return;
+      try {
+        await api.deleteRegion(currentCase.case_id, asset.asset_id, regionId);
+        await refreshRegions();
+        message("区域已删除。", "success");
+      } catch (error) {
+        message(formatError(error), "error");
+      }
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="replace-region"]')?.addEventListener("click", (event) => {
+      const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
+      if (!regionId || !window.confirm("重新圈选后将替换此区域。原区域会保留操作记录。继续吗？")) return;
+      state.replaceRegionId = regionId;
+      state.selectedRegionId = regionId;
+      message("请重新圈选该区域；保存后将替换旧区域。", "info");
+      render();
+    });
     target.querySelector<HTMLInputElement>('[data-action="template-file"]')?.addEventListener("change", async (event) => {
       const input = event.currentTarget as HTMLInputElement;
       const file = input.files?.[0];
       if (!file) return;
-      const templateId = target.querySelector<HTMLInputElement>("[data-template-id]")?.value.trim() ?? "";
-      const version = Number(target.querySelector<HTMLInputElement>("[data-template-version]")?.value);
       try {
         const contents = await file.text();
         if (file.name.toLowerCase().endsWith(".txt")) {
-          state.template = (await api.importLabelTxt(contents, templateId, version)).template;
+          state.template = (await api.installFixedLabelTxt(contents)).template;
+        } else if (file.name.toLowerCase().endsWith(".toml")) {
+          state.template = (await api.installFixedTomlTemplate(contents)).template;
         } else {
-          state.template = (await api.importJsonTemplate(contents)).template;
+          message("正式模板仅支持 .toml；.txt 仅用于首次兼容导入。", "error");
+          render();
+          return;
         }
         state.templateFileName = file.name;
-        message("标签模板已加载。", "success");
+        message("固定标签模板已安装，后续启动将自动加载。", "success");
       } catch (error) {
         message(formatError(error), "error");
       }
@@ -963,16 +1217,22 @@ function startApp(target: HTMLDivElement): void {
       const template = state.template;
       if (!currentCase || !asset || !draft || !template || !labelsMeetRequiredFields(template.fields, state.labelValues)) return;
       try {
-        await api.saveConfirmedRegion({
+        const request: SaveRegionRequest = {
           region_id: randomRegionId(),
           asset_id: asset.asset_id,
           polygon_norm: draft.points,
           template_id: template.template_id,
           template_version: template.version,
           labels: state.labelValues,
-        });
+        };
+        if (state.replaceRegionId) {
+          await api.replaceRegion({ case_id: currentCase.case_id, old_region_id: state.replaceRegionId, replacement: request });
+        } else {
+          await api.saveConfirmedRegion(request);
+        }
         state.labelDraft = null;
         state.labelValues = {};
+        state.replaceRegionId = null;
         await refreshRegions();
         state.crosshair.pointerInCanvas = false;
         message("区域与标签已保存。", "success");
@@ -981,18 +1241,128 @@ function startApp(target: HTMLDivElement): void {
       }
       render();
     });
+    const editForm = target.querySelector<HTMLFormElement>("[data-edit-label-form]");
+    editForm?.addEventListener("change", (event) => {
+      const input = event.target as HTMLInputElement | HTMLSelectElement;
+      const fieldId = input.dataset.labelField;
+      const edit = state.editLabels;
+      const template = state.template;
+      if (!fieldId || !edit || !template) return;
+      const field = template.fields.find((item) => item.id === fieldId);
+      if (!field) return;
+      edit.values[fieldId] = field.control === "multi_select"
+        ? Array.from(editForm.querySelectorAll<HTMLInputElement>(`input[data-label-field="${CSS.escape(fieldId)}"]:checked`), (option) => option.value)
+        : input.value;
+      render();
+    });
+    editForm?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const currentCase = selectedCase(state);
+      const asset = selectedAsset(state);
+      const edit = state.editLabels;
+      const template = state.template;
+      if (!currentCase || !asset || !edit || !template || !labelsMeetRequiredFields(template.fields, edit.values)) return;
+      try {
+        await api.updateRegionLabels({ case_id: currentCase.case_id, asset_id: asset.asset_id, region_id: edit.regionId, template_id: template.template_id, template_version: template.version, labels: edit.values });
+        state.editLabels = null;
+        await refreshRegions();
+        message("区域标签已修改。", "success");
+      } catch (error) {
+        message(formatError(error), "error");
+      }
+      render();
+    });
+    target.querySelectorAll<HTMLElement>('[data-action="cancel-edit"]').forEach((element) => {
+      element.addEventListener("click", () => {
+        state.editLabels = null;
+        render();
+      });
+    });
     target.querySelectorAll<HTMLElement>('[data-action="cancel-draft"]').forEach((element) => {
       element.addEventListener("click", (event) => {
         if (event.target === element || element.closest(".label-dialog")) {
           state.labelDraft = null;
           state.labelValues = {};
           state.drawing = null;
+          state.replaceRegionId = null;
           state.crosshair.pointerInCanvas = false;
           message("已丢弃未保存的圈选。", "info");
           render();
         }
       });
     });
+    const video = target.querySelector<HTMLVideoElement>("[data-video-player]");
+    if (video) {
+      const syncVideoState = () => {
+        state.videoTime = video.currentTime;
+        state.videoDuration = Number.isFinite(video.duration) ? video.duration : 0;
+        state.videoPlaying = !video.paused && !video.ended;
+        const output = target.querySelector<HTMLOutputElement>("[data-video-time]");
+        const seek = target.querySelector<HTMLInputElement>('[data-action="video-seek"]');
+        if (output) output.value = `${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}`;
+        if (seek) {
+          seek.max = String(state.videoDuration || 0);
+          seek.value = String(Math.min(state.videoTime, state.videoDuration || 0));
+        }
+      };
+      video.addEventListener("loadedmetadata", syncVideoState);
+      video.addEventListener("timeupdate", syncVideoState);
+      video.addEventListener("play", syncVideoState);
+      video.addEventListener("pause", syncVideoState);
+      video.addEventListener("error", () => {
+        message("本机无法播放此 MP4 编码，无法截帧。请使用本机支持的编码。", "error");
+        render();
+      });
+      target.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.addEventListener("click", async (event) => {
+        try {
+          if (video.paused) await video.play();
+          else video.pause();
+          syncVideoState();
+          (event.currentTarget as HTMLButtonElement).textContent = state.videoPlaying ? "暂停" : "播放";
+        } catch {
+          message("本机无法播放此 MP4 编码。", "error");
+          render();
+        }
+      });
+      target.querySelector<HTMLInputElement>('[data-action="video-seek"]')?.addEventListener("input", (event) => {
+        video.currentTime = Number((event.currentTarget as HTMLInputElement).value);
+        syncVideoState();
+      });
+      target.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.addEventListener("click", async () => {
+        const currentCase = selectedCase(state);
+        const asset = selectedAsset(state);
+        if (!currentCase || !asset || asset.media_kind !== "video") return;
+        const frame = videoFrameToBase64(video);
+        if (!frame) {
+          message("当前视频帧尚不可用，播放或拖动到有效位置后重试。", "error");
+          render();
+          return;
+        }
+        state.capturePending = true;
+        render();
+        try {
+          const captured = await api.captureVideoFrame({
+            case_id: currentCase.case_id,
+            video_asset_id: asset.asset_id,
+            capture_time_millis: Math.round(video.currentTime * 1000),
+            width: frame.width,
+            height: frame.height,
+            png_base64: frame.pngBase64,
+          });
+          const scan = await api.currentLocalDisplayScan();
+          const publicScan = await api.currentScan();
+          state.campuses = mergeScans(publicScan, scan);
+          const caseAfterCapture = selectedCase(state);
+          const index = caseAfterCapture?.assets.findIndex((item) => item.asset_id === captured.asset_id) ?? -1;
+          message("截帧已保存到本应用工作目录，并加入当前病例。", "success");
+          if (index >= 0) await selectAsset(index);
+        } catch (error) {
+          message(formatError(error), "error");
+        }
+        state.capturePending = false;
+        render();
+      });
+    }
     const canvas = target.querySelector<HTMLCanvasElement>("[data-drawing-canvas]");
     if (canvas) bindCanvas(canvas);
     if (state.labelDraft) {
@@ -1010,6 +1380,7 @@ function startApp(target: HTMLDivElement): void {
       state.labelDraft = null;
       state.labelValues = {};
       state.drawing = null;
+      state.replaceRegionId = null;
       state.crosshair.pointerInCanvas = false;
       message("已丢弃未保存的圈选。", "info");
       render();
@@ -1029,6 +1400,28 @@ function startApp(target: HTMLDivElement): void {
   });
 
   render();
+  void (async () => {
+    try {
+      const restored = await api.restoreProjectSession();
+      if (restored.scan) {
+        state.template = restored.template?.template ?? null;
+        await applyScan(restored.scan, restored.current_case_id, restored.current_asset_id);
+      }
+      const restoreMessages: Record<RestoreStatus, { text: string; kind: State["messageKind"] }> = {
+        no_session: { text: "请选择本地数据根目录。", kind: "info" },
+        restored: { text: "已恢复上次的数据目录、模板与浏览位置。", kind: "success" },
+        saved_root_unavailable: { text: "上次的数据目录不可用，请连接磁盘后重新选择。", kind: "error" },
+        fixed_template_missing: { text: "已恢复数据目录，但固定模板不可用；请重新导入 label-template-v1.toml。", kind: "error" },
+        fixed_template_checksum_mismatch: { text: "固定模板校验失败；请联系项目管理员后重新导入。", kind: "error" },
+        last_media_unavailable: { text: "已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。", kind: "info" },
+      };
+      const restoreMessage = restoreMessages[restored.status];
+      message(restoreMessage.text, restoreMessage.kind);
+    } catch (error) {
+      message(formatError(error), "error");
+    }
+    render();
+  })();
 }
 
 export function boot(target = document.querySelector<HTMLDivElement>("#app")): void {

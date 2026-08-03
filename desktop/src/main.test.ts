@@ -7,6 +7,7 @@ import {
   canAutoClose,
   clearCrosshairPointerState,
   customCrosshairMarkup,
+  formatVideoTime,
   labelsMeetRequiredFields,
   polygonArea,
   primaryDrawingButtonIsPressed,
@@ -51,6 +52,14 @@ describe("drawing geometry", () => {
     expect(primaryDrawingButtonIsPressed(1)).toBe(true);
     expect(primaryDrawingButtonIsPressed(2)).toBe(false);
     expect(primaryDrawingButtonIsPressed(3)).toBe(true);
+  });
+});
+
+describe("video utility", () => {
+  it("formats current time defensively for the local video controls", () => {
+    expect(formatVideoTime(0)).toBe("00:00");
+    expect(formatVideoTime(65.9)).toBe("01:05");
+    expect(formatVideoTime(Number.NaN)).toBe("00:00");
   });
 });
 
@@ -162,6 +171,7 @@ describe("local shell", () => {
     boot();
 
     expect(document.querySelector('[data-testid="offline-status"]')?.textContent).toBe("本地离线");
-    expect(document.body.textContent).toContain("未加载。请先选择 JSON 或 label.txt 模板。");
+    expect(document.body.textContent).toContain("未加载。首次请选择 label-template-v1.toml。");
+    expect(document.querySelector<HTMLButtonElement>('[data-action="forget-position"]')?.disabled).toBe(false);
   });
 });

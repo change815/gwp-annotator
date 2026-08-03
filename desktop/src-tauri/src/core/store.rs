@@ -4,12 +4,17 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use data_encoding::{BASE32_NOPAD, HEXLOWER};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    backup::Backup, params, Connection, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::core::error::{CoreError, CoreResult};
 use crate::core::ids::is_opaque_id;
@@ -20,7 +25,13 @@ const DATABASE_FILE: &str = "annotations.sqlite3";
 const DATABASE_JOURNAL_FILE: &str = "annotations.sqlite3-journal";
 const DATABASE_WAL_FILE: &str = "annotations.sqlite3-wal";
 const DATABASE_SHM_FILE: &str = "annotations.sqlite3-shm";
+const FIXED_TEMPLATE_FILE: &str = "templates/label-template-v1.toml";
+const FIXED_TEMPLATE_MANIFEST_FILE: &str = "templates/label-template-v1.manifest.json";
+const PROJECT_SESSION_FILE: &str = "session/project-session.json";
+const BACKUP_FORMAT: &str = "gwp-case-backup";
+const SCHEMA_VERSION: i64 = 3;
 const INTERSECTION_EPSILON: f64 = 1e-12;
+const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Store {
@@ -77,6 +88,9 @@ pub struct SavedRegion {
     pub region_id: String,
     pub asset_id: String,
     pub polygon_norm: Vec<PointNorm>,
+    pub template_id: String,
+    pub template_version: u32,
+    pub labels: BTreeMap<String, LabelValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +108,78 @@ pub struct RecoveryState {
     pub pan_y: f64,
 }
 
+/// This file is deliberately outside SQLite and any future training export. The root path is
+/// needed only to restore the local browsing session and is never copied into annotation data.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectSessionState {
+    pub source_root: String,
+    pub current_case_id: Option<String>,
+    pub current_asset_id: Option<String>,
+    pub template_content_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FixedTemplate {
+    pub content_sha256: String,
+    pub template_sha256: String,
+    pub template: LabelTemplate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct FixedTemplateManifest {
+    format: String,
+    content_sha256: String,
+    template_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CapturedFrame {
+    pub asset_id: String,
+    pub case_id: String,
+    pub parent_video_asset_id: String,
+    pub capture_time_millis: i64,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BackupResult {
+    pub case_id: String,
+    pub completed_at: i64,
+    pub capture_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct BackupManifest {
+    format: String,
+    version: u32,
+    case_id: String,
+    completed_at: i64,
+    template_content_sha256: String,
+    capture_asset_ids: Vec<String>,
+}
+
 impl Store {
+    /// Reads the local-only session file without creating a database. This is used before the
+    /// application can reopen a selected source root on startup.
+    pub(crate) fn read_project_session(
+        work_root: &Path,
+    ) -> CoreResult<Option<ProjectSessionState>> {
+        let Some(bytes) = read_optional_work_file(work_root, Path::new(PROJECT_SESSION_FILE))?
+        else {
+            return Ok(None);
+        };
+        let state: ProjectSessionState =
+            serde_json::from_slice(&bytes).map_err(|_| CoreError::StateUnavailable)?;
+        validate_project_session(&state)?;
+        Ok(Some(state))
+    }
+
+    pub(crate) fn forget_project_session_at(work_root: &Path) -> CoreResult<()> {
+        remove_optional_work_file(work_root, Path::new(PROJECT_SESSION_FILE))
+    }
+
     pub(crate) fn open(work_root: impl Into<PathBuf>) -> CoreResult<Self> {
         let requested_work_root = work_root.into();
         fs::create_dir_all(&requested_work_root)?;
@@ -115,6 +200,80 @@ impl Store {
             database_paths,
             connection: Mutex::new(connection),
         })
+    }
+
+    pub(crate) fn write_project_session(&self, state: &ProjectSessionState) -> CoreResult<()> {
+        validate_project_session(state)?;
+        let bytes = serde_json::to_vec(state).map_err(|_| CoreError::StateUnavailable)?;
+        self.atomic_write_relative(Path::new(PROJECT_SESSION_FILE), &bytes)
+            .map(|_| ())
+    }
+
+    pub(crate) fn install_fixed_template(
+        &self,
+        contents: &str,
+        template: &LabelTemplate,
+    ) -> CoreResult<FixedTemplate> {
+        let snapshot = template.snapshot()?;
+        let fixed = FixedTemplate {
+            content_sha256: sha256_hex(contents.as_bytes()),
+            template_sha256: snapshot.sha256,
+            template: template.clone(),
+        };
+        let manifest = FixedTemplateManifest {
+            format: "gwp-fixed-template".to_owned(),
+            content_sha256: fixed.content_sha256.clone(),
+            template_sha256: fixed.template_sha256.clone(),
+        };
+
+        let existing_manifest = self.read_fixed_template_manifest()?;
+        let existing_contents = self.read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?;
+        match (existing_manifest, existing_contents) {
+            (None, None) => {
+                self.atomic_write_relative(Path::new(FIXED_TEMPLATE_FILE), contents.as_bytes())?;
+                let manifest_bytes =
+                    serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
+                self.atomic_write_relative(
+                    Path::new(FIXED_TEMPLATE_MANIFEST_FILE),
+                    &manifest_bytes,
+                )?;
+                Ok(fixed)
+            }
+            (Some(existing), Some(existing_bytes)) => {
+                let existing_template = fixed_template_from_bytes(&existing, &existing_bytes)?;
+                if existing_template.content_sha256 == fixed.content_sha256
+                    && existing_template.template_sha256 == fixed.template_sha256
+                {
+                    Ok(existing_template)
+                } else {
+                    Err(CoreError::FixedTemplateAlreadyInstalled)
+                }
+            }
+            (Some(existing), None) => {
+                // A lost fixed copy may be restored only from identical source content. This
+                // prevents the recovery path from becoming an unreviewed template switch.
+                if existing.content_sha256 != fixed.content_sha256
+                    || existing.template_sha256 != fixed.template_sha256
+                {
+                    return Err(CoreError::FixedTemplateChecksumMismatch);
+                }
+                self.atomic_write_relative(Path::new(FIXED_TEMPLATE_FILE), contents.as_bytes())?;
+                Ok(fixed)
+            }
+            (None, Some(_)) => Err(CoreError::FixedTemplateMissing),
+        }
+    }
+
+    pub(crate) fn fixed_template(&self) -> CoreResult<Option<FixedTemplate>> {
+        let manifest = self.read_fixed_template_manifest()?;
+        let contents = self.read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?;
+        match (manifest, contents) {
+            (None, None) => Ok(None),
+            (Some(manifest), Some(contents)) => {
+                fixed_template_from_bytes(&manifest, &contents).map(Some)
+            }
+            _ => Err(CoreError::FixedTemplateMissing),
+        }
     }
 
     pub(crate) fn select_representative(
@@ -152,6 +311,27 @@ impl Store {
         Ok(selected_count)
     }
 
+    /// Persists dimensions decoded by the local WebView for an active image asset. Source paths
+    /// remain in the in-memory scan only; SQLite receives only opaque IDs and pixel dimensions.
+    pub(crate) fn record_asset_dimensions(
+        &self,
+        case: &PersistedCase,
+        asset: &PersistedAsset,
+    ) -> CoreResult<()> {
+        if case.case_id != asset.case_id || asset.width == 0 || asset.height == 0 {
+            return Err(CoreError::InvalidAssetDimensions);
+        }
+        self.verify_database_artifacts_safe()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_case_and_asset(&transaction, case, asset)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn deselect_representative(
         &self,
         case: &PersistedCase,
@@ -168,7 +348,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_saved_regions: Option<i64> = transaction
             .query_row(
-                "SELECT 1 FROM regions WHERE asset_id = ?1 LIMIT 1",
+                "SELECT 1 FROM regions WHERE asset_id = ?1 AND status = 'active' LIMIT 1",
                 params![asset.asset_id],
                 |row| row.get(0),
             )
@@ -244,15 +424,16 @@ impl Store {
             }
         }
 
+        let created_at = now_millis();
         transaction.execute(
-            "INSERT INTO regions (region_id, asset_id, polygon_norm_json, template_id, template_version, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO regions (region_id, asset_id, polygon_norm_json, template_id, template_version, created_at, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?6)",
             params![
                 draft.region_id,
                 draft.asset_id,
                 polygon_json,
                 draft.template.template_id,
                 draft.template.version,
-                now_millis(),
+                created_at,
             ],
         )?;
 
@@ -267,8 +448,422 @@ impl Store {
                 params![draft.region_id, field_id, value_json],
             )?;
         }
+        insert_region_operation(
+            &transaction,
+            "created",
+            &draft.region_id,
+            None,
+            None,
+            None,
+            Some(
+                &serde_json::to_string(&draft.polygon_norm)
+                    .map_err(|_| CoreError::InvalidPolygon)?,
+            ),
+            Some(&labels_json(&draft.labels)?),
+            created_at,
+        )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn update_region_labels(
+        &self,
+        region_id: &str,
+        template: &LabelTemplate,
+        labels: &BTreeMap<String, LabelValue>,
+    ) -> CoreResult<()> {
+        if !is_opaque_id(region_id, "REGION-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        template.validate_label_values(labels)?;
+        let snapshot = template.snapshot()?;
+        self.verify_database_artifacts_safe()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (polygon_json, template_id, template_version, status) = transaction
+            .query_row(
+                "SELECT polygon_norm_json, template_id, template_version, status FROM regions WHERE region_id = ?1",
+                params![region_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, String>(3)?)),
+            )
+            .optional()?
+            .ok_or(CoreError::RegionNotFound)?;
+        if status != "active" {
+            return Err(CoreError::RegionNotActive);
+        }
+        if template_id != snapshot.template_id || template_version != snapshot.version {
+            return Err(CoreError::TemplateSnapshotConflict);
+        }
+        ensure_template_snapshot(&transaction, &snapshot)?;
+        let before_labels = read_region_labels(&transaction, region_id)?;
+        transaction.execute(
+            "DELETE FROM region_label_values WHERE region_id = ?1",
+            params![region_id],
+        )?;
+        insert_region_labels(&transaction, region_id, labels)?;
+        let updated_at = now_millis();
+        transaction.execute(
+            "UPDATE regions SET updated_at = ?1 WHERE region_id = ?2",
+            params![updated_at, region_id],
+        )?;
+        insert_region_operation(
+            &transaction,
+            "labels_updated",
+            region_id,
+            None,
+            Some(&polygon_json),
+            Some(&labels_json(&before_labels)?),
+            Some(&polygon_json),
+            Some(&labels_json(labels)?),
+            updated_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_region(&self, region_id: &str) -> CoreResult<()> {
+        if !is_opaque_id(region_id, "REGION-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        self.verify_database_artifacts_safe()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (polygon_json, status) = transaction
+            .query_row(
+                "SELECT polygon_norm_json, status FROM regions WHERE region_id = ?1",
+                params![region_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(CoreError::RegionNotFound)?;
+        if status != "active" {
+            return Err(CoreError::RegionNotActive);
+        }
+        let before_labels = read_region_labels(&transaction, region_id)?;
+        let updated_at = now_millis();
+        transaction.execute(
+            "UPDATE regions SET status = 'deleted', updated_at = ?1 WHERE region_id = ?2",
+            params![updated_at, region_id],
+        )?;
+        insert_region_operation(
+            &transaction,
+            "deleted",
+            region_id,
+            None,
+            Some(&polygon_json),
+            Some(&labels_json(&before_labels)?),
+            None,
+            None,
+            updated_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_region(
+        &self,
+        old_region_id: &str,
+        draft: &RegionDraft,
+    ) -> CoreResult<()> {
+        if !is_opaque_id(old_region_id, "REGION-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        validate_region_draft(draft)?;
+        let snapshot = draft.template.snapshot()?;
+        let new_polygon_json =
+            serde_json::to_string(&draft.polygon_norm).map_err(|_| CoreError::InvalidPolygon)?;
+
+        self.verify_database_artifacts_safe()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (old_asset_id, old_polygon_json, old_status) = transaction
+            .query_row(
+                "SELECT asset_id, polygon_norm_json, status FROM regions WHERE region_id = ?1",
+                params![old_region_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(CoreError::RegionNotFound)?;
+        if old_status != "active" {
+            return Err(CoreError::RegionNotActive);
+        }
+        if old_asset_id != draft.asset_id {
+            return Err(CoreError::UnknownSessionItem);
+        }
+        let is_representative: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM representative_assets WHERE asset_id = ?1",
+                params![draft.asset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if is_representative.is_none() {
+            return Err(CoreError::AssetNotRepresentative);
+        }
+        ensure_template_snapshot(&transaction, &snapshot)?;
+        let old_labels = read_region_labels(&transaction, old_region_id)?;
+        let updated_at = now_millis();
+        transaction.execute(
+            "INSERT INTO regions (region_id, asset_id, polygon_norm_json, template_id, template_version, created_at, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?6)",
+            params![
+                draft.region_id,
+                draft.asset_id,
+                new_polygon_json,
+                draft.template.template_id,
+                draft.template.version,
+                updated_at,
+            ],
+        )?;
+        insert_region_labels(&transaction, &draft.region_id, &draft.labels)?;
+        transaction.execute(
+            "UPDATE regions SET status = 'replaced', replacement_region_id = ?1, updated_at = ?2 WHERE region_id = ?3",
+            params![draft.region_id, updated_at, old_region_id],
+        )?;
+        insert_region_operation(
+            &transaction,
+            "created",
+            &draft.region_id,
+            None,
+            None,
+            None,
+            Some(
+                &serde_json::to_string(&draft.polygon_norm)
+                    .map_err(|_| CoreError::InvalidPolygon)?,
+            ),
+            Some(&labels_json(&draft.labels)?),
+            updated_at,
+        )?;
+        insert_region_operation(
+            &transaction,
+            "replaced",
+            old_region_id,
+            Some(&draft.region_id),
+            Some(&old_polygon_json),
+            Some(&labels_json(&old_labels)?),
+            Some(&new_polygon_json),
+            Some(&labels_json(&draft.labels)?),
+            updated_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn capture_video_frame(
+        &self,
+        case: &PersistedCase,
+        parent_video_asset_id: &str,
+        capture_time_millis: i64,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> CoreResult<CapturedFrame> {
+        if !is_opaque_id(&case.case_id, "CASE-")
+            || !is_opaque_id(parent_video_asset_id, "ASSET-")
+            || capture_time_millis < 0
+            || width == 0
+            || height == 0
+            || bytes.is_empty()
+        {
+            return Err(CoreError::InvalidCapture);
+        }
+        validate_capture_png(bytes, width, height)?;
+        let asset_id = random_opaque_id("ASSET-");
+        let relative_path =
+            PathBuf::from(format!("captures/{}/FRAME-{}.png", case.case_id, asset_id));
+        self.atomic_write_relative(&relative_path, bytes)?;
+        let frame = CapturedFrame {
+            asset_id: asset_id.clone(),
+            case_id: case.case_id.clone(),
+            parent_video_asset_id: parent_video_asset_id.to_owned(),
+            capture_time_millis,
+            width,
+            height,
+            size_bytes: bytes
+                .len()
+                .try_into()
+                .map_err(|_| CoreError::InvalidCapture)?,
+        };
+        let persisted_asset = PersistedAsset {
+            asset_id: asset_id.clone(),
+            case_id: case.case_id.clone(),
+            kind: crate::core::scan::StoredAssetKind::CapturedFrame,
+            width,
+            height,
+            source_fingerprint: format!(
+                "CAPTURE-{}-{}",
+                parent_video_asset_id, capture_time_millis
+            ),
+        };
+        let persist_result = (|| -> CoreResult<()> {
+            self.verify_database_artifacts_safe()?;
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_| CoreError::StateUnavailable)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            upsert_case_and_asset(&transaction, case, &persisted_asset)?;
+            transaction.execute(
+                "INSERT INTO capture_sources (captured_asset_id, case_id, parent_video_asset_id, capture_time_millis, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    frame.asset_id,
+                    frame.case_id,
+                    frame.parent_video_asset_id,
+                    frame.capture_time_millis,
+                    frame.size_bytes,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = persist_result {
+            let _ = self.remove_relative_if_exists(&relative_path);
+            return Err(error);
+        }
+        Ok(frame)
+    }
+
+    pub(crate) fn captured_frames_for_case(&self, case_id: &str) -> CoreResult<Vec<CapturedFrame>> {
+        if !is_opaque_id(case_id, "CASE-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT captures.captured_asset_id, captures.case_id, captures.parent_video_asset_id,
+                    captures.capture_time_millis, assets.width, assets.height, captures.size_bytes
+             FROM capture_sources AS captures
+             INNER JOIN assets ON assets.asset_id = captures.captured_asset_id
+             WHERE captures.case_id = ?1
+             ORDER BY captures.capture_time_millis ASC, captures.captured_asset_id ASC",
+        )?;
+        let rows = statement.query_map(params![case_id], |row| {
+            Ok(CapturedFrame {
+                asset_id: row.get(0)?,
+                case_id: row.get(1)?,
+                parent_video_asset_id: row.get(2)?,
+                capture_time_millis: row.get(3)?,
+                width: row.get(4)?,
+                height: row.get(5)?,
+                size_bytes: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn read_captured_frame(&self, case_id: &str, asset_id: &str) -> CoreResult<Vec<u8>> {
+        if !is_opaque_id(case_id, "CASE-") || !is_opaque_id(asset_id, "ASSET-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM capture_sources WHERE case_id = ?1 AND captured_asset_id = ?2",
+                params![case_id, asset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        drop(connection);
+        if exists.is_none() {
+            return Err(CoreError::UnknownSessionItem);
+        }
+        self.read_relative_required(Path::new(&format!(
+            "captures/{case_id}/FRAME-{asset_id}.png"
+        )))
+    }
+
+    pub(crate) fn complete_case_backup(&self, case_id: &str) -> CoreResult<BackupResult> {
+        if !is_opaque_id(case_id, "CASE-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        let fixed_template = self
+            .fixed_template()?
+            .ok_or(CoreError::FixedTemplateMissing)?;
+        let template_bytes = self
+            .read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?
+            .ok_or(CoreError::FixedTemplateMissing)?;
+        let captures = self.captured_frames_for_case(case_id)?;
+        let completed_at = now_millis();
+        let backup_name = format!(
+            "backup-{}-{}",
+            completed_at,
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = PathBuf::from(format!("backups/{case_id}/{backup_name}"));
+        let database_relative = base.join("annotations.sqlite3");
+        let database_path = self.reserve_relative_file(&database_relative)?;
+
+        let backup_result = (|| -> CoreResult<()> {
+            self.verify_database_artifacts_safe()?;
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_| CoreError::StateUnavailable)?;
+            let mut destination = Connection::open_with_flags(
+                &database_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            let backup = Backup::new(&connection, &mut destination)?;
+            backup.run_to_completion(64, Duration::from_millis(5), None)?;
+            drop(backup);
+            destination.close().map_err(|_| CoreError::Database)?;
+            Ok(())
+        })();
+        if let Err(error) = backup_result {
+            let _ = self.remove_relative_if_exists(&database_relative);
+            return Err(error);
+        }
+
+        self.atomic_write_relative(&base.join("label-template-v1.toml"), &template_bytes)?;
+        for capture in &captures {
+            let bytes = self.read_captured_frame(case_id, &capture.asset_id)?;
+            self.atomic_write_relative(
+                &base.join(format!("captures/FRAME-{}.png", capture.asset_id)),
+                &bytes,
+            )?;
+        }
+        let manifest = BackupManifest {
+            format: BACKUP_FORMAT.to_owned(),
+            version: 1,
+            case_id: case_id.to_owned(),
+            completed_at,
+            template_content_sha256: fixed_template.content_sha256,
+            capture_asset_ids: captures
+                .iter()
+                .map(|capture| capture.asset_id.clone())
+                .collect(),
+        };
+        let manifest_bytes =
+            serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
+        // The manifest is deliberately written last. Incomplete backups lack it and are ignored.
+        self.atomic_write_relative(&base.join("manifest.json"), &manifest_bytes)?;
+        Ok(BackupResult {
+            case_id: case_id.to_owned(),
+            completed_at,
+            capture_count: captures.len(),
+        })
     }
 
     pub(crate) fn write_recovery_state(&self, state: &RecoveryState) -> CoreResult<PathBuf> {
@@ -362,31 +957,39 @@ impl Store {
             .lock()
             .map_err(|_| CoreError::StateUnavailable)?;
         let mut statement = connection.prepare(
-            "SELECT region_id, asset_id, polygon_norm_json
+            "SELECT region_id, asset_id, polygon_norm_json, template_id, template_version
              FROM regions
-             WHERE asset_id = ?1
+             WHERE asset_id = ?1 AND status = 'active'
              ORDER BY created_at ASC, region_id ASC",
         )?;
         let rows = statement.query_map(params![asset_id], |row| {
-            let polygon_json: String = row.get(2)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                polygon_json,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u32>(4)?,
             ))
         })?;
-        let mut regions = Vec::new();
-        for row in rows {
-            let (region_id, asset_id, polygon_json) = row?;
-            let polygon_norm =
-                serde_json::from_str(&polygon_json).map_err(|_| CoreError::Database)?;
-            regions.push(SavedRegion {
-                region_id,
-                asset_id,
-                polygon_norm,
-            });
-        }
-        Ok(regions)
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        records
+            .into_iter()
+            .map(
+                |(region_id, asset_id, polygon_json, template_id, template_version)| {
+                    let polygon_norm =
+                        serde_json::from_str(&polygon_json).map_err(|_| CoreError::Database)?;
+                    Ok(SavedRegion {
+                        labels: read_region_labels(&connection, &region_id)?,
+                        region_id,
+                        asset_id,
+                        polygon_norm,
+                        template_id,
+                        template_version,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub(crate) fn template_snapshot_json(
@@ -411,8 +1014,8 @@ impl Store {
 
     fn count_rows(&self, table: &str) -> CoreResult<usize> {
         let query = match table {
-            "regions" => "SELECT COUNT(*) FROM regions",
-            "region_label_values" => "SELECT COUNT(*) FROM region_label_values",
+            "regions" => "SELECT COUNT(*) FROM regions WHERE status = 'active'",
+            "region_label_values" => "SELECT COUNT(*) FROM region_label_values WHERE region_id IN (SELECT region_id FROM regions WHERE status = 'active')",
             _ => return Err(CoreError::StateUnavailable),
         };
         self.verify_database_artifacts_safe()?;
@@ -517,6 +1120,341 @@ impl Store {
             Err(_) => Err(CoreError::Filesystem),
         }
     }
+
+    fn read_fixed_template_manifest(&self) -> CoreResult<Option<FixedTemplateManifest>> {
+        let Some(bytes) = self.read_relative_optional(Path::new(FIXED_TEMPLATE_MANIFEST_FILE))?
+        else {
+            return Ok(None);
+        };
+        let manifest: FixedTemplateManifest =
+            serde_json::from_slice(&bytes).map_err(|_| CoreError::FixedTemplateMissing)?;
+        if manifest.format != "gwp-fixed-template"
+            || !is_sha256_hex(&manifest.content_sha256)
+            || !is_sha256_hex(&manifest.template_sha256)
+        {
+            return Err(CoreError::FixedTemplateMissing);
+        }
+        Ok(Some(manifest))
+    }
+
+    fn read_relative_optional(&self, relative: &Path) -> CoreResult<Option<Vec<u8>>> {
+        read_optional_work_file(&self.work_root, relative)
+    }
+
+    fn read_relative_required(&self, relative: &Path) -> CoreResult<Vec<u8>> {
+        self.read_relative_optional(relative)?
+            .ok_or(CoreError::Filesystem)
+    }
+
+    fn remove_relative_if_exists(&self, relative: &Path) -> CoreResult<()> {
+        if !is_safe_relative_path(relative) {
+            return Err(CoreError::InvalidWorkPath);
+        }
+        let file_name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(CoreError::InvalidWorkPath)?;
+        let parent = self.safe_output_parent(relative)?;
+        let parent = self.resolved_parent_within_work_root(&parent)?;
+        let destination = parent.join(file_name);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if is_link_or_reparse(&metadata) || !file_type.is_file() {
+                    return Err(CoreError::UnsafeDerivedPath);
+                }
+                fs::remove_file(destination)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(CoreError::Filesystem),
+        }
+    }
+
+    fn reserve_relative_file(&self, relative: &Path) -> CoreResult<PathBuf> {
+        if !is_safe_relative_path(relative) {
+            return Err(CoreError::InvalidWorkPath);
+        }
+        let file_name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(CoreError::InvalidWorkPath)?;
+        let parent = self.safe_output_parent(relative)?;
+        let parent = self.resolved_parent_within_work_root(&parent)?;
+        let destination = parent.join(file_name);
+        self.ensure_safe_output_target(&destination)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&destination)?;
+        file.sync_all()?;
+        Ok(destination)
+    }
+}
+
+fn read_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<Option<Vec<u8>>> {
+    if !is_safe_relative_path(relative) {
+        return Err(CoreError::InvalidWorkPath);
+    }
+    let root_metadata = match fs::symlink_metadata(work_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CoreError::Filesystem),
+    };
+    if is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
+        return Err(CoreError::UnsafeDerivedPath);
+    }
+    let canonical_root = fs::canonicalize(work_root)?;
+    let mut current = canonical_root.clone();
+    let components = relative.components().collect::<Vec<_>>();
+    let (file_component, parent_components) =
+        components.split_last().ok_or(CoreError::InvalidWorkPath)?;
+    for component in parent_components {
+        let Component::Normal(name) = component else {
+            return Err(CoreError::InvalidWorkPath);
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                    return Err(CoreError::UnsafeDerivedPath);
+                }
+                let resolved = fs::canonicalize(&current)?;
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(CoreError::UnsafeDerivedPath);
+                }
+                current = resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(CoreError::Filesystem),
+        }
+    }
+    let Component::Normal(file_name) = file_component else {
+        return Err(CoreError::InvalidWorkPath);
+    };
+    let path = current.join(file_name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CoreError::Filesystem),
+    };
+    if is_link_or_reparse(&metadata) || !metadata.file_type().is_file() {
+        return Err(CoreError::UnsafeDerivedPath);
+    }
+    fs::read(path).map(Some).map_err(Into::into)
+}
+
+fn remove_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<()> {
+    if !is_safe_relative_path(relative) {
+        return Err(CoreError::InvalidWorkPath);
+    }
+    let root_metadata = match fs::symlink_metadata(work_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(CoreError::Filesystem),
+    };
+    if is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
+        return Err(CoreError::UnsafeDerivedPath);
+    }
+    let canonical_root = fs::canonicalize(work_root)?;
+    let mut current = canonical_root.clone();
+    let components = relative.components().collect::<Vec<_>>();
+    let (file_component, parent_components) =
+        components.split_last().ok_or(CoreError::InvalidWorkPath)?;
+    for component in parent_components {
+        let Component::Normal(name) = component else {
+            return Err(CoreError::InvalidWorkPath);
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                    return Err(CoreError::UnsafeDerivedPath);
+                }
+                let resolved = fs::canonicalize(&current)?;
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(CoreError::UnsafeDerivedPath);
+                }
+                current = resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(CoreError::Filesystem),
+        }
+    }
+    let Component::Normal(file_name) = file_component else {
+        return Err(CoreError::InvalidWorkPath);
+    };
+    let path = current.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata) || !metadata.file_type().is_file() {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CoreError::Filesystem),
+    }
+}
+
+fn validate_project_session(state: &ProjectSessionState) -> CoreResult<()> {
+    if state.source_root.trim().is_empty()
+        || !Path::new(&state.source_root).is_absolute()
+        || state.current_case_id.is_some() != state.current_asset_id.is_some()
+        || state
+            .current_case_id
+            .as_deref()
+            .is_some_and(|value| !is_opaque_id(value, "CASE-"))
+        || state
+            .current_asset_id
+            .as_deref()
+            .is_some_and(|value| !is_opaque_id(value, "ASSET-"))
+        || state
+            .template_content_sha256
+            .as_deref()
+            .is_some_and(|value| !is_sha256_hex(value))
+    {
+        return Err(CoreError::StateUnavailable);
+    }
+    Ok(())
+}
+
+fn fixed_template_from_bytes(
+    manifest: &FixedTemplateManifest,
+    contents: &[u8],
+) -> CoreResult<FixedTemplate> {
+    let text =
+        std::str::from_utf8(contents).map_err(|_| CoreError::FixedTemplateChecksumMismatch)?;
+    let template =
+        LabelTemplate::parse_toml(text).map_err(|_| CoreError::FixedTemplateChecksumMismatch)?;
+    let snapshot = template.snapshot()?;
+    let content_sha256 = sha256_hex(contents);
+    if manifest.content_sha256 != content_sha256 || manifest.template_sha256 != snapshot.sha256 {
+        return Err(CoreError::FixedTemplateChecksumMismatch);
+    }
+    Ok(FixedTemplate {
+        content_sha256,
+        template_sha256: snapshot.sha256,
+        template,
+    })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    HEXLOWER.encode(Sha256::digest(bytes).as_slice())
+}
+
+fn random_opaque_id(prefix: &str) -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("{prefix}{}", BASE32_NOPAD.encode(&bytes))
+}
+
+fn ensure_template_snapshot(
+    transaction: &Transaction<'_>,
+    snapshot: &crate::core::template::TemplateSnapshot,
+) -> CoreResult<()> {
+    match transaction
+        .query_row(
+            "SELECT sha256 FROM templates WHERE template_id = ?1 AND version = ?2",
+            params![snapshot.template_id, snapshot.version],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        Some(existing_sha) if existing_sha != snapshot.sha256 => {
+            Err(CoreError::TemplateSnapshotConflict)
+        }
+        Some(_) => Ok(()),
+        None => {
+            transaction.execute(
+                "INSERT INTO templates (template_id, version, sha256, canonical_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    snapshot.template_id,
+                    snapshot.version,
+                    snapshot.sha256,
+                    snapshot.canonical_json,
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn read_region_labels(
+    connection: &Connection,
+    region_id: &str,
+) -> CoreResult<BTreeMap<String, LabelValue>> {
+    let mut statement = connection.prepare(
+        "SELECT field_id, value_json FROM region_label_values WHERE region_id = ?1 ORDER BY field_id ASC",
+    )?;
+    let rows = statement.query_map(params![region_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut labels = BTreeMap::new();
+    for row in rows {
+        let (field_id, value_json) = row?;
+        let value = serde_json::from_str(&value_json).map_err(|_| CoreError::Database)?;
+        if labels.insert(field_id, value).is_some() {
+            return Err(CoreError::Database);
+        }
+    }
+    Ok(labels)
+}
+
+fn labels_json(labels: &BTreeMap<String, LabelValue>) -> CoreResult<String> {
+    serde_json::to_string(labels).map_err(|_| CoreError::InvalidLabels)
+}
+
+fn insert_region_labels(
+    transaction: &Transaction<'_>,
+    region_id: &str,
+    labels: &BTreeMap<String, LabelValue>,
+) -> CoreResult<()> {
+    for (field_id, value) in labels {
+        let value_json = serde_json::to_string(value).map_err(|_| CoreError::InvalidLabels)?;
+        transaction.execute(
+            "INSERT INTO region_label_values (region_id, field_id, value_json) VALUES (?1, ?2, ?3)",
+            params![region_id, field_id, value_json],
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_region_operation(
+    transaction: &Transaction<'_>,
+    operation_kind: &str,
+    subject_region_id: &str,
+    related_region_id: Option<&str>,
+    before_polygon_norm_json: Option<&str>,
+    before_labels_json: Option<&str>,
+    after_polygon_norm_json: Option<&str>,
+    after_labels_json: Option<&str>,
+    occurred_at: i64,
+) -> CoreResult<()> {
+    transaction.execute(
+        "INSERT INTO region_operations (operation_kind, subject_region_id, related_region_id, occurred_at, before_polygon_norm_json, before_labels_json, after_polygon_norm_json, after_labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            operation_kind,
+            subject_region_id,
+            related_region_id,
+            occurred_at,
+            before_polygon_norm_json,
+            before_labels_json,
+            after_polygon_norm_json,
+            after_labels_json,
+        ],
+    )?;
+    Ok(())
 }
 
 /// The temporary file is always created in `destination.parent()`, so every replacement stays on
@@ -644,11 +1582,16 @@ fn configure_and_migrate(connection: &mut Connection) -> CoreResult<()> {
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
 
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 && !table_exists(connection, "cases")? {
-        create_v2_schema(connection)?;
+        create_v3_schema(connection)?;
+        return Ok(());
     } else if version < 2 {
         migrate_legacy_cases_to_v2(connection)?;
+        version = 2;
+    }
+    if version < SCHEMA_VERSION {
+        migrate_v2_to_v3(connection)?;
     } else {
         // A partially upgraded directory may retain this named v1 trigger even after its
         // user_version changed. It is harmless to remove and keeps reopening idempotent.
@@ -669,7 +1612,7 @@ fn table_exists(connection: &Connection, table: &str) -> CoreResult<bool> {
         .is_some())
 }
 
-fn create_v2_schema(connection: &mut Connection) -> CoreResult<()> {
+fn create_v3_schema(connection: &mut Connection) -> CoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "
@@ -707,6 +1650,9 @@ fn create_v2_schema(connection: &mut Connection) -> CoreResult<()> {
             template_id TEXT NOT NULL,
             template_version INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deleted', 'replaced')),
+            updated_at INTEGER NOT NULL,
+            replacement_region_id TEXT REFERENCES regions(region_id),
             FOREIGN KEY(template_id, template_version) REFERENCES templates(template_id, version)
         );
         CREATE TABLE IF NOT EXISTS region_label_values (
@@ -715,12 +1661,64 @@ fn create_v2_schema(connection: &mut Connection) -> CoreResult<()> {
             value_json TEXT NOT NULL,
             PRIMARY KEY(region_id, field_id)
         );
+        CREATE TABLE IF NOT EXISTS region_operations (
+            operation_id INTEGER PRIMARY KEY,
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced')),
+            subject_region_id TEXT NOT NULL REFERENCES regions(region_id),
+            related_region_id TEXT REFERENCES regions(region_id),
+            occurred_at INTEGER NOT NULL,
+            before_polygon_norm_json TEXT,
+            before_labels_json TEXT,
+            after_polygon_norm_json TEXT,
+            after_labels_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS capture_sources (
+            captured_asset_id TEXT PRIMARY KEY REFERENCES assets(asset_id),
+            case_id TEXT NOT NULL REFERENCES cases(case_id),
+            parent_video_asset_id TEXT NOT NULL CHECK(parent_video_asset_id GLOB 'ASSET-*'),
+            capture_time_millis INTEGER NOT NULL CHECK(capture_time_millis >= 0),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0)
+        );
         DROP TRIGGER IF EXISTS representative_assets_limit_before_insert;
         ",
     )?;
-    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_v2_to_v3(connection: &mut Connection) -> CoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        DROP TRIGGER IF EXISTS representative_assets_limit_before_insert;
+        ALTER TABLE regions ADD COLUMN status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deleted', 'replaced'));
+        ALTER TABLE regions ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE regions ADD COLUMN replacement_region_id TEXT REFERENCES regions(region_id);
+        UPDATE regions SET updated_at = created_at WHERE updated_at = 0;
+        CREATE TABLE region_operations (
+            operation_id INTEGER PRIMARY KEY,
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced')),
+            subject_region_id TEXT NOT NULL REFERENCES regions(region_id),
+            related_region_id TEXT REFERENCES regions(region_id),
+            occurred_at INTEGER NOT NULL,
+            before_polygon_norm_json TEXT,
+            before_labels_json TEXT,
+            after_polygon_norm_json TEXT,
+            after_labels_json TEXT
+        );
+        CREATE TABLE capture_sources (
+            captured_asset_id TEXT PRIMARY KEY REFERENCES assets(asset_id),
+            case_id TEXT NOT NULL REFERENCES cases(case_id),
+            parent_video_asset_id TEXT NOT NULL CHECK(parent_video_asset_id GLOB 'ASSET-*'),
+            capture_time_millis INTEGER NOT NULL CHECK(capture_time_millis >= 0),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0)
+        );
+        PRAGMA user_version = 3;
+        ",
+    )?;
+    transaction.commit()?;
+    verify_foreign_keys(connection)
 }
 
 fn migrate_legacy_cases_to_v2(connection: &mut Connection) -> CoreResult<()> {
@@ -780,7 +1778,12 @@ fn upsert_case_and_asset(
     )?;
     transaction.execute(
         "INSERT INTO assets (asset_id, case_id, kind, width, height, source_fingerprint) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(asset_id) DO UPDATE SET case_id = excluded.case_id, kind = excluded.kind, width = excluded.width, height = excluded.height, source_fingerprint = excluded.source_fingerprint",
+         ON CONFLICT(asset_id) DO UPDATE SET
+           case_id = excluded.case_id,
+           kind = excluded.kind,
+           width = CASE WHEN excluded.width > 0 THEN excluded.width ELSE assets.width END,
+           height = CASE WHEN excluded.height > 0 THEN excluded.height ELSE assets.height END,
+           source_fingerprint = excluded.source_fingerprint",
         params![
             asset.asset_id,
             asset.case_id,
@@ -812,6 +1815,24 @@ fn validate_region_draft(draft: &RegionDraft) -> CoreResult<()> {
     }
     draft.template.validate_label_values(&draft.labels)?;
     validate_polygon(&draft.polygon_norm)
+}
+
+fn validate_capture_png(bytes: &[u8], width: u32, height: u32) -> CoreResult<()> {
+    // The WebView creates captures via canvas.toDataURL("image/png"). Verify the immutable PNG
+    // signature and IHDR dimensions before turning the bytes into a persistent image asset.
+    if bytes.len() < 33
+        || bytes[..8] != PNG_SIGNATURE
+        || bytes[8..12] != [0, 0, 0, 13]
+        || bytes[12..16] != *b"IHDR"
+    {
+        return Err(CoreError::InvalidCapture);
+    }
+    let png_width = u32::from_be_bytes(bytes[16..20].try_into().expect("four-byte PNG width"));
+    let png_height = u32::from_be_bytes(bytes[20..24].try_into().expect("four-byte PNG height"));
+    if png_width == 0 || png_height == 0 || png_width != width || png_height != height {
+        return Err(CoreError::InvalidCapture);
+    }
+    Ok(())
 }
 
 fn validate_polygon(points: &[PointNorm]) -> CoreResult<()> {

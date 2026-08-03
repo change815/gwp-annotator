@@ -56,6 +56,12 @@ pub struct TemplateSnapshot {
 }
 
 impl LabelTemplate {
+    pub fn parse_toml(input: &str) -> CoreResult<Self> {
+        let template: Self = toml::from_str(input).map_err(|_| CoreError::InvalidTemplate)?;
+        template.validate()?;
+        Ok(template)
+    }
+
     pub fn parse_json(input: &str) -> CoreResult<Self> {
         let template: Self = serde_json::from_str(input)?;
         template.validate()?;
@@ -216,6 +222,46 @@ mod tests {
 
     use super::{parse_label_txt, FieldControl, LabelTemplate, LabelValue};
 
+    const TOML_TEMPLATE: &str = r#"
+format = "gwa-label-template"
+version = 1
+template_id = "template-beta"
+
+[[fields]]
+id = "field_a"
+label = "Field A"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "a1"
+label = "Option A"
+
+[[fields]]
+id = "field_b"
+label = "Field B"
+control = "single_select"
+required = false
+
+[[fields.options]]
+id = "b1"
+label = "Option B"
+
+[[fields]]
+id = "field_c"
+label = "Field C"
+control = "multi_select"
+required = true
+
+[[fields.options]]
+id = "c1"
+label = "Option C"
+
+[[fields.options]]
+id = "c2"
+label = "Option D"
+"#;
+
     #[test]
     fn label_txt_import_validation() {
         let template = parse_label_txt(
@@ -253,10 +299,69 @@ mod tests {
         assert!(template.validate_label_values(&BTreeMap::new()).is_err());
         let mut labels = BTreeMap::new();
         labels.insert("field_a".to_owned(), LabelValue::Single("a1".to_owned()));
+        labels.insert("field_b".to_owned(), LabelValue::Single("b1".to_owned()));
         labels.insert(
             "field_c".to_owned(),
             LabelValue::Multiple(vec!["c1".to_owned(), "c2".to_owned()]),
         );
         assert!(template.validate_label_values(&labels).is_ok());
+    }
+
+    #[test]
+    fn toml_template_controls_and_required_values_are_validated() {
+        let template = LabelTemplate::parse_toml(TOML_TEMPLATE).expect("valid TOML template");
+
+        assert_eq!(template.fields[0].control, FieldControl::Dropdown);
+        assert_eq!(template.fields[1].control, FieldControl::SingleSelect);
+        assert_eq!(template.fields[2].control, FieldControl::MultiSelect);
+        assert!(template.validate_label_values(&BTreeMap::new()).is_err());
+
+        let mut labels = BTreeMap::new();
+        labels.insert("field_a".to_owned(), LabelValue::Single("a1".to_owned()));
+        labels.insert("field_b".to_owned(), LabelValue::Single("b1".to_owned()));
+        labels.insert(
+            "field_c".to_owned(),
+            LabelValue::Multiple(vec!["c1".to_owned(), "c2".to_owned()]),
+        );
+        assert!(template.validate_label_values(&labels).is_ok());
+
+        labels.insert(
+            "field_b".to_owned(),
+            LabelValue::Multiple(vec!["b1".to_owned()]),
+        );
+        assert!(template.validate_label_values(&labels).is_err());
+    }
+
+    #[test]
+    fn toml_template_rejects_invalid_syntax_and_invalid_template_data() {
+        assert!(LabelTemplate::parse_toml("format = [").is_err());
+        assert!(LabelTemplate::parse_toml(
+            r#"
+format = "gwa-label-template"
+version = 1
+template_id = "template-invalid"
+
+[[fields]]
+id = "field_a"
+label = "Field A"
+control = "unsupported"
+required = true
+"#,
+        )
+        .is_err());
+        assert!(LabelTemplate::parse_toml(
+            r#"
+format = "gwa-label-template"
+version = 1
+template_id = "template-invalid"
+
+[[fields]]
+id = "field_a"
+label = "Field A"
+control = "dropdown"
+required = true
+"#,
+        )
+        .is_err());
     }
 }

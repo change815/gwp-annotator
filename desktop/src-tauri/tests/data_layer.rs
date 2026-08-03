@@ -3,10 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use filetime::FileTime;
 use gwp_annotator_core::core::error::CoreError;
 use gwp_annotator_core::core::scan::{MediaKind, PublicAsset, PublicCase, PublicScan};
-use gwp_annotator_core::core::service::SaveRegionRequest;
+use gwp_annotator_core::core::service::{
+    CaptureFrameRequest, ReplaceRegionRequest, RestoreStatus, SaveRegionRequest,
+    UpdateRegionLabelsRequest,
+};
 use gwp_annotator_core::core::store::{PointNorm, RecoveryState, SaveFault};
 use gwp_annotator_core::core::template::{
     FieldControl, LabelTemplate, LabelValue, TemplateField, TemplateOption, LABEL_TEMPLATE_FORMAT,
@@ -84,6 +89,112 @@ fn all_images(scan: &PublicScan) -> Vec<(PublicCase, PublicAsset)> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn first_video(scan: &PublicScan) -> (PublicCase, PublicAsset) {
+    scan.campuses
+        .iter()
+        .flat_map(|campus| campus.cases.iter())
+        .find_map(|case| {
+            case.assets
+                .iter()
+                .find(|asset| asset.media_kind == MediaKind::Video)
+                .cloned()
+                .map(|asset| (case.clone(), asset))
+        })
+        .expect("video asset")
+}
+
+const V02_TOML_TEMPLATE: &str = r#"
+format = "gwa-label-template"
+version = 1
+template_id = "template-v02"
+
+[[fields]]
+id = "field_dropdown"
+label = "Dropdown"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "dropdown_a"
+label = "Dropdown A"
+
+[[fields.options]]
+id = "dropdown_b"
+label = "Dropdown B"
+
+[[fields]]
+id = "field_single"
+label = "Single"
+control = "single_select"
+required = false
+
+[[fields.options]]
+id = "single_a"
+label = "Single A"
+
+[[fields]]
+id = "field_multi"
+label = "Multi"
+control = "multi_select"
+required = true
+
+[[fields.options]]
+id = "multi_a"
+label = "Multi A"
+
+[[fields.options]]
+id = "multi_b"
+label = "Multi B"
+"#;
+
+fn v02_labels(dropdown: &str) -> BTreeMap<String, LabelValue> {
+    BTreeMap::from([
+        (
+            "field_dropdown".to_owned(),
+            LabelValue::Single(dropdown.to_owned()),
+        ),
+        (
+            "field_single".to_owned(),
+            LabelValue::Single("single_a".to_owned()),
+        ),
+        (
+            "field_multi".to_owned(),
+            LabelValue::Multiple(vec!["multi_a".to_owned(), "multi_b".to_owned()]),
+        ),
+    ])
+}
+
+fn synthetic_png(width: u32, height: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::from([137, 80, 78, 71, 13, 10, 26, 10]);
+    bytes.extend_from_slice(&13_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn v02_region_request(
+    region_id: &str,
+    asset_id: String,
+    labels: BTreeMap<String, LabelValue>,
+) -> SaveRegionRequest {
+    SaveRegionRequest {
+        region_id: region_id.to_owned(),
+        asset_id,
+        polygon_norm: vec![
+            PointNorm { x: 0.1, y: 0.1 },
+            PointNorm { x: 0.8, y: 0.1 },
+            PointNorm { x: 0.4, y: 0.8 },
+        ],
+        template_id: "template-v02".to_owned(),
+        template_version: 1,
+        labels,
+    }
 }
 
 fn generic_template() -> LabelTemplate {
@@ -345,7 +456,7 @@ fn legacy_v1_database_migrates_without_limit_and_preserves_data_after_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("schema version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let cases_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cases'",
@@ -700,9 +811,22 @@ fn privacy_leak_scan() {
         .write_capture(&case.case_id, &asset.asset_id, b"derived-capture")
         .expect("capture");
 
-    let persisted_text = collect_file_bytes(service.work_root())
-        .into_values()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    let persisted_files = collect_file_bytes(service.work_root());
+    let session_path = Path::new("session/project-session.json");
+    let session_text = String::from_utf8_lossy(
+        persisted_files
+            .get(session_path)
+            .expect("local-only project session"),
+    );
+    assert!(session_text.contains(fixture.source_root.to_string_lossy().as_ref()));
+    assert!(!session_text.contains(&case.case_id));
+    assert!(!session_text.contains("20240101_CASE-ALPHA"));
+    assert!(!session_text.contains("ASSET-01.JPG"));
+
+    let persisted_text = persisted_files
+        .into_iter()
+        .filter(|(path, _)| path != session_path)
+        .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
         .collect::<String>();
     assert!(!persisted_text.contains("20240101_CASE-ALPHA"));
     assert!(!persisted_text.contains("CAMPUS-ALPHA"));
@@ -1057,6 +1181,621 @@ fn resolved_symlink_overlap_is_rejected_before_scan_and_write() {
         service.select_representative(&case.case_id, &asset.asset_id),
         Err(CoreError::SourceWorkOverlap)
     ));
+}
+
+#[test]
+fn fixed_toml_template_validates_labels_and_reloads_with_the_saved_session() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let (case, asset) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, asset) = first_image(&scan);
+        let descriptor = service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install first fixed TOML template");
+        assert_eq!(descriptor.template_id, "template-v02");
+        assert_eq!(descriptor.template.fields.len(), 3);
+        assert_eq!(
+            descriptor.template.fields[0].control,
+            FieldControl::Dropdown
+        );
+        assert_eq!(
+            descriptor.template.fields[1].control,
+            FieldControl::SingleSelect
+        );
+        assert_eq!(
+            descriptor.template.fields[2].control,
+            FieldControl::MultiSelect
+        );
+        assert_eq!(
+            service
+                .current_fixed_template()
+                .expect("current fixed template")
+                .expect("fixed template installed"),
+            descriptor
+        );
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select representative");
+        assert!(matches!(
+            service.save_confirmed_region(v02_region_request(
+                "REGION-TOMLTEST",
+                asset.asset_id.clone(),
+                BTreeMap::new(),
+            )),
+            Err(CoreError::InvalidLabels)
+        ));
+        service
+            .save_confirmed_region(v02_region_request(
+                "REGION-TOMLTEST",
+                asset.asset_id.clone(),
+                v02_labels("dropdown_a"),
+            ))
+            .expect("save valid TOML-backed region");
+        service
+            .save_last_position(&case.case_id, &asset.asset_id)
+            .expect("save current position");
+        assert_eq!(
+            fs::read_to_string(
+                fixture
+                    .work_root
+                    .join("templates")
+                    .join("label-template-v1.toml"),
+            )
+            .expect("fixed TOML copy"),
+            V02_TOML_TEMPLATE
+        );
+        assert!(fixture
+            .work_root
+            .join("templates")
+            .join("label-template-v1.manifest.json")
+            .is_file());
+        assert!(matches!(
+            service.install_fixed_toml_template(
+                &V02_TOML_TEMPLATE.replace("template-v02", "template-other",)
+            ),
+            Err(CoreError::FixedTemplateAlreadyInstalled)
+        ));
+        (case, asset)
+    };
+
+    let reopened = service(&fixture);
+    let restored = reopened
+        .restore_project_session()
+        .expect("restore fixed-template session");
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        restored.current_case_id.as_deref(),
+        Some(case.case_id.as_str())
+    );
+    assert_eq!(
+        restored.current_asset_id.as_deref(),
+        Some(asset.asset_id.as_str())
+    );
+    assert_eq!(
+        restored.template.expect("restored template").template_id,
+        "template-v02"
+    );
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[test]
+fn project_session_handles_forget_missing_media_missing_template_and_missing_root() {
+    let fixture = fixture(1);
+    let (case, asset) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, asset) = first_image(&scan);
+        service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install fixed template");
+        service
+            .save_last_position(&case.case_id, &asset.asset_id)
+            .expect("save position");
+        (case, asset)
+    };
+
+    let restored = service(&fixture)
+        .restore_project_session()
+        .expect("restore session");
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        restored.current_case_id.as_deref(),
+        Some(case.case_id.as_str())
+    );
+    assert_eq!(
+        restored.current_asset_id.as_deref(),
+        Some(asset.asset_id.as_str())
+    );
+
+    let forgetting_service = service(&fixture);
+    forgetting_service
+        .forget_last_position()
+        .expect("forget saved session");
+    assert_eq!(
+        service(&fixture)
+            .restore_project_session()
+            .expect("empty session restore")
+            .status,
+        RestoreStatus::NoSession
+    );
+
+    let rescan_service = service(&fixture);
+    rescan_service
+        .scan_selected_root(&fixture.source_root)
+        .expect("rescan fixture");
+    rescan_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("identical fixed template remains valid");
+    rescan_service
+        .save_last_position(&case.case_id, &asset.asset_id)
+        .expect("save position before media removal");
+    drop(rescan_service);
+
+    fs::remove_file(
+        fixture
+            .source_root
+            .join("CAMPUS-ALPHA")
+            .join("20240101_CASE-ALPHA")
+            .join("ASSET-01.JPG"),
+    )
+    .expect("remove synthetic current asset");
+    assert_eq!(
+        service(&fixture)
+            .restore_project_session()
+            .expect("restore after current asset disappears")
+            .status,
+        RestoreStatus::LastMediaUnavailable
+    );
+
+    fs::remove_file(
+        fixture
+            .work_root
+            .join("templates")
+            .join("label-template-v1.toml"),
+    )
+    .expect("remove fixed TOML copy");
+    assert_eq!(
+        service(&fixture)
+            .restore_project_session()
+            .expect("restore with missing fixed template")
+            .status,
+        RestoreStatus::FixedTemplateMissing
+    );
+
+    fs::remove_dir_all(&fixture.source_root).expect("remove synthetic root");
+    assert_eq!(
+        service(&fixture)
+            .restore_project_session()
+            .expect("restore after synthetic root removal")
+            .status,
+        RestoreStatus::SavedRootUnavailable
+    );
+}
+
+#[test]
+fn region_update_replace_delete_keep_only_active_regions_and_audit_history() {
+    let fixture = fixture(1);
+    let (case, asset) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, asset) = first_image(&scan);
+        service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install template");
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select representative");
+        service
+            .save_confirmed_region(v02_region_request(
+                "REGION-ORIGINAL",
+                asset.asset_id.clone(),
+                v02_labels("dropdown_a"),
+            ))
+            .expect("save original region");
+        service
+            .update_region_labels(UpdateRegionLabelsRequest {
+                case_id: case.case_id.clone(),
+                asset_id: asset.asset_id.clone(),
+                region_id: "REGION-ORIGINAL".to_owned(),
+                template_id: "template-v02".to_owned(),
+                template_version: 1,
+                labels: v02_labels("dropdown_b"),
+            })
+            .expect("update region labels");
+        assert_eq!(
+            service
+                .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+                .expect("updated active region")[0]
+                .labels,
+            v02_labels("dropdown_b")
+        );
+        service
+            .replace_region(ReplaceRegionRequest {
+                case_id: case.case_id.clone(),
+                old_region_id: "REGION-ORIGINAL".to_owned(),
+                replacement: v02_region_request(
+                    "REGION-REPLACED",
+                    asset.asset_id.clone(),
+                    v02_labels("dropdown_a"),
+                ),
+            })
+            .expect("replace region with redraw");
+        let active = service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("replacement active region");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].region_id, "REGION-REPLACED");
+        service
+            .delete_region(&case.case_id, &asset.asset_id, "REGION-REPLACED")
+            .expect("delete replacement region");
+        assert!(service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("no active regions")
+            .is_empty());
+        assert_eq!(service.region_count().expect("active region count"), 0);
+        assert_eq!(service.region_label_count().expect("active label count"), 0);
+        service
+            .deselect_representative(&case.case_id, &asset.asset_id)
+            .expect("deleted regions no longer block deselection");
+        (case, asset)
+    };
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("inspect region audit data");
+    let original: (String, Option<String>) = connection
+        .query_row(
+            "SELECT status, replacement_region_id FROM regions WHERE region_id = 'REGION-ORIGINAL'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("replaced source region");
+    assert_eq!(
+        original,
+        ("replaced".to_owned(), Some("REGION-REPLACED".to_owned()))
+    );
+    let replacement_status: String = connection
+        .query_row(
+            "SELECT status FROM regions WHERE region_id = 'REGION-REPLACED'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("deleted replacement region");
+    assert_eq!(replacement_status, "deleted");
+    let operations = connection
+        .prepare("SELECT operation_kind FROM region_operations ORDER BY operation_id")
+        .expect("region operation query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("region operation rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("region operations");
+    assert_eq!(
+        operations,
+        vec![
+            "created",
+            "labels_updated",
+            "created",
+            "replaced",
+            "deleted"
+        ]
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM regions WHERE asset_id = ?1 AND status = 'active'",
+                params![asset.asset_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("active region database count"),
+        0
+    );
+    assert!(!case.case_id.is_empty());
+}
+
+#[test]
+fn captured_frames_persist_as_annotatable_images_without_changing_the_source_tree() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let (case, video, captured_asset_id) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, video) = first_video(&scan);
+        service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install template");
+        assert!(matches!(
+            service.capture_video_frame(CaptureFrameRequest {
+                case_id: case.case_id.clone(),
+                video_asset_id: video.asset_id.clone(),
+                capture_time_millis: 0,
+                width: 2,
+                height: 2,
+                png_base64: BASE64_STANDARD.encode(b"not-a-png"),
+            }),
+            Err(CoreError::InvalidCapture)
+        ));
+        assert!(matches!(
+            service.capture_video_frame(CaptureFrameRequest {
+                case_id: case.case_id.clone(),
+                video_asset_id: video.asset_id.clone(),
+                capture_time_millis: 0,
+                width: 1,
+                height: 2,
+                png_base64: BASE64_STANDARD.encode(synthetic_png(2, 2, b"mismatched-dimensions")),
+            }),
+            Err(CoreError::InvalidCapture)
+        ));
+        let capture_bytes = synthetic_png(2, 2, b"synthetic-png-frame");
+        assert_eq!(
+            service
+                .video_asset_bytes(&case.case_id, &video.asset_id)
+                .expect("read synthetic video by opaque ID"),
+            b"fixture-video"
+        );
+        let captured = service
+            .capture_video_frame(CaptureFrameRequest {
+                case_id: case.case_id.clone(),
+                video_asset_id: video.asset_id.clone(),
+                capture_time_millis: 1_234,
+                width: 2,
+                height: 2,
+                png_base64: BASE64_STANDARD.encode(&capture_bytes),
+            })
+            .expect("persist captured frame");
+        assert_eq!(captured.case_id, case.case_id);
+        assert_eq!(captured.parent_video_asset_id, video.asset_id);
+        assert_eq!(captured.capture_time_millis, 1_234);
+        assert_eq!(captured.width, 2);
+        assert_eq!(captured.height, 2);
+        assert!(service
+            .current_scan()
+            .expect("scan with captured frame")
+            .campuses
+            .iter()
+            .flat_map(|campus| campus.cases.iter())
+            .find(|candidate| candidate.case_id == case.case_id)
+            .expect("captured case")
+            .assets
+            .iter()
+            .any(
+                |asset| asset.asset_id == captured.asset_id && asset.media_kind == MediaKind::Image
+            ));
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(
+                    service
+                        .read_image_asset(&case.case_id, &captured.asset_id)
+                        .expect("captured image payload")
+                        .data_base64,
+                )
+                .expect("captured image base64"),
+            capture_bytes
+        );
+        service
+            .select_representative(&case.case_id, &captured.asset_id)
+            .expect("captured frame as representative");
+        service
+            .save_confirmed_region(v02_region_request(
+                "REGION-CAPTURED",
+                captured.asset_id.clone(),
+                v02_labels("dropdown_a"),
+            ))
+            .expect("annotate captured frame");
+        service
+            .save_last_position(&case.case_id, &captured.asset_id)
+            .expect("save captured frame position");
+        (case, video, captured.asset_id)
+    };
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("inspect capture source");
+    let capture_source: (String, i64, u32, u32) = connection
+        .query_row(
+            "SELECT parent_video_asset_id, capture_time_millis, assets.width, assets.height
+             FROM capture_sources INNER JOIN assets ON assets.asset_id = capture_sources.captured_asset_id
+             WHERE captured_asset_id = ?1",
+            params![captured_asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("capture source metadata");
+    assert_eq!(capture_source, (video.asset_id.clone(), 1_234, 2, 2));
+    drop(connection);
+
+    let reopened = service(&fixture);
+    let restored = reopened
+        .restore_project_session()
+        .expect("restore captured frame session");
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        restored.current_case_id.as_deref(),
+        Some(case.case_id.as_str())
+    );
+    assert_eq!(
+        restored.current_asset_id.as_deref(),
+        Some(captured_asset_id.as_str())
+    );
+    assert!(restored
+        .scan
+        .expect("restored scan")
+        .campuses
+        .iter()
+        .flat_map(|campus| campus.cases.iter())
+        .find(|candidate| candidate.case_id == case.case_id)
+        .expect("restored captured case")
+        .assets
+        .iter()
+        .any(|asset| asset.asset_id == captured_asset_id && asset.media_kind == MediaKind::Image));
+    assert_eq!(
+        reopened
+            .saved_regions_for_asset(&case.case_id, &captured_asset_id)
+            .expect("captured annotations after restore")
+            .len(),
+        1
+    );
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[test]
+fn decoded_image_dimensions_are_validated_and_preserved_across_representative_reopen() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let (case, asset) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, asset) = first_image(&scan);
+        assert!(matches!(
+            service.record_image_dimensions(&case.case_id, &asset.asset_id, 0, 480),
+            Err(CoreError::InvalidAssetDimensions)
+        ));
+        assert!(matches!(
+            service.record_image_dimensions(&case.case_id, &asset.asset_id, 640, 0),
+            Err(CoreError::InvalidAssetDimensions)
+        ));
+        service
+            .record_image_dimensions(&case.case_id, &asset.asset_id, 640, 480)
+            .expect("record decoded dimensions");
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("representative upsert must not reset known dimensions");
+        (case, asset)
+    };
+
+    let reopened = service(&fixture);
+    reopened
+        .scan_selected_root(&fixture.source_root)
+        .expect("reopen image scan");
+    reopened
+        .select_representative(&case.case_id, &asset.asset_id)
+        .expect("repeat representative selection after reopen");
+    drop(reopened);
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("inspect persisted dimensions");
+    let dimensions: (u32, u32) = connection
+        .query_row(
+            "SELECT width, height FROM assets WHERE asset_id = ?1",
+            params![asset.asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("persisted dimensions");
+    assert_eq!(dimensions, (640, 480));
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[test]
+fn completed_case_backup_uses_a_consistent_sqlite_snapshot_and_includes_captures() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let (case, captured_asset_id, backup, capture_bytes) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, video) = first_video(&scan);
+        service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install template");
+        let capture_bytes = synthetic_png(3, 2, b"backup-capture-frame");
+        let captured = service
+            .capture_video_frame(CaptureFrameRequest {
+                case_id: case.case_id.clone(),
+                video_asset_id: video.asset_id,
+                capture_time_millis: 2_468,
+                width: 3,
+                height: 2,
+                png_base64: BASE64_STANDARD.encode(&capture_bytes),
+            })
+            .expect("capture frame for backup");
+        service
+            .select_representative(&case.case_id, &captured.asset_id)
+            .expect("select captured representative");
+        service
+            .save_confirmed_region(v02_region_request(
+                "REGION-BACKUPAA",
+                captured.asset_id.clone(),
+                v02_labels("dropdown_b"),
+            ))
+            .expect("commit annotation before backup");
+        let backup = service
+            .complete_case_and_backup(&case.case_id)
+            .expect("complete case backup");
+        assert_eq!(backup.case_id, case.case_id);
+        assert_eq!(backup.capture_count, 1);
+        (case, captured.asset_id, backup, capture_bytes)
+    };
+
+    let backup_root = fixture.work_root.join("backups").join(&case.case_id);
+    let manifests = collect_file_bytes(&backup_root)
+        .into_iter()
+        .filter(|(path, _)| path.file_name().is_some_and(|name| name == "manifest.json"))
+        .collect::<Vec<_>>();
+    assert_eq!(manifests.len(), 1, "only one completed backup manifest");
+    let (manifest_relative, manifest_bytes) = &manifests[0];
+    let manifest: serde_json::Value =
+        serde_json::from_slice(manifest_bytes).expect("backup completion manifest");
+    assert_eq!(manifest["format"], "gwp-case-backup");
+    assert_eq!(manifest["case_id"], case.case_id);
+    assert_eq!(
+        manifest["capture_asset_ids"],
+        serde_json::json!([captured_asset_id.clone()])
+    );
+    assert_eq!(manifest["completed_at"], backup.completed_at);
+    let backup_directory = manifest_relative.parent().expect("backup directory");
+    let backup_database = backup_root
+        .join(backup_directory)
+        .join("annotations.sqlite3");
+    let backup_connection = Connection::open(&backup_database).expect("open SQLite backup");
+    assert_eq!(
+        backup_connection
+            .query_row(
+                "SELECT COUNT(*) FROM regions WHERE asset_id = ?1 AND status = 'active'",
+                params![captured_asset_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("committed annotation in backup"),
+        1
+    );
+    assert_eq!(
+        backup_connection
+            .query_row(
+                "SELECT COUNT(*) FROM capture_sources WHERE captured_asset_id = ?1",
+                params![captured_asset_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("capture source in backup"),
+        1
+    );
+    assert_eq!(
+        fs::read(
+            backup_root
+                .join(backup_directory)
+                .join("captures")
+                .join(format!("FRAME-{captured_asset_id}.png")),
+        )
+        .expect("backup capture bytes"),
+        capture_bytes
+    );
+    assert_eq!(
+        fs::read_to_string(
+            backup_root
+                .join(backup_directory)
+                .join("label-template-v1.toml"),
+        )
+        .expect("backup fixed template"),
+        V02_TOML_TEMPLATE
+    );
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
 }
 
 #[test]

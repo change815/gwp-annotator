@@ -6,9 +6,10 @@ use tauri::State;
 use crate::core::error::CoreError;
 use crate::core::scan::{ImageAssetData, LocalDisplayScan, PublicScan};
 use crate::core::service::{
-    ProjectService, RepresentativeSelection, SaveRegionRequest, TemplateDescriptor,
+    CaptureFrameRequest, ProjectService, ReplaceRegionRequest, RepresentativeSelection,
+    SaveRegionRequest, StartupRestore, TemplateDescriptor, UpdateRegionLabelsRequest,
 };
-use crate::core::store::SavedRegion;
+use crate::core::store::{BackupResult, CapturedFrame, SavedRegion};
 
 pub struct AppState {
     pub service: ProjectService,
@@ -46,6 +47,14 @@ pub fn scan_selected_root(
 
 pub fn current_scan(state: State<'_, AppState>) -> Result<PublicScan, CommandError> {
     state.service.current_scan().map_err(Into::into)
+}
+
+pub fn restore_project_session(state: State<'_, AppState>) -> Result<StartupRestore, CommandError> {
+    state.service.restore_project_session().map_err(Into::into)
+}
+
+pub fn forget_last_position(state: State<'_, AppState>) -> Result<(), CommandError> {
+    state.service.forget_last_position().map_err(Into::into)
 }
 
 /// Local UI-only command. The returned display fields are transient and are not persisted.
@@ -102,6 +111,32 @@ pub fn import_label_txt(
         .map_err(Into::into)
 }
 
+pub fn install_fixed_toml_template(
+    template_toml: String,
+    state: State<'_, AppState>,
+) -> Result<TemplateDescriptor, CommandError> {
+    state
+        .service
+        .install_fixed_toml_template(&template_toml)
+        .map_err(Into::into)
+}
+
+pub fn install_fixed_label_txt(
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<TemplateDescriptor, CommandError> {
+    state
+        .service
+        .install_fixed_label_txt(&text)
+        .map_err(Into::into)
+}
+
+pub fn current_fixed_template(
+    state: State<'_, AppState>,
+) -> Result<Option<TemplateDescriptor>, CommandError> {
+    state.service.current_fixed_template().map_err(Into::into)
+}
+
 pub fn save_confirmed_region(
     request: SaveRegionRequest,
     state: State<'_, AppState>,
@@ -109,6 +144,79 @@ pub fn save_confirmed_region(
     state
         .service
         .save_confirmed_region(request)
+        .map_err(Into::into)
+}
+
+pub fn update_region_labels(
+    request: UpdateRegionLabelsRequest,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .update_region_labels(request)
+        .map_err(Into::into)
+}
+
+pub fn delete_region(
+    case_id: String,
+    asset_id: String,
+    region_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .delete_region(&case_id, &asset_id, &region_id)
+        .map_err(Into::into)
+}
+
+pub fn replace_region(
+    request: ReplaceRegionRequest,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state.service.replace_region(request).map_err(Into::into)
+}
+
+pub fn capture_video_frame(
+    request: CaptureFrameRequest,
+    state: State<'_, AppState>,
+) -> Result<CapturedFrame, CommandError> {
+    state
+        .service
+        .capture_video_frame(request)
+        .map_err(Into::into)
+}
+
+pub fn complete_case_and_backup(
+    case_id: String,
+    state: State<'_, AppState>,
+) -> Result<BackupResult, CommandError> {
+    state
+        .service
+        .complete_case_and_backup(&case_id)
+        .map_err(Into::into)
+}
+
+pub fn save_last_position(
+    case_id: String,
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .save_last_position(&case_id, &asset_id)
+        .map_err(Into::into)
+}
+
+pub fn record_image_dimensions(
+    case_id: String,
+    asset_id: String,
+    width: u32,
+    height: u32,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .record_image_dimensions(&case_id, &asset_id, width, height)
         .map_err(Into::into)
 }
 
@@ -156,6 +264,9 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::AssetNotRepresentative => "ASSET_NOT_REPRESENTATIVE",
         CoreError::TemplateNotLoaded => "TEMPLATE_NOT_LOADED",
         CoreError::InvalidTemplate => "INVALID_TEMPLATE",
+        CoreError::FixedTemplateMissing => "FIXED_TEMPLATE_MISSING",
+        CoreError::FixedTemplateChecksumMismatch => "FIXED_TEMPLATE_CHECKSUM_MISMATCH",
+        CoreError::FixedTemplateAlreadyInstalled => "FIXED_TEMPLATE_ALREADY_INSTALLED",
         CoreError::InvalidLabels => "INVALID_LABELS",
         CoreError::InvalidPolygon => "INVALID_POLYGON",
         CoreError::TemplateSnapshotConflict => "TEMPLATE_SNAPSHOT_CONFLICT",
@@ -163,6 +274,12 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::InvalidWorkPath => "INVALID_WORK_PATH",
         CoreError::UnsafeDerivedPath => "UNSAFE_DERIVED_PATH",
         CoreError::RepresentativeHasRegions => "REPRESENTATIVE_HAS_REGIONS",
+        CoreError::RegionNotFound => "REGION_NOT_FOUND",
+        CoreError::RegionNotActive => "REGION_NOT_ACTIVE",
+        CoreError::NotVideoAsset => "NOT_VIDEO_ASSET",
+        CoreError::InvalidCapture => "INVALID_CAPTURE",
+        CoreError::InvalidAssetDimensions => "INVALID_ASSET_DIMENSIONS",
+        CoreError::SavedRootUnavailable => "SAVED_ROOT_UNAVAILABLE",
         CoreError::CredentialStoreUnavailable => "CREDENTIAL_STORE_UNAVAILABLE",
         CoreError::InvalidSecret => "INVALID_SECRET",
         CoreError::Filesystem => "FILESYSTEM_ERROR",

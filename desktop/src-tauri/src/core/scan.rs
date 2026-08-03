@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -279,14 +279,83 @@ impl ScanSession {
         // The source image is opened from the scan-time root handle. Unix opens every path
         // component with O_NOFOLLOW; Windows validates the final opened handle against the
         // scan-time file identity and physical path before any byte is read.
-        let mut file = open_source_image_no_follow(&self.source_root, asset)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
         Ok(ImageAssetData {
             asset_id: asset_id.to_owned(),
             mime_type: "image/jpeg".to_owned(),
-            data_base64: BASE64_STANDARD.encode(bytes),
+            data_base64: BASE64_STANDARD.encode(self.read_source_asset_bytes(asset)?),
         })
+    }
+
+    /// Returns bytes for an MP4 identified only by the opaque IDs from the active scan session.
+    /// The source relative path stays within this process and is never returned or serialized.
+    pub(crate) fn video_asset_bytes(&self, case_id: &str, asset_id: &str) -> CoreResult<Vec<u8>> {
+        let asset = self.video_asset(case_id, asset_id)?;
+        self.read_source_asset_bytes(asset)
+    }
+
+    /// Returns the scan-time video size without exposing a source path. The local protocol uses
+    /// this before parsing a Range request, avoiding a full media read just to find its length.
+    pub(crate) fn video_asset_size(&self, case_id: &str, asset_id: &str) -> CoreResult<usize> {
+        self.video_asset(case_id, asset_id)?
+            .size_bytes
+            .try_into()
+            .map_err(|_| CoreError::StateUnavailable)
+    }
+
+    /// Reads only the requested inclusive byte range from an identity-checked MP4 source.
+    pub(crate) fn video_asset_range_bytes(
+        &self,
+        case_id: &str,
+        asset_id: &str,
+        start: usize,
+        end: usize,
+    ) -> CoreResult<Vec<u8>> {
+        let asset = self.video_asset(case_id, asset_id)?;
+        let length: usize = asset
+            .size_bytes
+            .try_into()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        if start > end || end >= length {
+            return Err(CoreError::UnknownSessionItem);
+        }
+        let mut file = open_source_asset_no_follow(&self.source_root, asset)?;
+        file.seek(SeekFrom::Start(start as u64))?;
+        let expected = end - start + 1;
+        let mut bytes = Vec::with_capacity(expected);
+        file.take(expected as u64).read_to_end(&mut bytes)?;
+        if bytes.len() != expected {
+            return Err(CoreError::UnsafeSourceAsset);
+        }
+        Ok(bytes)
+    }
+
+    /// Validates that an opaque asset is an MP4 in the active scan without reading its bytes.
+    pub(crate) fn ensure_video_asset(&self, case_id: &str, asset_id: &str) -> CoreResult<()> {
+        self.video_asset(case_id, asset_id).map(|_| ())
+    }
+
+    fn video_asset(&self, case_id: &str, asset_id: &str) -> CoreResult<&MemoryAsset> {
+        let case = self
+            .cases
+            .get(case_id)
+            .ok_or(CoreError::UnknownSessionItem)?;
+        let asset = case
+            .assets
+            .get(asset_id)
+            .ok_or(CoreError::UnknownSessionItem)?;
+        if asset.media_kind != MediaKind::Video {
+            return Err(CoreError::NotVideoAsset);
+        }
+        Ok(asset)
+    }
+
+    fn read_source_asset_bytes(&self, asset: &MemoryAsset) -> CoreResult<Vec<u8>> {
+        // Both source images and videos use the same scan-time-root and file-identity checks.
+        // No fresh source path lookup occurs before the protected open.
+        let mut file = open_source_asset_no_follow(&self.source_root, asset)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -332,11 +401,11 @@ fn open_source_read_root(path: &Path) -> CoreResult<SourceReadRoot> {
     }
 }
 
-fn open_source_image_no_follow(root: &SourceReadRoot, asset: &MemoryAsset) -> CoreResult<File> {
+fn open_source_asset_no_follow(root: &SourceReadRoot, asset: &MemoryAsset) -> CoreResult<File> {
     #[cfg(unix)]
     {
         let identity = asset.source_identity.ok_or(CoreError::StateUnavailable)?;
-        let file = unix_open_relative_image_no_follow(&root.handle, &asset.source_relative_path)?;
+        let file = unix_open_relative_asset_no_follow(&root.handle, &asset.source_relative_path)?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() || unix_source_identity(&metadata) != identity {
             return Err(CoreError::UnsafeSourceAsset);
@@ -392,7 +461,7 @@ fn unix_open_path_no_follow(path: &Path, directory: bool) -> CoreResult<File> {
 }
 
 #[cfg(unix)]
-fn unix_open_relative_image_no_follow(root: &File, relative_path: &Path) -> CoreResult<File> {
+fn unix_open_relative_asset_no_follow(root: &File, relative_path: &Path) -> CoreResult<File> {
     let components = relative_path
         .components()
         .map(|component| match component {
@@ -521,12 +590,15 @@ fn windows_file_handle(file: &File) -> CoreResult<HANDLE> {
 }
 
 #[cfg(unix)]
-fn scan_image_identity(_path: &Path, metadata: &fs::Metadata) -> CoreResult<UnixSourceIdentity> {
+fn scan_source_identity(_path: &Path, metadata: &fs::Metadata) -> CoreResult<UnixSourceIdentity> {
     Ok(unix_source_identity(metadata))
 }
 
 #[cfg(windows)]
-fn scan_image_identity(path: &Path, _metadata: &fs::Metadata) -> CoreResult<WindowsSourceIdentity> {
+fn scan_source_identity(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> CoreResult<WindowsSourceIdentity> {
     let file = windows_open_path_no_follow(path, false)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
@@ -604,17 +676,9 @@ pub fn scan_data_root(root: &Path, secret: &ProjectSecret) -> CoreResult<ScanOut
                 let size_bytes = metadata.len();
                 let modified_millis = modified_millis(&metadata);
                 #[cfg(unix)]
-                let source_identity = if media_kind == MediaKind::Image {
-                    Some(scan_image_identity(&path, &metadata)?)
-                } else {
-                    None
-                };
+                let source_identity = Some(scan_source_identity(&path, &metadata)?);
                 #[cfg(windows)]
-                let source_identity = if media_kind == MediaKind::Image {
-                    Some(scan_image_identity(&path, &metadata)?)
-                } else {
-                    None
-                };
+                let source_identity = Some(scan_source_identity(&path, &metadata)?);
                 let asset_id = asset_id(
                     secret,
                     &case_id,
@@ -857,6 +921,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{natural_cmp, scan_data_root};
+    use crate::core::error::CoreError;
     use crate::core::ids::ProjectSecret;
 
     fn secret() -> ProjectSecret {
@@ -926,6 +991,54 @@ mod tests {
                 super::MediaKind::Video
             ]
         );
+    }
+
+    #[test]
+    fn session_reads_video_by_opaque_id_and_rejects_replaced_source() {
+        let (_temporary, root) = empty_two_campus_root();
+        let case_path = root.join("CAMPUS-ALPHA").join("20240102_CASE-ALPHA");
+        fs::create_dir_all(&case_path).expect("fixture case");
+        let video_path = case_path.join("ASSET-01.MP4");
+        fs::write(&video_path, b"synthetic mp4 payload").expect("fixture video");
+
+        let outcome = scan_data_root(&root, &secret()).expect("scan fixture");
+        let public_case = outcome
+            .public
+            .campuses
+            .iter()
+            .find_map(|campus| campus.cases.first())
+            .expect("public case");
+        let video = public_case
+            .assets
+            .iter()
+            .find(|asset| asset.media_kind == super::MediaKind::Video)
+            .expect("public video");
+
+        assert_eq!(
+            outcome
+                .session
+                .video_asset_bytes(&public_case.case_id, &video.asset_id)
+                .expect("opaque video read"),
+            b"synthetic mp4 payload"
+        );
+        assert_eq!(
+            outcome
+                .session
+                .video_asset_range_bytes(&public_case.case_id, &video.asset_id, 10, 12)
+                .expect("opaque video range read"),
+            b"mp4"
+        );
+
+        let replacement = case_path.join("ASSET-REPLACEMENT.MP4");
+        fs::write(&replacement, b"replacement synthetic mp4 payload").expect("replacement");
+        fs::rename(&replacement, &video_path).expect("replace source video");
+
+        assert!(matches!(
+            outcome
+                .session
+                .video_asset_bytes(&public_case.case_id, &video.asset_id),
+            Err(CoreError::UnsafeSourceAsset)
+        ));
     }
 
     #[test]

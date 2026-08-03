@@ -28,6 +28,12 @@ pub enum CoreError {
     TemplateNotLoaded,
     #[error("template validation failed")]
     InvalidTemplate,
+    #[error("the fixed project template is missing")]
+    FixedTemplateMissing,
+    #[error("the fixed project template does not match its recorded checksum")]
+    FixedTemplateChecksumMismatch,
+    #[error("a different fixed project template is already installed")]
+    FixedTemplateAlreadyInstalled,
     #[error("label values do not satisfy the template")]
     InvalidLabels,
     #[error("polygon is invalid")]
@@ -42,6 +48,18 @@ pub enum CoreError {
     UnsafeDerivedPath,
     #[error("a representative asset with saved regions cannot be deselected")]
     RepresentativeHasRegions,
+    #[error("requested region does not exist")]
+    RegionNotFound,
+    #[error("requested region is no longer active")]
+    RegionNotActive,
+    #[error("requested asset is not a source video")]
+    NotVideoAsset,
+    #[error("captured frame data is invalid")]
+    InvalidCapture,
+    #[error("image dimensions are invalid")]
+    InvalidAssetDimensions,
+    #[error("the saved data root is unavailable")]
+    SavedRootUnavailable,
     #[error("credential store is unavailable")]
     CredentialStoreUnavailable,
     #[error("secret material is invalid")]
