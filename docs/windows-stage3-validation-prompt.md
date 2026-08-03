@@ -17,6 +17,25 @@ git status --short
 
 也可在新的空目录执行 `git clone --branch main --single-branch <authorized-repository-url>`。记录实际 commit SHA；不要为复测提交、推送或创建 PR。
 
+### 旧克隆提示 `M desktop/src-tauri/Cargo.toml`
+
+这表示 Git 检测到该文件的工作树内容与当前提交不同，并不表示需要修改 Cargo。先检查是否存在实际内容差异：
+
+```powershell
+git diff --ignore-space-at-eol -- desktop/src-tauri/Cargo.toml
+```
+
+若该命令没有输出，通常只是旧 Windows 克隆的行尾状态。可只恢复这一文件，并在本次命令中临时要求 LF；不改全局 Git 设置：
+
+```powershell
+git -c core.autocrlf=false -c core.eol=lf restore --source=HEAD --worktree -- desktop/src-tauri/Cargo.toml
+git status --short
+git switch main
+git pull --ff-only origin main
+```
+
+若第一条差异检查有实际文本输出，停止更新并保留该文件，不要用 `reset`、`clean` 或覆盖命令丢弃未知改动。
+
 ## 仅限合成 fixture
 
 在 `%TEMP%` 下创建一个新目录，一级目录只能是 `CAMPUS-A` 与 `CAMPUS-B`，病例名称和媒体名称只使用 `CASE-...`、`ASSET-...` 等占位符。`CAMPUS-A` 的一个病例放入至少三张非临床、合成 JPG；为两个院区各放入至少一个病例。使用外部 JSON 或 `label.txt` 合成模板，不填写或推测医学标签词表。
