@@ -9,7 +9,7 @@
 ### 已确认范围
 
 - Windows 单机，默认离线；仅服务胃癌术中白斑区域标注。
-- 两院区目录、病例选择、左右键媒体浏览、每例 1--2 张代表图、自由圈选、多区域、模板标签、MP4 播放和当前帧截取。
+- 两院区目录、病例选择、左右键媒体浏览、按需数量的代表图、自由圈选、多区域、模板标签、MP4 播放和当前帧截取。
 - 原始 JPG/MP4 永不改写；所有输出只使用脱敏病例 ID。
 - 不含模型预测、分期、强制双人标注、审核、登录、云服务或自动医疗诊断。
 
@@ -112,7 +112,7 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 
 - MP4 在中央查看器中由 `<video>` 播放，作为浏览媒体参与左右键序列。
 - “截取当前帧”从已解码的当前画面绘制到离屏 Canvas，并写入项目目录 `captures/<case_id>/FRAME-<opaque-id>.jpg`；先写临时文件，成功后原子重命名。
-- 截帧不写入原始病例目录，不改动 MP4，也不支持逐帧追踪。截帧必须先被标为代表图，且与 JPG 共用每病例最多 2 张的上限和同一圈选流程。
+- 截帧不写入原始病例目录，不改动 MP4，也不支持逐帧追踪。截帧必须先被标为代表图，并与 JPG 共用同一代表图和圈选流程。
 - 标注记录保存 `source_kind: "captured_frame"`、脱敏 `source_asset_id` 和 `source_timestamp_ms`，不保存源视频文件名或原始路径。
 - 若 Windows 解码器不支持某个 MP4，界面显示不可播放原因并允许继续浏览其他媒体；V0.1 不在后台联网下载编解码器或转码源文件。
 
@@ -146,7 +146,7 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 | --- | --- | --- |
 | `cases` | `case_id`, `campus_code`, `representative_count`, `updated_at` | 不存储原始病例名或路径。 |
 | `assets` | `asset_id`, `case_id`, `kind`, `width`, `height`, `source_fingerprint` | `kind` 为 `original_image` 或 `captured_frame`；指纹是不可逆的 HMAC 输出。 |
-| `representative_assets` | `case_id`, `asset_id`, `selected_at` | 事务约束每个 `case_id` 最多 2 条。 |
+| `representative_assets` | `case_id`, `asset_id`, `selected_at` | 一个病例可按需保留任意数量的代表图。 |
 | `regions` | `region_id`, `asset_id`, `polygon_norm_json`, `template_id`, `template_version`, `created_at` | 一个区域一行，顶点为归一化坐标。 |
 | `region_label_values` | `region_id`, `field_id`, `value_json` | 单选/下拉保存一个 option ID；多选保存 option ID 数组。 |
 | `templates` | `template_id`, `version`, `sha256`, `canonical_json` | 保存已使用模板的不可变快照，不含患者信息。 |
@@ -289,5 +289,5 @@ COCO 多边形坐标在导出时由 `polygon_norm` 乘以源图像宽高得到�
 1. 建立 Rust 核心：项目工作目录、只读扫描、内存路径映射、HMAC ID、SQLite 迁移和原子保存。
 2. 建立 Tauri 界面：院区/病例/媒体导航、按需缩略图、图片渲染和键盘焦点规则。
 3. 实现自由圈选、模板解析与标签小窗口，使用假数据和占位模板测试所有控件。
-4. 增加 MP4 播放与当前帧截取，确保截帧走同一代表图限制与标注管线。
+4. 增加 MP4 播放与当前帧截取，确保截帧走同一代表图与标注管线。
 5. 实现 GWA-JSON、COCO 和隐私扫描导出，再按验收标准在 Windows 参考设备上验证。

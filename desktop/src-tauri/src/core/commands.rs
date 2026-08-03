@@ -152,7 +152,6 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::UnknownSessionItem => "UNKNOWN_SESSION_ITEM",
         CoreError::NotImageAsset => "NOT_IMAGE_ASSET",
         CoreError::UnsafeSourceAsset => "UNSAFE_SOURCE_ASSET",
-        CoreError::RepresentativeLimit => "REPRESENTATIVE_LIMIT",
         CoreError::RepresentativeNotSelected => "REPRESENTATIVE_NOT_SELECTED",
         CoreError::AssetNotRepresentative => "ASSET_NOT_REPRESENTATIVE",
         CoreError::TemplateNotLoaded => "TEMPLATE_NOT_LOADED",

@@ -5,10 +5,13 @@ import {
   boot,
   canAnnotate,
   canAutoClose,
+  clearCrosshairPointerState,
+  customCrosshairMarkup,
   labelsMeetRequiredFields,
   polygonArea,
   primaryDrawingButtonIsPressed,
   shouldHandleMediaNavigation,
+  shouldShowCustomCrosshair,
   type PointNorm,
   type TemplateField,
 } from "./main";
@@ -115,6 +118,38 @@ describe("template controls and representative gate", () => {
     expect(canAnnotate(true, false)).toBe(false);
     expect(canAnnotate(false, true)).toBe(false);
     expect(canAnnotate(true, true)).toBe(true);
+  });
+});
+
+describe("custom drawing crosshair", () => {
+  it("appears only for a mouse over an annotation-ready image outside pan and dialog states", () => {
+    expect(shouldShowCustomCrosshair(true, true, false, true, true, false)).toBe(true);
+    expect(shouldShowCustomCrosshair(false, true, false, true, true, false)).toBe(false);
+    expect(shouldShowCustomCrosshair(true, false, false, true, true, false)).toBe(false);
+    expect(shouldShowCustomCrosshair(true, true, true, true, true, false)).toBe(false);
+    expect(shouldShowCustomCrosshair(true, true, false, false, true, false)).toBe(false);
+    expect(shouldShowCustomCrosshair(true, true, false, true, false, false)).toBe(false);
+    expect(shouldShowCustomCrosshair(true, true, false, true, true, true)).toBe(false);
+  });
+
+  it("hides the cursor state when pointer capture stops", () => {
+    const stopped = clearCrosshairPointerState({ pointerInCanvas: true, x: 320, y: 240 });
+
+    expect(stopped).toEqual({ pointerInCanvas: false, x: 320, y: 240 });
+    expect(shouldShowCustomCrosshair(true, true, false, stopped.pointerInCanvas, true, false)).toBe(false);
+  });
+
+  it("renders a test-addressable non-interactive cursor element with stable coordinates", () => {
+    document.body.innerHTML = customCrosshairMarkup(true, 42.4, 64.6);
+    const cursor = document.querySelector<HTMLElement>("[data-drawing-crosshair]");
+
+    expect(cursor?.dataset.drawingCrosshair).toBe("visible");
+    expect(cursor?.getAttribute("aria-hidden")).toBe("true");
+    expect(cursor?.classList.contains("drawing-crosshair")).toBe(true);
+    expect(cursor?.style.pointerEvents).toBe("none");
+    expect(cursor?.style.zIndex).toBe("6");
+    expect(cursor?.style.getPropertyValue("--crosshair-x")).toBe("42px");
+    expect(cursor?.style.getPropertyValue("--crosshair-y")).toBe("65px");
   });
 });
 

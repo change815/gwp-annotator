@@ -170,6 +170,12 @@ interface DraftRegion {
   points: PointNorm[];
 }
 
+export interface CrosshairState {
+  pointerInCanvas: boolean;
+  x: number;
+  y: number;
+}
+
 interface State {
   campuses: DisplayCampus[];
   campusCode: string | null;
@@ -188,6 +194,7 @@ interface State {
   labelValues: Record<string, LabelValue>;
   template: LabelTemplate | null;
   templateFileName: string | null;
+  crosshair: CrosshairState;
   message: string;
   messageKind: "info" | "error" | "success";
 }
@@ -210,6 +217,7 @@ const initialState = (): State => ({
   labelValues: {},
   template: null,
   templateFileName: null,
+  crosshair: { pointerInCanvas: false, x: 0, y: 0 },
   message: "请选择本地数据根目录。",
   messageKind: "info",
 });
@@ -265,6 +273,27 @@ export function canAnnotate(representative: boolean, templateLoaded: boolean): b
   return representative && templateLoaded;
 }
 
+export function shouldShowCustomCrosshair(
+  representative: boolean,
+  templateLoaded: boolean,
+  panMode: boolean,
+  pointerInCanvas: boolean,
+  imageReady: boolean,
+  labelDialogOpen: boolean,
+): boolean {
+  return representative && templateLoaded && !panMode && pointerInCanvas && imageReady && !labelDialogOpen;
+}
+
+export function clearCrosshairPointerState(crosshair: CrosshairState): CrosshairState {
+  return { ...crosshair, pointerInCanvas: false };
+}
+
+export function customCrosshairMarkup(visible: boolean, x: number, y: number): string {
+  const safeX = Number.isFinite(x) ? Math.round(x) : 0;
+  const safeY = Number.isFinite(y) ? Math.round(y) : 0;
+  return `<div class="drawing-crosshair ${visible ? "visible" : ""}" data-drawing-crosshair="${visible ? "visible" : "hidden"}" aria-hidden="true" style="pointer-events: none; z-index: 6; --crosshair-x: ${safeX}px; --crosshair-y: ${safeY}px;"></div>`;
+}
+
 function getApi(): AppApi {
   return window.__GWP_API__ ?? tauriApi;
 }
@@ -281,7 +310,6 @@ function formatError(error: unknown): string {
   const messages: Record<string, string> = {
     INVALID_CAMPUS_LAYOUT: "数据根目录必须正好包含两个院区目录。",
     SOURCE_WORK_OVERLAP: "数据根目录与工作目录重叠，已拒绝操作。",
-    REPRESENTATIVE_LIMIT: "每个病例最多选择两张代表图。",
     REPRESENTATIVE_HAS_REGIONS: "该代表图已有保存区域，不能取消选择。",
     NOT_IMAGE_ASSET: "只有图片可以作为代表图。",
     ASSET_NOT_REPRESENTATIVE: "请先选择当前图片为代表图。",
@@ -395,6 +423,16 @@ function mountMarkup(state: State): string {
   const isImage = asset?.media_kind === "image";
   const isRepresentative = Boolean(asset && state.representativeIds.has(asset.asset_id));
   const annotationReady = canAnnotate(isRepresentative, Boolean(state.template));
+  const imageReady = Boolean(state.image && state.imageAssetId === asset?.asset_id);
+  const crosshairVisible = shouldShowCustomCrosshair(
+    isRepresentative,
+    Boolean(state.template),
+    state.panMode,
+    state.crosshair.pointerInCanvas,
+    imageReady,
+    Boolean(state.labelDraft),
+  );
+  const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft;
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
@@ -444,10 +482,11 @@ function mountMarkup(state: State): string {
               <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
             </div>
           </div>
-          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""}" data-canvas-frame>
+          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""}" data-canvas-frame>
             ${!asset ? `<p class="empty-copy">从左侧选择病例。</p>` : ""}
             ${asset?.media_kind === "video" ? `<div class="video-deferred"><strong>MP4</strong><p>视频将在下一阶段处理。当前不可播放、不可截帧、不可标注。</p></div>` : ""}
             ${isImage ? `<canvas data-drawing-canvas aria-label="图片标注画布" tabindex="0"></canvas>` : ""}
+            ${isImage ? customCrosshairMarkup(crosshairVisible, state.crosshair.x, state.crosshair.y) : ""}
             ${state.imageLoading ? `<div class="loading-cover">正在读取图片…</div>` : ""}
             ${isImage && !isRepresentative ? `<div class="canvas-hint">请先将当前图片选择为代表图，才可圈选。</div>` : ""}
             ${isImage && isRepresentative && !state.template ? `<div class="canvas-hint">请先加载标签模板，才可保存圈选。</div>` : ""}
@@ -577,6 +616,7 @@ function startApp(target: HTMLDivElement): void {
     }
     const requestedCase = currentCase.case_id;
     const requestedAsset = asset.asset_id;
+    state.crosshair.pointerInCanvas = false;
     state.image = null;
     state.imageAssetId = null;
     state.imageLoading = true;
@@ -608,6 +648,7 @@ function startApp(target: HTMLDivElement): void {
     state.selectedRegionId = null;
     state.view = { zoom: 1, panX: 0, panY: 0 };
     state.drawing = null;
+    state.crosshair.pointerInCanvas = false;
     await refreshRegions();
     await loadImage();
   };
@@ -619,6 +660,7 @@ function startApp(target: HTMLDivElement): void {
     state.view = { zoom: 1, panX: 0, panY: 0 };
     state.drawing = null;
     state.labelDraft = null;
+    state.crosshair.pointerInCanvas = false;
     await refreshRegions();
     await loadImage();
   };
@@ -665,7 +707,41 @@ function startApp(target: HTMLDivElement): void {
     observer.observe(canvas);
     draw(canvas);
     canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    const updateCrosshair = (): void => {
+      const asset = selectedAsset(state);
+      const visible = shouldShowCustomCrosshair(
+        Boolean(asset && state.representativeIds.has(asset.asset_id)),
+        Boolean(state.template),
+        state.panMode,
+        state.crosshair.pointerInCanvas,
+        Boolean(state.image && state.imageAssetId === asset?.asset_id),
+        Boolean(state.labelDraft),
+      );
+      const crosshair = canvas.parentElement?.querySelector<HTMLElement>("[data-drawing-crosshair]");
+      if (!crosshair) return;
+      crosshair.classList.toggle("visible", visible);
+      crosshair.dataset.drawingCrosshair = visible ? "visible" : "hidden";
+      crosshair.style.setProperty("--crosshair-x", `${Math.round(state.crosshair.x)}px`);
+      crosshair.style.setProperty("--crosshair-y", `${Math.round(state.crosshair.y)}px`);
+    };
+    const recordMousePosition = (event: PointerEvent): void => {
+      if (event.pointerType !== "mouse") return;
+      const pointer = canvasPoint(event, canvas);
+      state.crosshair = {
+        pointerInCanvas: pointer.x >= 0 && pointer.y >= 0 && pointer.x <= canvas.clientWidth && pointer.y <= canvas.clientHeight,
+        x: pointer.x,
+        y: pointer.y,
+      };
+      updateCrosshair();
+    };
+    canvas.addEventListener("pointerenter", recordMousePosition);
+    canvas.addEventListener("pointerleave", (event) => {
+      if (event.pointerType !== "mouse") return;
+      state.crosshair.pointerInCanvas = false;
+      updateCrosshair();
+    });
     canvas.addEventListener("pointerdown", (event) => {
+      recordMousePosition(event);
       const image = state.image;
       const asset = selectedAsset(state);
       if (!image || !asset) return;
@@ -691,6 +767,7 @@ function startApp(target: HTMLDivElement): void {
       draw(canvas);
     });
     canvas.addEventListener("pointermove", (event) => {
+      recordMousePosition(event);
       const image = state.image;
       if (!image) return;
       const pointer = canvasPoint(event, canvas);
@@ -742,6 +819,8 @@ function startApp(target: HTMLDivElement): void {
     });
     const stopPointer = (event: PointerEvent) => {
       panOrigin = null;
+      state.crosshair = clearCrosshairPointerState(state.crosshair);
+      updateCrosshair();
       if (state.drawing) {
         state.drawing = null;
         state.labelValues = {};
@@ -752,6 +831,7 @@ function startApp(target: HTMLDivElement): void {
     };
     canvas.addEventListener("pointerup", stopPointer);
     canvas.addEventListener("pointercancel", stopPointer);
+    canvas.addEventListener("lostpointercapture", stopPointer);
     canvas.addEventListener("wheel", (event) => {
       const image = state.image;
       if (!image) return;
@@ -806,6 +886,7 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelector<HTMLButtonElement>('[data-action="pan"]')?.addEventListener("click", () => {
       state.panMode = !state.panMode;
+      state.crosshair.pointerInCanvas = false;
       render();
     });
     target.querySelectorAll<HTMLButtonElement>('[data-action="representative"]').forEach((button) => {
@@ -823,6 +904,7 @@ function startApp(target: HTMLDivElement): void {
             state.representativeIds.add(assetId);
             message("已选择为代表图。", "success");
           }
+          state.crosshair.pointerInCanvas = false;
           render();
         } catch (error) {
           message(formatError(error), "error");
@@ -892,6 +974,7 @@ function startApp(target: HTMLDivElement): void {
         state.labelDraft = null;
         state.labelValues = {};
         await refreshRegions();
+        state.crosshair.pointerInCanvas = false;
         message("区域与标签已保存。", "success");
       } catch (error) {
         message(formatError(error), "error");
@@ -904,6 +987,7 @@ function startApp(target: HTMLDivElement): void {
           state.labelDraft = null;
           state.labelValues = {};
           state.drawing = null;
+          state.crosshair.pointerInCanvas = false;
           message("已丢弃未保存的圈选。", "info");
           render();
         }
@@ -926,6 +1010,7 @@ function startApp(target: HTMLDivElement): void {
       state.labelDraft = null;
       state.labelValues = {};
       state.drawing = null;
+      state.crosshair.pointerInCanvas = false;
       message("已丢弃未保存的圈选。", "info");
       render();
       return;

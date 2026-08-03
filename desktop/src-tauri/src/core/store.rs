@@ -141,14 +141,6 @@ impl Store {
             )
             .optional()?;
         if existing.is_none() {
-            let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM representative_assets WHERE case_id = ?1",
-                params![case.case_id],
-                |row| row.get(0),
-            )?;
-            if count >= 2 {
-                return Err(CoreError::RepresentativeLimit);
-            }
             transaction.execute(
                 "INSERT INTO representative_assets (case_id, asset_id, selected_at) VALUES (?1, ?2, ?3)",
                 params![case.case_id, asset.asset_id, now_millis()],
@@ -652,64 +644,127 @@ fn configure_and_migrate(connection: &mut Connection) -> CoreResult<()> {
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
 
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 1 && !table_exists(connection, "cases")? {
+        create_v2_schema(connection)?;
+    } else if version < 2 {
+        migrate_legacy_cases_to_v2(connection)?;
+    } else {
+        // A partially upgraded directory may retain this named v1 trigger even after its
+        // user_version changed. It is harmless to remove and keeps reopening idempotent.
+        connection
+            .execute_batch("DROP TRIGGER IF EXISTS representative_assets_limit_before_insert;")?;
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> CoreResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn create_v2_schema(connection: &mut Connection) -> CoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version < 1 {
+    transaction.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS cases (
+            case_id TEXT PRIMARY KEY CHECK(case_id GLOB 'CASE-*'),
+            campus_code TEXT NOT NULL CHECK(campus_code GLOB 'CAMPUS-*'),
+            representative_count INTEGER NOT NULL DEFAULT 0 CHECK(representative_count >= 0),
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS assets (
+            asset_id TEXT PRIMARY KEY CHECK(asset_id GLOB 'ASSET-*'),
+            case_id TEXT NOT NULL REFERENCES cases(case_id),
+            kind TEXT NOT NULL CHECK(kind IN ('original_image', 'captured_frame')),
+            width INTEGER NOT NULL CHECK(width >= 0),
+            height INTEGER NOT NULL CHECK(height >= 0),
+            source_fingerprint TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS representative_assets (
+            case_id TEXT NOT NULL REFERENCES cases(case_id),
+            asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+            selected_at INTEGER NOT NULL,
+            PRIMARY KEY(case_id, asset_id)
+        );
+        CREATE TABLE IF NOT EXISTS templates (
+            template_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            canonical_json TEXT NOT NULL,
+            PRIMARY KEY(template_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS regions (
+            region_id TEXT PRIMARY KEY CHECK(region_id GLOB 'REGION-*'),
+            asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+            polygon_norm_json TEXT NOT NULL,
+            template_id TEXT NOT NULL,
+            template_version INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(template_id, template_version) REFERENCES templates(template_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS region_label_values (
+            region_id TEXT NOT NULL REFERENCES regions(region_id),
+            field_id TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            PRIMARY KEY(region_id, field_id)
+        );
+        DROP TRIGGER IF EXISTS representative_assets_limit_before_insert;
+        ",
+    )?;
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_legacy_cases_to_v2(connection: &mut Connection) -> CoreResult<()> {
+    // SQLite cannot drop a CHECK constraint in place. Foreign keys must be disabled before
+    // replacing the referenced table, then restored even when the migration transaction fails.
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration_result = (|| -> CoreResult<()> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS cases (
+            DROP TRIGGER IF EXISTS representative_assets_limit_before_insert;
+            CREATE TABLE cases_v2 (
                 case_id TEXT PRIMARY KEY CHECK(case_id GLOB 'CASE-*'),
                 campus_code TEXT NOT NULL CHECK(campus_code GLOB 'CAMPUS-*'),
-                representative_count INTEGER NOT NULL DEFAULT 0 CHECK(representative_count BETWEEN 0 AND 2),
+                representative_count INTEGER NOT NULL DEFAULT 0 CHECK(representative_count >= 0),
                 updated_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS assets (
-                asset_id TEXT PRIMARY KEY CHECK(asset_id GLOB 'ASSET-*'),
-                case_id TEXT NOT NULL REFERENCES cases(case_id),
-                kind TEXT NOT NULL CHECK(kind IN ('original_image', 'captured_frame')),
-                width INTEGER NOT NULL CHECK(width >= 0),
-                height INTEGER NOT NULL CHECK(height >= 0),
-                source_fingerprint TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS representative_assets (
-                case_id TEXT NOT NULL REFERENCES cases(case_id),
-                asset_id TEXT NOT NULL REFERENCES assets(asset_id),
-                selected_at INTEGER NOT NULL,
-                PRIMARY KEY(case_id, asset_id)
-            );
-            CREATE TRIGGER IF NOT EXISTS representative_assets_limit_before_insert
-            BEFORE INSERT ON representative_assets
-            WHEN (SELECT COUNT(*) FROM representative_assets WHERE case_id = NEW.case_id) >= 2
-            BEGIN
-                SELECT RAISE(ABORT, 'representative_limit');
-            END;
-            CREATE TABLE IF NOT EXISTS templates (
-                template_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                sha256 TEXT NOT NULL,
-                canonical_json TEXT NOT NULL,
-                PRIMARY KEY(template_id, version)
-            );
-            CREATE TABLE IF NOT EXISTS regions (
-                region_id TEXT PRIMARY KEY CHECK(region_id GLOB 'REGION-*'),
-                asset_id TEXT NOT NULL REFERENCES assets(asset_id),
-                polygon_norm_json TEXT NOT NULL,
-                template_id TEXT NOT NULL,
-                template_version INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY(template_id, template_version) REFERENCES templates(template_id, version)
-            );
-            CREATE TABLE IF NOT EXISTS region_label_values (
-                region_id TEXT NOT NULL REFERENCES regions(region_id),
-                field_id TEXT NOT NULL,
-                value_json TEXT NOT NULL,
-                PRIMARY KEY(region_id, field_id)
-            );
+            INSERT INTO cases_v2 (case_id, campus_code, representative_count, updated_at)
+            SELECT
+                cases.case_id,
+                cases.campus_code,
+                (SELECT COUNT(*) FROM representative_assets WHERE representative_assets.case_id = cases.case_id),
+                cases.updated_at
+            FROM cases;
+            DROP TABLE cases;
+            ALTER TABLE cases_v2 RENAME TO cases;
+            PRAGMA user_version = 2;
             ",
         )?;
-        transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    let restore_result = connection.pragma_update(None, "foreign_keys", "ON");
+    migration_result?;
+    restore_result?;
+    verify_foreign_keys(connection)
+}
+
+fn verify_foreign_keys(connection: &Connection) -> CoreResult<()> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    if rows.next()?.is_some() {
+        return Err(CoreError::Database);
     }
-    transaction.commit()?;
     Ok(())
 }
 

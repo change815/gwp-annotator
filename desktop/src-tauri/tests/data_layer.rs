@@ -12,6 +12,7 @@ use gwp_annotator_core::core::template::{
     FieldControl, LabelTemplate, LabelValue, TemplateField, TemplateOption, LABEL_TEMPLATE_FORMAT,
 };
 use gwp_annotator_core::{FixedSecretProvider, ProjectService};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 struct Fixture {
@@ -129,8 +130,8 @@ fn load_generic_template(service: &ProjectService) {
 }
 
 #[test]
-fn representative_limit_and_gate() {
-    let fixture = fixture(3);
+fn representative_selection_has_no_limit_and_keeps_annotation_gate() {
+    let fixture = fixture(4);
     let service = service(&fixture);
     let scan = service
         .scan_selected_root(&fixture.source_root)
@@ -146,49 +147,246 @@ fn representative_limit_and_gate() {
         Err(CoreError::AssetNotRepresentative)
     ));
 
-    for (_, asset) in images.iter().take(2) {
-        service
+    for (index, (_, asset)) in images.iter().enumerate() {
+        let selection = service
             .select_representative(&case.case_id, &asset.asset_id)
             .expect("representative selection");
+        assert_eq!(selection.representative_count, index + 1);
     }
-    let rejected_third = service.select_representative(&case.case_id, &images[2].1.asset_id);
-    assert!(matches!(
-        rejected_third,
-        Err(CoreError::RepresentativeLimit)
-    ));
+    assert_eq!(
+        service
+            .recorded_representative_count(&case.case_id)
+            .expect("recorded count"),
+        4
+    );
     assert_eq!(
         service.representative_count(&case.case_id).expect("count"),
-        2
+        4
     );
+}
+
+fn create_legacy_v1_database(
+    fixture: &Fixture,
+    case: &PublicCase,
+    campus_code: &str,
+    assets: &[PublicAsset],
+) {
+    fs::create_dir_all(&fixture.work_root).expect("legacy work root");
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open legacy database");
+    connection
+        .execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE cases (
+                case_id TEXT PRIMARY KEY CHECK(case_id GLOB 'CASE-*'),
+                campus_code TEXT NOT NULL CHECK(campus_code GLOB 'CAMPUS-*'),
+                representative_count INTEGER NOT NULL DEFAULT 0 CHECK(representative_count BETWEEN 0 AND 2),
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY CHECK(asset_id GLOB 'ASSET-*'),
+                case_id TEXT NOT NULL REFERENCES cases(case_id),
+                kind TEXT NOT NULL CHECK(kind IN ('original_image', 'captured_frame')),
+                width INTEGER NOT NULL CHECK(width >= 0),
+                height INTEGER NOT NULL CHECK(height >= 0),
+                source_fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE representative_assets (
+                case_id TEXT NOT NULL REFERENCES cases(case_id),
+                asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+                selected_at INTEGER NOT NULL,
+                PRIMARY KEY(case_id, asset_id)
+            );
+            CREATE TRIGGER representative_assets_limit_before_insert
+            BEFORE INSERT ON representative_assets
+            WHEN (SELECT COUNT(*) FROM representative_assets WHERE case_id = NEW.case_id) >= 2
+            BEGIN
+                SELECT RAISE(ABORT, 'representative_limit');
+            END;
+            CREATE TABLE templates (
+                template_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                canonical_json TEXT NOT NULL,
+                PRIMARY KEY(template_id, version)
+            );
+            CREATE TABLE regions (
+                region_id TEXT PRIMARY KEY CHECK(region_id GLOB 'REGION-*'),
+                asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+                polygon_norm_json TEXT NOT NULL,
+                template_id TEXT NOT NULL,
+                template_version INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(template_id, template_version) REFERENCES templates(template_id, version)
+            );
+            CREATE TABLE region_label_values (
+                region_id TEXT NOT NULL REFERENCES regions(region_id),
+                field_id TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY(region_id, field_id)
+            );
+            PRAGMA user_version = 1;
+            ",
+        )
+        .expect("create legacy schema");
+    connection
+        .execute(
+            "INSERT INTO cases (case_id, campus_code, representative_count, updated_at) VALUES (?1, ?2, 0, 1)",
+            params![case.case_id, campus_code],
+        )
+        .expect("insert legacy case");
+    for asset in assets {
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, case_id, kind, width, height, source_fingerprint) VALUES (?1, ?2, 'original_image', 1, 1, 'legacy')",
+                params![asset.asset_id, case.case_id],
+            )
+            .expect("insert legacy asset");
+    }
+    for (index, asset) in assets.iter().take(2).enumerate() {
+        connection
+            .execute(
+                "INSERT INTO representative_assets (case_id, asset_id, selected_at) VALUES (?1, ?2, ?3)",
+                params![case.case_id, asset.asset_id, index as i64 + 1],
+            )
+            .expect("insert legacy representative");
+    }
+    let template = generic_template();
+    let snapshot = template.snapshot().expect("template snapshot");
+    connection
+        .execute(
+            "INSERT INTO templates (template_id, version, sha256, canonical_json) VALUES (?1, ?2, ?3, ?4)",
+            params![snapshot.template_id, snapshot.version, snapshot.sha256, snapshot.canonical_json],
+        )
+        .expect("insert legacy template");
+    connection
+        .execute(
+            "INSERT INTO regions (region_id, asset_id, polygon_norm_json, template_id, template_version, created_at) VALUES ('REGION-LEGACY', ?1, '[{\"x\":0.1,\"y\":0.1},{\"x\":0.8,\"y\":0.1},{\"x\":0.4,\"y\":0.8}]', 'template-alpha', 1, 1)",
+            params![&assets[0].asset_id],
+        )
+        .expect("insert legacy region");
+    connection
+        .execute(
+            "INSERT INTO region_label_values (region_id, field_id, value_json) VALUES ('REGION-LEGACY', 'field_alpha', '\"option_alpha\"')",
+            [],
+        )
+        .expect("insert legacy label");
+}
+
+#[test]
+fn legacy_v1_database_migrates_without_limit_and_preserves_data_after_reopen() {
+    let fixture = fixture(4);
+    let discovery_work_root = fixture._temporary.path().join("DISCOVERY");
+    let discovery = service_with_work_root(&discovery_work_root);
+    let scan = discovery
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan synthetic fixture for opaque IDs");
+    let (case, _) = first_image(&scan);
+    let assets = all_images(&scan)
+        .into_iter()
+        .filter_map(|(candidate_case, asset)| {
+            (candidate_case.case_id == case.case_id).then_some(asset)
+        })
+        .collect::<Vec<_>>();
+    create_legacy_v1_database(&fixture, &case, "CAMPUS-ALPHA", &assets);
+
+    {
+        let migrated = service(&fixture);
+        migrated
+            .scan_selected_root(&fixture.source_root)
+            .expect("open and migrate legacy database");
+        assert_eq!(
+            migrated
+                .representative_asset_ids(&case.case_id)
+                .expect("preserved representative selections"),
+            assets
+                .iter()
+                .take(2)
+                .map(|asset| asset.asset_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            migrated
+                .representative_count(&case.case_id)
+                .expect("actual count"),
+            2
+        );
+        assert_eq!(
+            migrated
+                .recorded_representative_count(&case.case_id)
+                .expect("recomputed recorded count"),
+            2
+        );
+        assert_eq!(
+            migrated
+                .saved_regions_for_asset(&case.case_id, &assets[0].asset_id)
+                .expect("preserved regions")
+                .iter()
+                .map(|region| region.region_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["REGION-LEGACY"]
+        );
+        assert!(matches!(
+            migrated.deselect_representative(&case.case_id, &assets[0].asset_id),
+            Err(CoreError::RepresentativeHasRegions)
+        ));
+        assert_eq!(
+            migrated
+                .select_representative(&case.case_id, &assets[2].asset_id)
+                .expect("select third representative after migration")
+                .representative_count,
+            3
+        );
+    }
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("inspect migrated database");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("schema version");
+    assert_eq!(version, 2);
+    let cases_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cases'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("new cases schema");
+    assert!(!cases_sql.contains("BETWEEN 0 AND 2"));
+    let legacy_trigger: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'representative_assets_limit_before_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("legacy trigger lookup");
+    assert_eq!(legacy_trigger, None);
+    {
+        let mut foreign_key_check = connection
+            .prepare("PRAGMA foreign_key_check")
+            .expect("foreign key check statement");
+        let mut foreign_key_rows = foreign_key_check
+            .query([])
+            .expect("foreign key check query");
+        assert!(foreign_key_rows
+            .next()
+            .expect("foreign key check row")
+            .is_none());
+    }
+    drop(connection);
+
+    let reopened = service(&fixture);
+    reopened
+        .scan_selected_root(&fixture.source_root)
+        .expect("reopen migrated database");
     assert_eq!(
-        service
-            .recorded_representative_count(&case.case_id)
-            .expect("recorded count"),
-        2
-    );
-    let removed = service
-        .deselect_representative(&case.case_id, &images[0].1.asset_id)
-        .expect("cancel representative selection");
-    assert_eq!(removed.representative_count, 1);
-    assert_eq!(
-        service.representative_count(&case.case_id).expect("count"),
-        1
-    );
-    assert_eq!(
-        service
-            .recorded_representative_count(&case.case_id)
-            .expect("recorded count"),
-        1
-    );
-    let third = service
-        .select_representative(&case.case_id, &images[2].1.asset_id)
-        .expect("selection after cancellation");
-    assert_eq!(third.representative_count, 2);
-    assert_eq!(
-        service
-            .recorded_representative_count(&case.case_id)
-            .expect("recorded count"),
-        2
+        reopened
+            .select_representative(&case.case_id, &assets[3].asset_id)
+            .expect("select fourth representative after reopen")
+            .representative_count,
+        4
     );
 }
 
