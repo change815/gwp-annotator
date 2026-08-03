@@ -1,0 +1,3 @@
+# Tauri invokes POSIX shell scripts on Windows. Keep tracked text files in LF
+# form regardless of a user's global core.autocrlf setting.
+* text=auto eol=lf

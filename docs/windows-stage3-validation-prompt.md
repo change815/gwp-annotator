@@ -51,42 +51,43 @@
 - 不要把 `node_modules`、`.npm-cache`、`src-tauri\target`、安装器、SQLite 数据库、
   合成模板或日志提交到 Git。不要改动 Git 配置、代理、TLS/Schannel/CRL 配置。
 
-## 获取并核对当前 main
+## 创建隔离的复测克隆并核对当前 main
 
 优先使用普通的、已授权的 Git/GitHub 登录流程，不打印 token、密码或其他秘密。
-已有工作目录若不是干净的 Git 仓库，立即报告 BLOCKED；不要使用 reset、clean、
-强制覆盖或其他会丢失修改的命令。
+不要复用、修改、恢复、清理或删除任何已有的 `C:\work\gwp-annotator` 工作目录：它
+可能包含用户未提交的修改，或受旧行尾设置影响。每次复测都在新的、带时间戳的非临床
+目录克隆当前 `main`，让旧目录保持原样。
+
+仓库已用 `.gitattributes` 要求文本文件以 LF checkout，以免用户级
+`core.autocrlf` 把 Rust、TOML 或 shell 文件误报为修改。不要修改全局或用户级 Git
+行尾配置；新克隆仍非空白时，按 BLOCKED 报告。
 
 在普通 PowerShell 中执行：
 
   $repoUrl = 'https://github.com/change815/gwp-annotator.git'
-  $repoDir = 'C:\work\gwp-annotator'
+  $workRoot = 'C:\work'
+  $runId = Get-Date -Format 'yyyyMMddHHmmssfff'
+  $repoDir = Join-Path $workRoot ("gwp-annotator-stage3-retest-$runId")
+  New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
   if (Test-Path -LiteralPath $repoDir) {
-    if (-not (Test-Path -LiteralPath (Join-Path $repoDir '.git'))) {
-      Write-Error "已有路径不是 Git 仓库：$repoDir"
-      exit 2
-    }
-    $dirty = git -C $repoDir status --porcelain
-    if ($dirty) {
-      Write-Error '工作树不干净；请先由所有者处理现有修改。'
-      exit 2
-    }
-    git -C $repoDir fetch origin
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    git -C $repoDir switch main
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    git -C $repoDir pull --ff-only origin main
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  } else {
-    git clone --branch main $repoUrl $repoDir
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Error "复测目录意外已存在：$repoDir"
+    exit 2
   }
+  git clone --branch main --single-branch $repoUrl $repoDir
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   $checkedOutSha = git -C $repoDir rev-parse HEAD
-  git -C $repoDir status --short
+  $dirty = git -C $repoDir status --porcelain
+  if ($dirty) {
+    Write-Error "全新复测克隆不干净：$dirty"
+    exit 2
+  }
+  git -C $repoDir remote get-url origin
+  Write-Host "isolated retest clone: $repoDir"
   Write-Host "checked-out SHA: $checkedOutSha"
 
 记录仓库 URL、分支和 `$checkedOutSha`。`d7d4a16` 只是本次任务所知的参考基线，
 不是必须写死或必须 checkout 的构建 SHA；以本次 `git rev-parse HEAD` 的证据为准。
+报告中同时写明“旧 `C:\work\gwp-annotator`：未访问/未修改；隔离复测克隆：干净”。
 
 ## Windows 和工具链先决条件
 
@@ -334,6 +335,8 @@ Windows shell wrapper、MSVC、WebView2 或其他 Windows 特有问题失败，�
   仓库 URL：
   分支：
   checked-out SHA（来自 git rev-parse HEAD）：
+  隔离复测克隆目录：
+  旧 C:\work\gwp-annotator：未访问/未修改
   Windows 版本和架构：
   Node/npm/Rust/Cargo/MSVC/Git/sh/WebView2 版本：
 
