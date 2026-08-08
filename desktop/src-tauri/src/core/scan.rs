@@ -625,14 +625,14 @@ pub fn scan_data_root(root: &Path, secret: &ProjectSecret) -> CoreResult<ScanOut
     // replacement therefore cannot redirect Unix reads away from the scanned root.
     let source_root = open_source_read_root(&resolved_root)?;
     let mut campus_paths = direct_directories(&resolved_root)?;
-    if campus_paths.len() != 2 {
+    if campus_paths.is_empty() {
         return Err(CoreError::InvalidCampusLayout);
     }
     campus_paths.sort_by(|left, right| natural_path_cmp(left, right));
 
     let mut session_cases = HashMap::new();
     let mut session_campuses = HashMap::new();
-    let mut campuses = Vec::with_capacity(2);
+    let mut campuses = Vec::with_capacity(campus_paths.len());
 
     for campus_path in campus_paths {
         let raw_campus_name = file_name_text(&campus_path)?;
@@ -757,11 +757,21 @@ pub fn scan_data_root(root: &Path, secret: &ProjectSecret) -> CoreResult<ScanOut
             .into_iter()
             .map(|sortable| sortable.public)
             .collect::<Vec<_>>();
+        if cases.is_empty() {
+            session_campuses.remove(&campus_code);
+            continue;
+        }
         campuses.push(PublicCampus {
             campus_code,
             case_count: cases.len(),
             cases,
         });
+    }
+
+    // Reject an empty/one-level layout. This also catches the common mistake of selecting a
+    // campus directory whose cases contain only media files, instead of selecting the data root.
+    if campuses.is_empty() {
+        return Err(CoreError::InvalidCampusLayout);
     }
 
     campuses.sort_by(|left, right| left.campus_code.cmp(&right.campus_code));
@@ -928,12 +938,93 @@ mod tests {
         ProjectSecret::from_bytes([9; 32])
     }
 
-    fn empty_two_campus_root() -> (TempDir, std::path::PathBuf) {
+    fn empty_campus_root(campus_names: &[&str]) -> (TempDir, std::path::PathBuf) {
         let temporary = tempfile::tempdir().expect("temporary root");
         let root = temporary.path().join("ROOT-CASE-FIXTURE");
-        fs::create_dir_all(root.join("CAMPUS-ALPHA")).expect("campus alpha");
-        fs::create_dir_all(root.join("CAMPUS-BETA")).expect("campus beta");
+        fs::create_dir_all(&root).expect("fixture root");
+        for campus_name in campus_names {
+            fs::create_dir_all(root.join(campus_name)).expect("fixture campus");
+        }
         (temporary, root)
+    }
+
+    fn empty_two_campus_root() -> (TempDir, std::path::PathBuf) {
+        empty_campus_root(&["CAMPUS-ALPHA", "CAMPUS-BETA"])
+    }
+
+    #[test]
+    fn empty_campus_layout_is_rejected() {
+        let (_temporary, root) = empty_campus_root(&[]);
+
+        assert!(matches!(
+            scan_data_root(&root, &secret()),
+            Err(CoreError::InvalidCampusLayout)
+        ));
+
+        fs::create_dir_all(root.join("CAMPUS-EMPTY")).expect("empty campus fixture");
+        assert!(matches!(
+            scan_data_root(&root, &secret()),
+            Err(CoreError::InvalidCampusLayout)
+        ));
+    }
+
+    #[test]
+    fn selecting_a_flat_campus_directory_as_the_root_is_rejected() {
+        let (_temporary, root) = empty_campus_root(&["CAMPUS-ONE"]);
+        let campus = root.join("CAMPUS-ONE");
+        let case = campus.join("20240101_CASE-ALPHA");
+        fs::create_dir_all(&case).expect("fixture case");
+        fs::write(case.join("ASSET-01.JPG"), b"fixture").expect("fixture media");
+
+        assert!(matches!(
+            scan_data_root(&campus, &secret()),
+            Err(CoreError::InvalidCampusLayout)
+        ));
+    }
+
+    #[test]
+    fn file_scan_allows_one_chinese_named_campus() {
+        let campus_name = "华东院区";
+        let (_temporary, root) = empty_campus_root(&[campus_name]);
+        fs::create_dir_all(root.join(campus_name).join("20240101_CASE-ALPHA"))
+            .expect("fixture case");
+
+        let outcome = scan_data_root(&root, &secret()).expect("scan fixture");
+        assert_eq!(outcome.public.campuses.len(), 1);
+        assert_eq!(outcome.public.campuses[0].case_count, 1);
+
+        let local = outcome
+            .session
+            .local_display_scan(&outcome.public)
+            .expect("local display scan");
+        assert_eq!(local.campuses[0].display_name, campus_name);
+        let public_json = serde_json::to_string(&outcome.public).expect("public serialization");
+        assert!(!public_json.contains(campus_name));
+    }
+
+    #[test]
+    fn file_scan_allows_more_than_two_campuses() {
+        let campus_names = ["CAMPUS-01", "CAMPUS-02", "CAMPUS-10", "CAMPUS-11"];
+        let (_temporary, root) = empty_campus_root(&[
+            "CAMPUS-EMPTY",
+            "CAMPUS-01",
+            "CAMPUS-02",
+            "CAMPUS-10",
+            "CAMPUS-11",
+        ]);
+        for campus_name in campus_names {
+            fs::create_dir_all(root.join(campus_name).join("20240101_CASE-ALPHA"))
+                .expect("fixture case");
+        }
+
+        let outcome = scan_data_root(&root, &secret()).expect("scan fixture");
+        // Unrelated or not-yet-populated first-level directories are not presented as campuses.
+        assert_eq!(outcome.public.campuses.len(), 4);
+        assert!(outcome
+            .public
+            .campuses
+            .iter()
+            .all(|campus| campus.case_count == 1));
     }
 
     #[test]

@@ -9,13 +9,13 @@
 ### 已确认范围
 
 - Windows 单机，默认离线；仅服务胃癌术中白斑区域标注。
-- 两院区目录、病例选择、左右键媒体浏览、按需数量的代表图、自由圈选、多区域、模板标签、MP4 播放和当前帧截取。
+- 一个或多个任意命名（可含中文）的院区目录、病例选择、左右键媒体浏览、按需数量的代表图、自由圈选、多区域、模板标签、MP4 播放和当前帧截取。
 - 原始 JPG/MP4 永不改写；所有输出只使用脱敏病例 ID。
 - 不含模型预测、分期、强制双人标注、审核、登录、云服务或自动医疗诊断。
 
 ### 后续可选功能
 
-模板可视化编辑、区域编辑/撤销、更多编码兼容、筛选、双人标注、审核、账户、同步和模型辅助均留待后续版本；它们不改变本设计中的本地标注数据格式。
+模板可视化编辑、区域编辑/撤销、更多媒体编码兼容、筛选、双人标注、审核、账户、同步和模型辅助均留待后续版本；它们不改变本设计中的本地标注数据格式。
 
 ### 唯一待确认问题
 
@@ -31,7 +31,7 @@ Rust 核心
   扫描器 / 会话内路径映射 / 脱敏 ID / SQLite 仓储 / 原子文件写入 / 导出器
           |
       只读数据根目录                 应用项目工作目录（可写）
-  两个院区 -> 病例目录 -> JPG/MP4    SQLite / 截帧 / 缩略图 / 恢复 / 导出
+  1+ 院区 -> 病例目录 -> JPG/MP4      SQLite / 截帧 / 缩略图 / 恢复 / 导出
 ```
 
 | 层 | 选型 | 责任 |
@@ -65,8 +65,8 @@ Rust 核心
 
 ### 5.1 扫描规则
 
-1. 用户显式选择数据根目录；应用要求其第一层恰有两个可用院区目录，并在界面中显示院区别名。
-2. 每个院区第一层子目录视为一个病例。目录名按第一个下划线切为日期前缀和仅供本机显示的原始显示名；不把显示名序列化到结果。
+1. 用户显式选择数据根目录；第一层中至少含一个直属病例子目录的目录视为院区，空的或无病例子目录的一级目录不显示。院区可为任意名称（包括中文）。只在找不到任何“院区 -> 病例”两层结构时报告布局错误；这能识别把常见的扁平病例院区目录误选为根目录的情况。目录名不设规则，因此对带额外嵌套目录的任意文件树不宣称能自动判断用户选错层级。有 1 个或更多有效院区时不得按数量拒绝。界面原样显示本机真实目录名，不生成或显示持久化别名。
+2. 每个院区第一层子目录视为一个病例。目录名按第一个下划线切为日期前缀和仅供本机显示的原始显示名；院区和病例显示名都只保留在当前进程的内存路径映射中，不序列化到结果。
 3. 仅枚举病例目录直接包含的 `.jpg`、`.jpeg`、`.mp4`，后缀大小写不敏感；不递归扫描、不改写源目录、不在扫描时读取像素或视频帧。
 4. 解析 `yyyyMMdd`、`yyyy-MM-dd`、`yyyy.MM.dd` 日期前缀；可解析项按日期降序，无法解析项排在其后并按目录修改时间降序。相同键按 `case_id` 稳定排序。
 5. 同一病例的媒体按自然文件名顺序排列；左右键在该序列中切换。媒体路径和原始文件名只保留在当前进程的内存映射中。
@@ -78,11 +78,12 @@ Rust 核心
 每次扫描在内存中计算：
 
 ```text
+campus_code = "CAMPUS-" + Base32(HMAC-SHA-256(project_secret, raw_campus_folder_name))[0..15]
 case_id  = "CASE-" + Base32(HMAC-SHA-256(project_secret, campus_code + NUL + raw_case_folder_name))[0..15]
 asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_media_name + NUL + size + NUL + mtime))[0..15]
 ```
 
-`project_secret` 是仅在本机 Windows Credential Manager 中按项目 ID 保存的秘密，不进入项目工作目录、SQLite 或训练导出。原始目录名和媒体名只作为内存中的 HMAC 输入，绝不写入 SQLite、JSON、日志、缓存名或导出文件。重新扫描同一目录可得到相同 ID；若原始文件改名、大小或修改时间变化，`asset_id` 改变并在界面要求人工确认是否重新标注。
+`project_secret` 是仅在本机 Windows Credential Manager 中按项目 ID 保存的秘密，不进入项目工作目录、SQLite 或训练导出。`campus_code` 是不可逆的不透明 ID，不是院区名。原始院区/病例目录名和媒体名只作为内存中的 HMAC 输入及本机 UI 显示值，绝不写入 SQLite、备份、JSON、日志、缓存名、Git 或导出文件。重新扫描同一目录可得到相同 ID；若原始文件改名、大小或修改时间变化，`asset_id` 改变并在界面要求人工确认是否重新标注。
 
 ## 6. 界面、渲染和自动闭合自由圈选
 
@@ -144,7 +145,7 @@ D:/Apps/GWP Annotator Data/PROJECT-LOCAL/
 
 | 表 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `cases` | `case_id`, `campus_code`, `representative_count`, `updated_at` | 不存储原始病例名或路径。 |
+| `cases` | `case_id`, `campus_code`, `representative_count`, `updated_at` | `campus_code` 是不透明 HMAC ID；不存储原始院区/病例名或路径。 |
 | `assets` | `asset_id`, `case_id`, `kind`, `width`, `height`, `source_fingerprint` | `kind` 为 `original_image` 或 `captured_frame`；指纹是不可逆的 HMAC 输出。 |
 | `representative_assets` | `case_id`, `asset_id`, `selected_at` | 一个病例可按需保留任意数量的代表图。 |
 | `regions` | `region_id`, `asset_id`, `polygon_norm_json`, `template_id`, `template_version`, `created_at` | 一个区域一行，顶点为归一化坐标。 |
@@ -163,6 +164,10 @@ D:/Apps/GWP Annotator Data/PROJECT-LOCAL/
 ### 9.1 正式 TOML 模板
 
 医生维护的正式格式为 `label-template-v1.toml`。医学负责人填入实际字段和选项；以下名称均为中性结构占位，不能作为默认医学词表发布。
+
+导入器在 TOML 解析前必须严格以 UTF-8 解码输入字节。任何解码错误、解码结果中的 Unicode 替换字符 `U+FFFD` 或明显乱码均使导入失败；界面提示用户用 UTF-8 重新保存后再试。不得猜测、尝试或记录 GBK/系统代码页转换。通过字节编码检查后，才执行 TOML 语法、字段 ID 和业务校验。
+
+项目升级时，内容校验和与模板摘要均匹配的历史固定副本和 SQLite 模板快照可以按结构读取，即使其显示文字带有明确旧乱码；这是模板内容不可改写的历史解释兼容，不是新的导入豁免。前端隐藏圈选准星并禁用“删除后重画”，Rust 保存边界再次拒绝用该模板创建或替换区域；旧区域的查看、标签修正和删除仍保留。
 
 ```toml
 format = "gwa-label-template"
@@ -198,7 +203,7 @@ id = "option_b"
 label = "选项 B"
 ```
 
-允许字段的 `control` 取值只有 `dropdown`、`single_select`、`multi_select`。`id` 和每个选项 `id` 在各自作用域必须唯一且稳定；`required = true` 的字段必须至少有一个选项。模板变更应产生新 `version`，旧标注仍由 SQLite 中存储的规范化 JSON 快照解释；该 JSON 是内部表示，不是医生日常维护格式。
+允许字段的 `control` 取值只有 `dropdown`、`single_select`、`multi_select`。`id` 和每个选项 `id` 在各自作用域必须唯一且稳定；`required = true` 的字段必须至少有一个选项。模板变更应产生新 `version`，旧标注仍由 SQLite 中存储的规范化 JSON 快照解释；该 JSON 是内部表示，不是医生日常维护格式。Windows 合成 fixture 写入模板时优先使用仅 ASCII 的 TOML `\uXXXX` 转义；若需要写入实际中文字符，必须明确以 UTF-8（无 BOM）写入，不能依赖 PowerShell 默认编码。
 
 ### 9.2 简化 `label.txt` 导入
 

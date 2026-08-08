@@ -8,7 +8,7 @@ pub enum CoreError {
     Filesystem,
     #[error("database operation failed")]
     Database,
-    #[error("selected root does not contain exactly two campus directories")]
+    #[error("selected root must contain at least one valid campus directory")]
     InvalidCampusLayout,
     #[error("source root and project work root must not overlap")]
     SourceWorkOverlap,

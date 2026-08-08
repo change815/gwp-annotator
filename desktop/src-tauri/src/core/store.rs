@@ -2468,7 +2468,46 @@ fn now_millis() -> i64 {
 mod tests {
     use std::fs;
 
-    use super::{prepare_work_root_after_overlap_check, validate_polygon, CoreError, PointNorm};
+    use rusqlite::params;
+
+    use crate::core::template::LabelTemplate;
+
+    use super::{
+        load_template_snapshot_from_connection, prepare_work_root_after_overlap_check,
+        validate_polygon, CoreError, PointNorm, Store,
+    };
+
+    const LEGACY_DAMAGED_TOML: &str = r#"
+format = "gwa-label-template"
+version = 1
+template_id = "legacy-template"
+
+[[fields]]
+id = "field_legacy"
+label = "閫夐」"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "option_legacy"
+label = "锟斤拷"
+"#;
+
+    const CLEAN_REPLACEMENT_TOML: &str = r#"
+format = "gwa-label-template"
+version = 2
+template_id = "legacy-template"
+
+[[fields]]
+id = "field_replacement"
+label = "字段甲"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "option_replacement"
+label = "选项甲"
+"#;
 
     fn points(values: &[(f64, f64)]) -> Vec<PointNorm> {
         values
@@ -2532,6 +2571,62 @@ mod tests {
             prepare_work_root_after_overlap_check(&work_root),
             Err(CoreError::WorkRootUnavailable)
         ));
+    }
+
+    #[test]
+    fn historical_damaged_templates_can_be_verified_recovered_and_replaced() {
+        let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+        let store =
+            Store::open(temporary.path().join("PROJECT-LOCAL")).expect("open synthetic store");
+        let legacy = LabelTemplate::parse_toml(LEGACY_DAMAGED_TOML)
+            .expect("historical template remains structurally valid");
+        assert!(LabelTemplate::parse_toml_for_import(LEGACY_DAMAGED_TOML).is_err());
+
+        let prepared = store
+            .prepare_fixed_template_install(LEGACY_DAMAGED_TOML, &legacy)
+            .expect("prepare legacy fixed template");
+        store
+            .activate_prepared_fixed_template(&prepared.fixed)
+            .expect("activate legacy fixed template");
+        let recovered = store
+            .fixed_template()
+            .expect("read verified legacy fixed template")
+            .expect("legacy fixed template");
+        assert_eq!(recovered.template.fields[0].label, "閫夐」");
+
+        let snapshot = legacy.snapshot().expect("historical SQLite snapshot");
+        {
+            let connection = store.connection.lock().expect("store connection");
+            connection
+                .execute(
+                    "INSERT INTO templates (template_id, version, sha256, canonical_json) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        snapshot.template_id,
+                        snapshot.version,
+                        snapshot.sha256,
+                        snapshot.canonical_json,
+                    ],
+                )
+                .expect("insert historical SQLite snapshot");
+            let loaded = load_template_snapshot_from_connection(&connection, "legacy-template", 1)
+                .expect("load historical SQLite snapshot")
+                .expect("historical SQLite template");
+            assert_eq!(loaded.fields[0].options[0].label, "锟斤拷");
+        }
+
+        let replacement = LabelTemplate::parse_toml_for_import(CLEAN_REPLACEMENT_TOML)
+            .expect("valid UTF-8 replacement");
+        let prepared = store
+            .prepare_fixed_template_replacement(CLEAN_REPLACEMENT_TOML, &replacement)
+            .expect("prepare clean replacement");
+        store
+            .activate_prepared_fixed_template(&prepared.fixed)
+            .expect("activate clean replacement");
+        let active = store
+            .fixed_template()
+            .expect("read active replacement")
+            .expect("active replacement");
+        assert_eq!(active.template.fields[0].label, "字段甲");
     }
 
     #[cfg(unix)]

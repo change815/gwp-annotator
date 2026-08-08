@@ -9,6 +9,9 @@ use crate::core::ids::stable_template_component;
 
 pub const LABEL_TEMPLATE_FORMAT: &str = "gwa-label-template";
 
+// These are explicit UTF-8-as-GBK artifacts, not a broad rejection of rare Han characters.
+const GBK_MOJIBAKE_MARKERS: &[&str] = &["锟斤拷", "閫夐", "瀹炵"];
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LabelTemplate {
     pub format: String,
@@ -62,9 +65,23 @@ impl LabelTemplate {
         Ok(template)
     }
 
+    pub fn parse_toml_for_import(input: &str) -> CoreResult<Self> {
+        validate_template_text_encoding(input)?;
+        let template = Self::parse_toml(input)?;
+        template.validate_import_text()?;
+        Ok(template)
+    }
+
     pub fn parse_json(input: &str) -> CoreResult<Self> {
         let template: Self = serde_json::from_str(input)?;
         template.validate()?;
+        Ok(template)
+    }
+
+    pub fn parse_json_for_import(input: &str) -> CoreResult<Self> {
+        validate_template_text_encoding(input)?;
+        let template = Self::parse_json(input)?;
+        template.validate_import_text()?;
         Ok(template)
     }
 
@@ -98,6 +115,19 @@ impl LabelTemplate {
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_import_text(&self) -> CoreResult<()> {
+        if self.fields.iter().any(|field| {
+            !has_safe_template_text(&field.label)
+                || field
+                    .options
+                    .iter()
+                    .any(|option| !has_safe_template_text(&option.label))
+        }) {
+            return Err(CoreError::InvalidTemplate);
+        }
         Ok(())
     }
 
@@ -139,6 +169,7 @@ impl LabelTemplate {
 }
 
 pub fn parse_label_txt(input: &str, template_id: &str, version: u32) -> CoreResult<LabelTemplate> {
+    validate_template_text_encoding(input)?;
     let mut fields = Vec::new();
     let mut seen_display_names = HashSet::new();
 
@@ -188,6 +219,7 @@ pub fn parse_label_txt(input: &str, template_id: &str, version: u32) -> CoreResu
         fields,
     };
     template.validate()?;
+    template.validate_import_text()?;
     Ok(template)
 }
 
@@ -216,6 +248,112 @@ fn is_machine_id(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn validate_template_text_encoding(input: &str) -> CoreResult<()> {
+    if !has_safe_template_text(input) {
+        return Err(CoreError::InvalidTemplate);
+    }
+    Ok(())
+}
+
+fn has_safe_template_text(value: &str) -> bool {
+    !value.contains('\u{FFFD}')
+        && !value.chars().any(is_private_use_code_point)
+        && !has_obvious_mojibake(value)
+}
+
+fn is_private_use_code_point(character: char) -> bool {
+    matches!(
+        character as u32,
+        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+    )
+}
+
+fn has_obvious_mojibake(value: &str) -> bool {
+    if GBK_MOJIBAKE_MARKERS
+        .iter()
+        .any(|marker| value.contains(marker))
+    {
+        return true;
+    }
+
+    let bytes = value
+        .chars()
+        .map(windows_1252_byte)
+        .collect::<Vec<Option<u8>>>();
+
+    bytes.iter().enumerate().any(|(index, lead)| {
+        let Some(lead) = lead else {
+            return false;
+        };
+        let second = bytes.get(index + 1).copied().flatten();
+        let third = bytes.get(index + 2).copied().flatten();
+        let fourth = bytes.get(index + 3).copied().flatten();
+
+        (matches!(lead, 0xC2..=0xDF) && byte_in_range(second, 0x80, 0xBF))
+            || (*lead == 0xE0
+                && byte_in_range(second, 0xA0, 0xBF)
+                && byte_in_range(third, 0x80, 0xBF))
+            || ((matches!(lead, 0xE1..=0xEC | 0xEE..=0xEF))
+                && byte_in_range(second, 0x80, 0xBF)
+                && byte_in_range(third, 0x80, 0xBF))
+            || (*lead == 0xED
+                && byte_in_range(second, 0x80, 0x9F)
+                && byte_in_range(third, 0x80, 0xBF))
+            || (*lead == 0xF0
+                && byte_in_range(second, 0x90, 0xBF)
+                && byte_in_range(third, 0x80, 0xBF)
+                && byte_in_range(fourth, 0x80, 0xBF))
+            || (matches!(lead, 0xF1..=0xF3)
+                && byte_in_range(second, 0x80, 0xBF)
+                && byte_in_range(third, 0x80, 0xBF)
+                && byte_in_range(fourth, 0x80, 0xBF))
+            || (*lead == 0xF4
+                && byte_in_range(second, 0x80, 0x8F)
+                && byte_in_range(third, 0x80, 0xBF)
+                && byte_in_range(fourth, 0x80, 0xBF))
+    })
+}
+
+fn windows_1252_byte(character: char) -> Option<u8> {
+    if (character as u32) <= 0xFF {
+        return Some(character as u8);
+    }
+    match character {
+        '\u{20AC}' => Some(0x80),
+        '\u{201A}' => Some(0x82),
+        '\u{0192}' => Some(0x83),
+        '\u{201E}' => Some(0x84),
+        '\u{2026}' => Some(0x85),
+        '\u{2020}' => Some(0x86),
+        '\u{2021}' => Some(0x87),
+        '\u{02C6}' => Some(0x88),
+        '\u{2030}' => Some(0x89),
+        '\u{0160}' => Some(0x8A),
+        '\u{2039}' => Some(0x8B),
+        '\u{0152}' => Some(0x8C),
+        '\u{017D}' => Some(0x8E),
+        '\u{2018}' => Some(0x91),
+        '\u{2019}' => Some(0x92),
+        '\u{201C}' => Some(0x93),
+        '\u{201D}' => Some(0x94),
+        '\u{2022}' => Some(0x95),
+        '\u{2013}' => Some(0x96),
+        '\u{2014}' => Some(0x97),
+        '\u{02DC}' => Some(0x98),
+        '\u{2122}' => Some(0x99),
+        '\u{0161}' => Some(0x9A),
+        '\u{203A}' => Some(0x9B),
+        '\u{0153}' => Some(0x9C),
+        '\u{017E}' => Some(0x9E),
+        '\u{0178}' => Some(0x9F),
+        _ => None,
+    }
+}
+
+fn byte_in_range(byte: Option<u8>, lower: u8, upper: u8) -> bool {
+    byte.is_some_and(|byte| (lower..=upper).contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -229,37 +367,37 @@ template_id = "template-beta"
 
 [[fields]]
 id = "field_a"
-label = "Field A"
+label = "字段甲"
 control = "dropdown"
 required = true
 
 [[fields.options]]
 id = "a1"
-label = "Option A"
+label = "选项甲"
 
 [[fields]]
 id = "field_b"
-label = "Field B"
+label = "字段乙"
 control = "single_select"
 required = false
 
 [[fields.options]]
 id = "b1"
-label = "Option B"
+label = "选项乙"
 
 [[fields]]
 id = "field_c"
-label = "Field C"
+label = "字段丙"
 control = "multi_select"
 required = true
 
 [[fields.options]]
 id = "c1"
-label = "Option C"
+label = "选项丙"
 
 [[fields.options]]
 id = "c2"
-label = "Option D"
+label = "选项丁"
 "#;
 
     #[test]
@@ -282,7 +420,7 @@ label = "Option D"
 
     #[test]
     fn json_template_controls_and_required_values_are_validated() {
-        let template = LabelTemplate::parse_json(
+        let template = LabelTemplate::parse_json_for_import(
             r#"{
                 "format":"gwa-label-template",
                 "version":1,
@@ -309,8 +447,11 @@ label = "Option D"
 
     #[test]
     fn toml_template_controls_and_required_values_are_validated() {
-        let template = LabelTemplate::parse_toml(TOML_TEMPLATE).expect("valid TOML template");
+        let template =
+            LabelTemplate::parse_toml_for_import(TOML_TEMPLATE).expect("valid TOML template");
 
+        assert_eq!(template.fields[0].label, "字段甲");
+        assert_eq!(template.fields[0].options[0].label, "选项甲");
         assert_eq!(template.fields[0].control, FieldControl::Dropdown);
         assert_eq!(template.fields[1].control, FieldControl::SingleSelect);
         assert_eq!(template.fields[2].control, FieldControl::MultiSelect);
@@ -363,5 +504,44 @@ required = true
 "#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn template_parsers_reject_encoding_damage() {
+        let mojibake = "\u{00E6}\u{00B5}\u{2039}\u{00E8}\u{00AF}\u{2022}";
+        for damaged_label in ["字段\u{FFFD}", "字段\u{E000}", mojibake, "閫夐」"] {
+            let damaged_toml = TOML_TEMPLATE.replace("字段甲", damaged_label);
+            assert!(LabelTemplate::parse_toml_for_import(&damaged_toml).is_err());
+        }
+
+        assert!(LabelTemplate::parse_json_for_import(
+            r#"{
+                "format":"gwa-label-template",
+                "version":1,
+                "template_id":"template-beta",
+                "fields":[{
+                    "id":"field_a",
+                    "label":"字段\uFFFD",
+                    "control":"dropdown",
+                    "required":true,
+                    "options":[{"id":"a1","label":"选项甲"}]
+                }]
+            }"#,
+        )
+        .is_err());
+        assert!(parse_label_txt("字段\u{FFFD}=选项甲", "template-alpha", 1).is_err());
+    }
+
+    #[test]
+    fn historical_template_parsers_keep_damaged_labels_for_verified_recovery() {
+        let damaged_toml = TOML_TEMPLATE.replace("字段甲", "閫夐」");
+        let template = LabelTemplate::parse_toml(&damaged_toml)
+            .expect("historical fixed template remains structurally valid");
+        let snapshot = template.snapshot().expect("historical snapshot");
+        let restored = LabelTemplate::parse_json(&snapshot.canonical_json)
+            .expect("historical SQLite snapshot remains structurally valid");
+
+        assert_eq!(restored.fields[0].label, "閫夐」");
+        assert!(LabelTemplate::parse_toml_for_import(&damaged_toml).is_err());
     }
 }

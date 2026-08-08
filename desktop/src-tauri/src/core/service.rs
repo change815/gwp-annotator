@@ -251,13 +251,13 @@ impl ProjectService {
 
     pub fn install_fixed_toml_template(&self, input: &str) -> CoreResult<TemplateDescriptor> {
         self.ensure_active_roots_separate()?;
-        let template = LabelTemplate::parse_toml(input)?;
+        let template = LabelTemplate::parse_toml_for_import(input)?;
         self.install_fixed_template(input, template)
     }
 
     pub fn replace_fixed_toml_template(&self, input: &str) -> CoreResult<TemplateDescriptor> {
         self.ensure_active_roots_separate()?;
-        let template = LabelTemplate::parse_toml(input)?;
+        let template = LabelTemplate::parse_toml_for_import(input)?;
         let _activation = self
             .template_activation
             .lock()
@@ -387,7 +387,7 @@ impl ProjectService {
     }
 
     pub fn import_json_template(&self, input: &str) -> CoreResult<TemplateDescriptor> {
-        self.register_template(LabelTemplate::parse_json(input)?)
+        self.register_template(LabelTemplate::parse_json_for_import(input)?)
     }
 
     pub fn import_label_txt(
@@ -1036,6 +1036,9 @@ impl ProjectService {
         if active.template.snapshot()?.sha256 != active.sha256 {
             return Err(CoreError::TemplateNotActive);
         }
+        // Historical damaged templates remain readable so the user can replace them, but they
+        // must never create a new active region or a replacement region.
+        active.template.validate_import_text()?;
         Ok(RegionDraft {
             region_id: request.region_id,
             asset_id: request.asset_id,

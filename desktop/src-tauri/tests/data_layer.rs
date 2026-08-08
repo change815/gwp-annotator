@@ -28,11 +28,23 @@ struct Fixture {
 }
 
 fn fixture(images_per_case: usize) -> Fixture {
+    fixture_with_campus_names(images_per_case, "CAMPUS-ALPHA", "CAMPUS-BETA")
+}
+
+fn fixture_with_campus_names(
+    images_per_case: usize,
+    alpha_campus_name: &str,
+    beta_campus_name: &str,
+) -> Fixture {
     let temporary = tempfile::tempdir().expect("temporary fixture");
     let source_root = temporary.path().join("ROOT-CASE-FIXTURE");
     let work_root = temporary.path().join("WORK-CASE-FIXTURE");
-    let alpha_case = source_root.join("CAMPUS-ALPHA").join("20240101_CASE-ALPHA");
-    let beta_case = source_root.join("CAMPUS-BETA").join("20240102_CASE-BETA");
+    let alpha_case = source_root
+        .join(alpha_campus_name)
+        .join("20240101_CASE-ALPHA");
+    let beta_case = source_root
+        .join(beta_campus_name)
+        .join("20240102_CASE-BETA");
     fs::create_dir_all(&alpha_case).expect("alpha case");
     fs::create_dir_all(&beta_case).expect("beta case");
     for index in 1..=images_per_case {
@@ -777,7 +789,8 @@ fn opaque_id_stability() {
 
 #[test]
 fn privacy_leak_scan() {
-    let fixture = fixture(1);
+    let alpha_campus_name = "华东院区";
+    let fixture = fixture_with_campus_names(1, alpha_campus_name, "西南院区");
     let service = service(&fixture);
     let scan = service
         .scan_selected_root(&fixture.source_root)
@@ -787,8 +800,10 @@ fn privacy_leak_scan() {
         .current_local_display_scan()
         .expect("local display scan");
     let local_display_json = serde_json::to_string(&local_display).expect("local display JSON");
-    assert!(local_display_json.contains("CAMPUS-ALPHA"));
+    assert!(local_display_json.contains(alpha_campus_name));
     assert!(local_display_json.contains("20240101_CASE-ALPHA"));
+    let public_scan_json = serde_json::to_string(&scan).expect("public scan JSON");
+    assert!(!public_scan_json.contains(alpha_campus_name));
     load_generic_template(&service);
     service
         .select_representative(&case.case_id, &asset.asset_id)
@@ -811,6 +826,9 @@ fn privacy_leak_scan() {
     service
         .write_capture(&case.case_id, &asset.asset_id, b"derived-capture")
         .expect("capture");
+    service
+        .complete_case_and_backup(&case.case_id)
+        .expect("complete case and backup");
 
     let persisted_files = collect_file_bytes(service.work_root());
     let session_path = Path::new("session/project-session.json");
@@ -830,7 +848,7 @@ fn privacy_leak_scan() {
         .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
         .collect::<String>();
     assert!(!persisted_text.contains("20240101_CASE-ALPHA"));
-    assert!(!persisted_text.contains("CAMPUS-ALPHA"));
+    assert!(!persisted_text.contains(alpha_campus_name));
     assert!(!persisted_text.contains("ASSET-01.JPG"));
     let source_root_text = fixture.source_root.to_string_lossy();
     assert!(!persisted_text.contains(source_root_text.as_ref()));

@@ -7,12 +7,17 @@ import {
   canAutoClose,
   clearCrosshairPointerState,
   customCrosshairMarkup,
+  decodeUtf8Template,
   formatVideoTime,
   labelsMeetRequiredFields,
+  LEGACY_TEMPLATE_ENCODING_WARNING,
   polygonArea,
   primaryDrawingButtonIsPressed,
   shouldHandleMediaNavigation,
   shouldShowCustomCrosshair,
+  TEMPLATE_UTF8_IMPORT_ERROR,
+  templateHasEncodingDamage,
+  templateAllowsNewAnnotations,
   templateImportAction,
   type LabelTemplate,
   type PointNorm,
@@ -33,6 +38,19 @@ const templateV1: LabelTemplate = {
 };
 
 const templateV2: LabelTemplate = { ...templateV1, version: 2 };
+
+const legacyDamagedTemplate: LabelTemplate = {
+  ...templateV1,
+  fields: [
+    {
+      id: "field_legacy",
+      label: "閫夐」",
+      control: "dropdown",
+      required: true,
+      options: [{ id: "option_legacy", label: "锟斤拷" }],
+    },
+  ],
+};
 
 function templateDescriptor(template: LabelTemplate, sha256: string): Record<string, unknown> {
   return {
@@ -68,14 +86,34 @@ function mockAppApi(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
-function chooseTemplateFile(fileName: string, contents = "version = 2"): void {
+function chooseTemplateFile(fileName: string, contents: string | Uint8Array = "version = 2"): void {
+  const bytes = typeof contents === "string" ? new TextEncoder().encode(contents) : contents;
   const input = document.querySelector<HTMLInputElement>('[data-action="template-file"]');
   Object.defineProperty(input, "files", {
     configurable: true,
-    value: [{ name: fileName, text: async () => contents }],
+    value: [{ name: fileName, arrayBuffer: async () => bytes.slice().buffer }],
   });
   input?.dispatchEvent(new Event("change", { bubbles: true }));
 }
+
+const chineseToml = `
+format = "gwa-label-template"
+version = 1
+template_id = "template-utf8"
+
+[[fields]]
+id = "field_a"
+label = "字段甲"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "option_a"
+label = "选项甲"
+`;
+
+const typicalMojibake = "\u00e6\u00b5\u2039\u00e8\u00af\u2022";
+const typicalGbkMojibake = "閫夐」";
 
 describe("drawing geometry", () => {
   it("uses CSS-pixel distance with the documented automatic-close threshold", () => {
@@ -192,6 +230,33 @@ describe("template controls and representative gate", () => {
   });
 });
 
+describe("template UTF-8 import", () => {
+  it("decodes a valid Chinese UTF-8 TOML template without altering its labels", () => {
+    expect(decodeUtf8Template(new TextEncoder().encode(chineseToml))).toBe(chineseToml);
+  });
+
+  it("rejects invalid UTF-8 bytes before IPC", () => {
+    expect(() => decodeUtf8Template(new Uint8Array([0xff, 0xfe]))).toThrow(TEMPLATE_UTF8_IMPORT_ERROR);
+  });
+
+  it.each(["字段\uFFFD", "字段\uE000", typicalMojibake, typicalGbkMojibake])(
+    "rejects damaged template text %j",
+    (damagedLabel) => {
+      const damagedToml = chineseToml.replace("字段甲", damagedLabel);
+      expect(() => decodeUtf8Template(new TextEncoder().encode(damagedToml))).toThrow(
+        TEMPLATE_UTF8_IMPORT_ERROR,
+      );
+    },
+  );
+
+  it("identifies a recovered legacy template with explicit damage without treating it as a new import", () => {
+    expect(templateHasEncodingDamage(legacyDamagedTemplate)).toBe(true);
+    expect(templateHasEncodingDamage(templateV1)).toBe(false);
+    expect(templateAllowsNewAnnotations(legacyDamagedTemplate)).toBe(false);
+    expect(templateAllowsNewAnnotations(templateV1)).toBe(true);
+  });
+});
+
 describe("custom drawing crosshair", () => {
   it("appears only for a mouse over an annotation-ready image outside pan and dialog states", () => {
     expect(shouldShowCustomCrosshair(true, true, false, true, true, false)).toBe(true);
@@ -264,6 +329,54 @@ describe("local shell", () => {
       expect(replaceFixedTomlTemplate).toHaveBeenCalledWith("version = 2");
       expect(document.body.textContent).toContain("当前模板：template-test v2");
       expect(document.body.textContent).toContain("标签模板已更换");
+    });
+  });
+
+  it("does not send invalid UTF-8 template bytes to the backend", async () => {
+    const installFixedTomlTemplate = vi.fn();
+    window.__GWP_API__ = mockAppApi({ installFixedTomlTemplate }) as never;
+    boot();
+
+    chooseTemplateFile("label-template-v1.toml", new Uint8Array([0xff]));
+
+    await vi.waitFor(() => {
+      expect(installFixedTomlTemplate).not.toHaveBeenCalled();
+      expect(document.body.textContent).toContain(TEMPLATE_UTF8_IMPORT_ERROR);
+    });
+  });
+
+  it("warns about a restored legacy damaged template while retaining its replacement control", async () => {
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(legacyDamagedTemplate, "a".repeat(64))),
+    }) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(LEGACY_TEMPLATE_ENCODING_WARNING);
+      const input = document.querySelector<HTMLInputElement>('[data-action="template-file"]');
+      expect(input?.getAttribute("aria-label")).toBe("更换标签模板");
+      expect(input?.disabled).toBe(false);
+    });
+  });
+
+  it("warns after selecting a root with a legacy damaged template while retaining replacement", async () => {
+    const chooseAndScanRoot = vi.fn().mockResolvedValue({ campuses: [] });
+    const currentFixedTemplate = vi.fn().mockResolvedValue(templateDescriptor(legacyDamagedTemplate, "a".repeat(64)));
+    window.__GWP_API__ = mockAppApi({ chooseAndScanRoot, currentFixedTemplate }) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("请选择本地数据根目录。");
+    });
+    document.querySelector<HTMLButtonElement>('[data-action="choose-root"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(chooseAndScanRoot).toHaveBeenCalledOnce();
+      expect(currentFixedTemplate).toHaveBeenCalledOnce();
+      expect(document.body.textContent).toContain(LEGACY_TEMPLATE_ENCODING_WARNING);
+      const input = document.querySelector<HTMLInputElement>('[data-action="template-file"]');
+      expect(input?.getAttribute("aria-label")).toBe("更换标签模板");
+      expect(input?.disabled).toBe(false);
     });
   });
 

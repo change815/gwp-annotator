@@ -396,6 +396,150 @@ export function templateImportAction(templateLoaded: boolean, fileName: string):
   return "unsupported";
 }
 
+export const TEMPLATE_UTF8_IMPORT_ERROR =
+  "标签模板编码无效或疑似损坏。请将标签模板另存为 UTF-8 后重新导入。";
+export const LEGACY_TEMPLATE_ENCODING_WARNING = "当前模板疑似乱码，请用更换模板导入 UTF-8 TOML";
+
+const TEMPLATE_ENCODING_ERROR_CODE = "INVALID_TEMPLATE_ENCODING";
+
+// Keep this deliberately short: each is a well-known UTF-8-as-GBK artifact, not a rare Han-character ban.
+const GBK_MOJIBAKE_MARKERS = ["锟斤拷", "閫夐", "瀹炵"];
+
+const WINDOWS_1252_BYTES = new Map<number, number>([
+  [0x20ac, 0x80],
+  [0x201a, 0x82],
+  [0x0192, 0x83],
+  [0x201e, 0x84],
+  [0x2026, 0x85],
+  [0x2020, 0x86],
+  [0x2021, 0x87],
+  [0x02c6, 0x88],
+  [0x2030, 0x89],
+  [0x0160, 0x8a],
+  [0x2039, 0x8b],
+  [0x0152, 0x8c],
+  [0x017d, 0x8e],
+  [0x2018, 0x91],
+  [0x2019, 0x92],
+  [0x201c, 0x93],
+  [0x201d, 0x94],
+  [0x2022, 0x95],
+  [0x2013, 0x96],
+  [0x2014, 0x97],
+  [0x02dc, 0x98],
+  [0x2122, 0x99],
+  [0x0161, 0x9a],
+  [0x203a, 0x9b],
+  [0x0153, 0x9c],
+  [0x017e, 0x9e],
+  [0x0178, 0x9f],
+]);
+
+function templateEncodingError(): Error & { code: string } {
+  return Object.assign(new Error(TEMPLATE_UTF8_IMPORT_ERROR), {
+    code: TEMPLATE_ENCODING_ERROR_CODE,
+  });
+}
+
+function windows1252Byte(character: string): number | null {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) return null;
+  if (codePoint <= 0xff) return codePoint;
+  return WINDOWS_1252_BYTES.get(codePoint) ?? null;
+}
+
+function byteInRange(byte: number | null | undefined, lower: number, upper: number): boolean {
+  return byte !== null && byte !== undefined && byte >= lower && byte <= upper;
+}
+
+function hasObviousMojibake(value: string): boolean {
+  if (GBK_MOJIBAKE_MARKERS.some((marker) => value.includes(marker))) return true;
+
+  const bytes = Array.from(value, windows1252Byte);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const lead = bytes[index];
+    if (lead === null || lead === undefined) continue;
+
+    const second = bytes[index + 1];
+    const third = bytes[index + 2];
+    const fourth = bytes[index + 3];
+    if (
+      ((lead >= 0xc2 && lead <= 0xdf) && byteInRange(second, 0x80, 0xbf)) ||
+      (lead === 0xe0 && byteInRange(second, 0xa0, 0xbf) && byteInRange(third, 0x80, 0xbf)) ||
+      (((lead >= 0xe1 && lead <= 0xec) || (lead >= 0xee && lead <= 0xef)) &&
+        byteInRange(second, 0x80, 0xbf) &&
+        byteInRange(third, 0x80, 0xbf)) ||
+      (lead === 0xed && byteInRange(second, 0x80, 0x9f) && byteInRange(third, 0x80, 0xbf)) ||
+      (lead === 0xf0 &&
+        byteInRange(second, 0x90, 0xbf) &&
+        byteInRange(third, 0x80, 0xbf) &&
+        byteInRange(fourth, 0x80, 0xbf)) ||
+      ((lead >= 0xf1 && lead <= 0xf3) &&
+        byteInRange(second, 0x80, 0xbf) &&
+        byteInRange(third, 0x80, 0xbf) &&
+        byteInRange(fourth, 0x80, 0xbf)) ||
+      (lead === 0xf4 &&
+        byteInRange(second, 0x80, 0x8f) &&
+        byteInRange(third, 0x80, 0xbf) &&
+        byteInRange(fourth, 0x80, 0xbf))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasPrivateUseCodePoint(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint !== undefined &&
+      ((codePoint >= 0xe000 && codePoint <= 0xf8ff) ||
+        (codePoint >= 0xf0000 && codePoint <= 0xffffd) ||
+        (codePoint >= 0x100000 && codePoint <= 0x10fffd))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function validateTemplateTextEncoding(value: string): void {
+  // These byte-like sequences are characteristic of UTF-8 rendered as Latin-1/Windows-1252.
+  if (templateTextHasEncodingDamage(value)) {
+    throw templateEncodingError();
+  }
+}
+
+function templateTextHasEncodingDamage(value: string): boolean {
+  return value.includes("\uFFFD") || hasPrivateUseCodePoint(value) || hasObviousMojibake(value);
+}
+
+export function templateHasEncodingDamage(template: LabelTemplate | null | undefined): boolean {
+  return Boolean(
+    template?.fields.some(
+      (field) =>
+        templateTextHasEncodingDamage(field.label) ||
+        field.options.some((option) => templateTextHasEncodingDamage(option.label)),
+    ),
+  );
+}
+
+export function templateAllowsNewAnnotations(template: LabelTemplate | null | undefined): boolean {
+  return Boolean(template && !templateHasEncodingDamage(template));
+}
+
+export function decodeUtf8Template(bytes: ArrayBuffer | Uint8Array): string {
+  let value: string;
+  try {
+    value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw templateEncodingError();
+  }
+  validateTemplateTextEncoding(value);
+  return value;
+}
+
 export function shouldShowCustomCrosshair(
   representative: boolean,
   templateLoaded: boolean,
@@ -431,12 +575,14 @@ function errorCode(error: unknown): string {
 function formatError(error: unknown): string {
   const code = errorCode(error);
   const messages: Record<string, string> = {
-    INVALID_CAMPUS_LAYOUT: "数据根目录必须正好包含两个院区目录。",
+    [TEMPLATE_ENCODING_ERROR_CODE]: TEMPLATE_UTF8_IMPORT_ERROR,
+    INVALID_CAMPUS_LAYOUT: "数据根目录至少需要包含一个有效院区目录。",
     SOURCE_WORK_OVERLAP: "数据根目录与工作目录重叠，已拒绝操作。",
     REPRESENTATIVE_HAS_REGIONS: "该代表图已有保存区域，不能取消选择。",
     NOT_IMAGE_ASSET: "只有图片可以作为代表图。",
     ASSET_NOT_REPRESENTATIVE: "请先选择当前图片为代表图。",
     TEMPLATE_NOT_LOADED: "请先加载标签模板。",
+    INVALID_TEMPLATE: "标签模板内容无效或编码损坏。请将标签模板另存为 UTF-8 后重新导入。",
     FIXED_TEMPLATE_MISSING: "固定标签模板不可用，请重新选择 label-template-v1.toml。",
     FIXED_TEMPLATE_CHECKSUM_MISMATCH: "固定标签模板校验失败，请联系项目管理员后重新导入。",
     FIXED_TEMPLATE_ALREADY_INSTALLED: "当前模板未能更换，请确认选择的是新的 TOML 模板。",
@@ -599,11 +745,12 @@ function mountMarkup(state: State): string {
   const asset = selectedAsset(state);
   const isImage = asset?.media_kind === "image";
   const isRepresentative = Boolean(asset && state.representativeIds.has(asset.asset_id));
-  const annotationReady = canAnnotate(isRepresentative, Boolean(state.template));
+  const templateReady = templateAllowsNewAnnotations(state.template);
+  const annotationReady = canAnnotate(isRepresentative, templateReady);
   const imageReady = Boolean(state.image && state.imageAssetId === asset?.asset_id);
   const crosshairVisible = shouldShowCustomCrosshair(
     isRepresentative,
-    Boolean(state.template),
+    templateReady,
     state.panMode,
     state.crosshair.pointerInCanvas,
     imageReady,
@@ -692,11 +839,11 @@ function mountMarkup(state: State): string {
             ${state.regions
               .map(
                 (region, index) =>
-                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}">删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady ? "" : "disabled"}>删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
-          <div class="annotation-state ${annotationReady ? "ready" : ""}">${isImage ? annotationReady ? "可圈选" : isRepresentative ? "等待模板" : "等待代表图" : "图片标注不可用"}</div>
+          <div class="annotation-state ${annotationReady ? "ready" : ""}">${isImage ? annotationReady ? "可圈选" : isRepresentative ? state.template && !templateReady ? "请更换模板" : "等待模板" : "等待代表图" : "图片标注不可用"}</div>
         </aside>
       </div>
       ${state.labelDraft && state.template ? `
@@ -950,7 +1097,7 @@ function startApp(target: HTMLDivElement): void {
       const asset = selectedAsset(state);
       const visible = shouldShowCustomCrosshair(
         Boolean(asset && state.representativeIds.has(asset.asset_id)),
-        Boolean(state.template),
+        templateAllowsNewAnnotations(state.template),
         state.panMode,
         state.crosshair.pointerInCanvas,
         Boolean(state.image && state.imageAssetId === asset?.asset_id),
@@ -990,8 +1137,16 @@ function startApp(target: HTMLDivElement): void {
         return;
       }
       if (event.button !== 0) return;
-      if (!canAnnotate(state.representativeIds.has(asset.asset_id), Boolean(state.template))) {
-        message(state.template ? "请先选择当前图片为代表图。" : "请先加载标签模板。", "error");
+      const templateReady = templateAllowsNewAnnotations(state.template);
+      if (!canAnnotate(state.representativeIds.has(asset.asset_id), templateReady)) {
+        message(
+          state.template && !templateReady
+            ? LEGACY_TEMPLATE_ENCODING_WARNING
+            : state.template
+              ? "请先选择当前图片为代表图。"
+              : "请先加载标签模板。",
+          "error",
+        );
         render();
         return;
       }
@@ -1105,7 +1260,12 @@ function startApp(target: HTMLDivElement): void {
           state.templateFileName = null;
           throw error;
         }
-        message(`已扫描 ${state.campuses.length} 个院区。`, "success");
+        message(
+          templateHasEncodingDamage(state.template)
+            ? LEGACY_TEMPLATE_ENCODING_WARNING
+            : `已扫描 ${state.campuses.length} 个院区。`,
+          templateHasEncodingDamage(state.template) ? "error" : "success",
+        );
         render();
       } catch (error) {
         message(formatError(error), "error");
@@ -1225,6 +1385,11 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="replace-region"]')?.addEventListener("click", (event) => {
+      if (!templateAllowsNewAnnotations(state.template)) {
+        message(state.template ? LEGACY_TEMPLATE_ENCODING_WARNING : "请先加载标签模板。", "error");
+        render();
+        return;
+      }
       const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
       if (!regionId || !window.confirm("重新圈选后将替换此区域。原区域会保留操作记录。继续吗？")) return;
       state.replaceRegionId = regionId;
@@ -1255,7 +1420,7 @@ function startApp(target: HTMLDivElement): void {
       state.templateInstallPending = true;
       render();
       try {
-        const contents = await file.text();
+        const contents = decodeUtf8Template(await file.arrayBuffer());
         if (action === "install_txt") {
           state.template = (await api.installFixedLabelTxt(contents)).template;
         } else if (action === "replace_toml") {
@@ -1306,7 +1471,14 @@ function startApp(target: HTMLDivElement): void {
       const asset = selectedAsset(state);
       const draft = state.labelDraft;
       const template = state.template;
-      if (!currentCase || !asset || !draft || !template || !labelsMeetRequiredFields(template.fields, state.labelValues)) return;
+      if (
+        !currentCase ||
+        !asset ||
+        !draft ||
+        !template ||
+        !templateAllowsNewAnnotations(template) ||
+        !labelsMeetRequiredFields(template.fields, state.labelValues)
+      ) return;
       try {
         const request: SaveRegionRequest = {
           region_id: randomRegionId(),
@@ -1507,7 +1679,12 @@ function startApp(target: HTMLDivElement): void {
         last_media_unavailable: { text: "已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。", kind: "info" },
       };
       const restoreMessage = restoreMessages[restored.status];
-      message(restoreMessage.text, restoreMessage.kind);
+      message(
+        templateHasEncodingDamage(state.template)
+          ? LEGACY_TEMPLATE_ENCODING_WARNING
+          : restoreMessage.text,
+        templateHasEncodingDamage(state.template) ? "error" : restoreMessage.kind,
+      );
     } catch (error) {
       message(formatError(error), "error");
     }
