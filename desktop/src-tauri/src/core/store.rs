@@ -25,14 +25,21 @@ const DATABASE_FILE: &str = "annotations.sqlite3";
 const DATABASE_JOURNAL_FILE: &str = "annotations.sqlite3-journal";
 const DATABASE_WAL_FILE: &str = "annotations.sqlite3-wal";
 const DATABASE_SHM_FILE: &str = "annotations.sqlite3-shm";
-const FIXED_TEMPLATE_FILE: &str = "templates/label-template-v1.toml";
-const FIXED_TEMPLATE_MANIFEST_FILE: &str = "templates/label-template-v1.manifest.json";
+const LEGACY_FIXED_TEMPLATE_FILE: &str = "templates/label-template-v1.toml";
+const LEGACY_FIXED_TEMPLATE_MANIFEST_FILE: &str = "templates/label-template-v1.manifest.json";
+const ACTIVE_TEMPLATE_MANIFEST_FILE: &str = "templates/active-template.manifest.json";
+const ACTIVE_TEMPLATE_STORAGE_MARKER_FILE: &str = "templates/active-template-storage-v1.marker";
+const TEMPLATE_ARCHIVE_DIRECTORY: &str = "templates/immutable";
+const ACTIVE_TEMPLATE_STORAGE_MARKER: &[u8] = b"gwp-active-template-storage-v1\n";
 const PROJECT_SESSION_FILE: &str = "session/project-session.json";
 const BACKUP_FORMAT: &str = "gwp-case-backup";
+const INSTALLATION_STORAGE_PARENT_DIRECTORY: &str = "GWP Annotator Data";
+const INSTALLATION_WORK_ROOT_DIRECTORY: &str = "PROJECT-LOCAL";
 const SCHEMA_VERSION: i64 = 3;
 const INTERSECTION_EPSILON: f64 = 1e-12;
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WORK_ROOT_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Store {
     /// Canonical physical work root. All derived-file parents must resolve beneath this path.
@@ -90,6 +97,7 @@ pub struct SavedRegion {
     pub polygon_norm: Vec<PointNorm>,
     pub template_id: String,
     pub template_version: u32,
+    pub template: LabelTemplate,
     pub labels: BTreeMap<String, LabelValue>,
 }
 
@@ -116,13 +124,22 @@ pub struct ProjectSessionState {
     pub current_case_id: Option<String>,
     pub current_asset_id: Option<String>,
     pub template_content_sha256: Option<String>,
+    #[serde(default)]
+    pub pending_template_content_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FixedTemplate {
     pub content_sha256: String,
     pub template_sha256: String,
+    pub previous_content_sha256: Option<String>,
     pub template: LabelTemplate,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedFixedTemplate {
+    pub fixed: FixedTemplate,
+    pub needs_activation: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -130,6 +147,10 @@ struct FixedTemplateManifest {
     format: String,
     content_sha256: String,
     template_sha256: String,
+    #[serde(default)]
+    previous_content_sha256: Option<String>,
+    #[serde(default)]
+    template_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -161,6 +182,22 @@ struct BackupManifest {
 }
 
 impl Store {
+    /// Checks only the application-owned final storage components. It intentionally does not
+    /// inspect arbitrary ancestors: macOS legitimately exposes `/var` through a symlink, while
+    /// Windows needs the two app-owned components checked before any canonicalization can follow
+    /// a junction away from the chosen installation drive.
+    pub(crate) fn validate_work_root_for_overlap(work_root: &Path) -> CoreResult<()> {
+        validate_existing_work_root_components(work_root)
+    }
+
+    /// Resolves an existing portion without creating anything. This lets the service reject a
+    /// source/work overlap before SQLite, session files, a write probe, or even the work root are
+    /// created.
+    pub(crate) fn resolve_work_root_for_overlap(work_root: &Path) -> CoreResult<PathBuf> {
+        validate_existing_work_root_components(work_root)?;
+        resolve_existing_work_root_path(work_root)
+    }
+
     /// Reads the local-only session file without creating a database. This is used before the
     /// application can reopen a selected source root on startup.
     pub(crate) fn read_project_session(
@@ -182,12 +219,7 @@ impl Store {
 
     pub(crate) fn open(work_root: impl Into<PathBuf>) -> CoreResult<Self> {
         let requested_work_root = work_root.into();
-        fs::create_dir_all(&requested_work_root)?;
-        let work_root = fs::canonicalize(&requested_work_root)?;
-        let work_root_metadata = fs::symlink_metadata(&work_root)?;
-        if is_link_or_reparse(&work_root_metadata) || !work_root_metadata.file_type().is_dir() {
-            return Err(CoreError::UnsafeDerivedPath);
-        }
+        let work_root = prepare_work_root_after_overlap_check(&requested_work_root)?;
         let database_paths = DatabasePaths::in_work_root(&work_root);
         prepare_database_artifacts(&database_paths)?;
         let mut connection = open_database_no_follow(&database_paths.main)?;
@@ -209,71 +241,74 @@ impl Store {
             .map(|_| ())
     }
 
-    pub(crate) fn install_fixed_template(
+    pub(crate) fn prepare_fixed_template_install(
         &self,
         contents: &str,
         template: &LabelTemplate,
-    ) -> CoreResult<FixedTemplate> {
-        let snapshot = template.snapshot()?;
-        let fixed = FixedTemplate {
-            content_sha256: sha256_hex(contents.as_bytes()),
-            template_sha256: snapshot.sha256,
-            template: template.clone(),
-        };
-        let manifest = FixedTemplateManifest {
-            format: "gwp-fixed-template".to_owned(),
-            content_sha256: fixed.content_sha256.clone(),
-            template_sha256: fixed.template_sha256.clone(),
-        };
-
-        let existing_manifest = self.read_fixed_template_manifest()?;
-        let existing_contents = self.read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?;
-        match (existing_manifest, existing_contents) {
-            (None, None) => {
-                self.atomic_write_relative(Path::new(FIXED_TEMPLATE_FILE), contents.as_bytes())?;
-                let manifest_bytes =
-                    serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
-                self.atomic_write_relative(
-                    Path::new(FIXED_TEMPLATE_MANIFEST_FILE),
-                    &manifest_bytes,
-                )?;
-                Ok(fixed)
+    ) -> CoreResult<PreparedFixedTemplate> {
+        let candidate = fixed_template_from_input(contents, template, None)?;
+        match self.fixed_template() {
+            Ok(None) => {
+                self.prepare_template_archive(contents.as_bytes(), &candidate)?;
+                Ok(PreparedFixedTemplate {
+                    fixed: candidate,
+                    needs_activation: true,
+                })
             }
-            (Some(existing), Some(existing_bytes)) => {
-                let existing_template = fixed_template_from_bytes(&existing, &existing_bytes)?;
-                if existing_template.content_sha256 == fixed.content_sha256
-                    && existing_template.template_sha256 == fixed.template_sha256
-                {
-                    Ok(existing_template)
-                } else {
-                    Err(CoreError::FixedTemplateAlreadyInstalled)
-                }
+            Ok(Some(existing))
+                if existing.content_sha256 == candidate.content_sha256
+                    && existing.template_sha256 == candidate.template_sha256 =>
+            {
+                Ok(PreparedFixedTemplate {
+                    fixed: existing,
+                    needs_activation: false,
+                })
             }
-            (Some(existing), None) => {
-                // A lost fixed copy may be restored only from identical source content. This
-                // prevents the recovery path from becoming an unreviewed template switch.
-                if existing.content_sha256 != fixed.content_sha256
-                    || existing.template_sha256 != fixed.template_sha256
-                {
-                    return Err(CoreError::FixedTemplateChecksumMismatch);
-                }
-                self.atomic_write_relative(Path::new(FIXED_TEMPLATE_FILE), contents.as_bytes())?;
-                Ok(fixed)
+            Ok(Some(_)) => Err(CoreError::FixedTemplateAlreadyInstalled),
+            Err(CoreError::FixedTemplateMissing) => {
+                self.prepare_missing_template_copy(contents.as_bytes(), candidate)
             }
-            (None, Some(_)) => Err(CoreError::FixedTemplateMissing),
+            Err(error) => Err(error),
         }
     }
 
-    pub(crate) fn fixed_template(&self) -> CoreResult<Option<FixedTemplate>> {
-        let manifest = self.read_fixed_template_manifest()?;
-        let contents = self.read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?;
-        match (manifest, contents) {
-            (None, None) => Ok(None),
-            (Some(manifest), Some(contents)) => {
-                fixed_template_from_bytes(&manifest, &contents).map(Some)
-            }
-            _ => Err(CoreError::FixedTemplateMissing),
+    pub(crate) fn prepare_fixed_template_replacement(
+        &self,
+        contents: &str,
+        template: &LabelTemplate,
+    ) -> CoreResult<PreparedFixedTemplate> {
+        let current = self
+            .fixed_template()?
+            .ok_or(CoreError::FixedTemplateMissing)?;
+        let candidate =
+            fixed_template_from_input(contents, template, Some(current.content_sha256.clone()))?;
+        if current.content_sha256 == candidate.content_sha256
+            && current.template_sha256 == candidate.template_sha256
+        {
+            return Ok(PreparedFixedTemplate {
+                fixed: current,
+                needs_activation: false,
+            });
         }
+
+        self.ensure_replacement_identity_is_available(&candidate)?;
+        self.prepare_template_archive(contents.as_bytes(), &candidate)?;
+        Ok(PreparedFixedTemplate {
+            fixed: candidate,
+            needs_activation: true,
+        })
+    }
+
+    pub(crate) fn activate_prepared_fixed_template(
+        &self,
+        fixed: &FixedTemplate,
+    ) -> CoreResult<FixedTemplate> {
+        self.activate_template_archive(fixed)
+    }
+
+    pub(crate) fn fixed_template(&self) -> CoreResult<Option<FixedTemplate>> {
+        self.fixed_template_with_contents()
+            .map(|fixed| fixed.map(|(fixed, _)| fixed))
     }
 
     pub(crate) fn select_representative(
@@ -798,11 +833,8 @@ impl Store {
         if !is_opaque_id(case_id, "CASE-") {
             return Err(CoreError::InvalidOpaqueId);
         }
-        let fixed_template = self
-            .fixed_template()?
-            .ok_or(CoreError::FixedTemplateMissing)?;
-        let template_bytes = self
-            .read_relative_optional(Path::new(FIXED_TEMPLATE_FILE))?
+        let (fixed_template, template_bytes) = self
+            .fixed_template_with_contents()?
             .ok_or(CoreError::FixedTemplateMissing)?;
         let captures = self.captured_frames_for_case(case_id)?;
         let completed_at = now_millis();
@@ -981,6 +1013,12 @@ impl Store {
                         serde_json::from_str(&polygon_json).map_err(|_| CoreError::Database)?;
                     Ok(SavedRegion {
                         labels: read_region_labels(&connection, &region_id)?,
+                        template: load_template_snapshot_from_connection(
+                            &connection,
+                            &template_id,
+                            template_version,
+                        )?
+                        .ok_or(CoreError::Database)?,
                         region_id,
                         asset_id,
                         polygon_norm,
@@ -990,6 +1028,19 @@ impl Store {
                 },
             )
             .collect()
+    }
+
+    pub(crate) fn load_template_snapshot(
+        &self,
+        template_id: &str,
+        version: u32,
+    ) -> CoreResult<Option<LabelTemplate>> {
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        load_template_snapshot_from_connection(&connection, template_id, version)
     }
 
     pub(crate) fn template_snapshot_json(
@@ -1121,9 +1172,196 @@ impl Store {
         }
     }
 
+    fn fixed_template_with_contents(&self) -> CoreResult<Option<(FixedTemplate, Vec<u8>)>> {
+        if let Some(manifest) = self.read_active_template_manifest()? {
+            self.ensure_active_template_storage_marker()?;
+            let relative = active_template_archive_path(&manifest)?;
+            let contents = self
+                .read_relative_optional(&relative)?
+                .ok_or(CoreError::FixedTemplateMissing)?;
+            return fixed_template_from_bytes(&manifest, &contents)
+                .map(|fixed| Some((fixed, contents)));
+        }
+
+        if self.active_template_storage_marker_exists()? {
+            return Err(CoreError::FixedTemplateMissing);
+        }
+
+        let manifest = self.read_fixed_template_manifest()?;
+        let contents = self.read_relative_optional(Path::new(LEGACY_FIXED_TEMPLATE_FILE))?;
+        match (manifest, contents) {
+            (None, None) => Ok(None),
+            (Some(manifest), Some(contents)) => {
+                fixed_template_from_bytes(&manifest, &contents).map(|fixed| Some((fixed, contents)))
+            }
+            _ => Err(CoreError::FixedTemplateMissing),
+        }
+    }
+
+    fn prepare_template_archive(&self, contents: &[u8], fixed: &FixedTemplate) -> CoreResult<()> {
+        let archive_relative = template_archive_relative_path(&fixed.content_sha256);
+        match self.read_relative_optional(&archive_relative)? {
+            Some(existing) if existing != contents => {
+                return Err(CoreError::FixedTemplateChecksumMismatch)
+            }
+            Some(_) => {}
+            None => {
+                self.atomic_write_relative(&archive_relative, contents)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_template_archive(&self, fixed: &FixedTemplate) -> CoreResult<FixedTemplate> {
+        let archive_relative = template_archive_relative_path(&fixed.content_sha256);
+        let contents = self
+            .read_relative_optional(&archive_relative)?
+            .ok_or(CoreError::FixedTemplateMissing)?;
+        let archive_fixed = fixed_template_from_input(
+            std::str::from_utf8(&contents).map_err(|_| CoreError::FixedTemplateChecksumMismatch)?,
+            &fixed.template,
+            fixed.previous_content_sha256.clone(),
+        )?;
+        if archive_fixed.content_sha256 != fixed.content_sha256
+            || archive_fixed.template_sha256 != fixed.template_sha256
+        {
+            return Err(CoreError::FixedTemplateChecksumMismatch);
+        }
+
+        let marker_created = self.ensure_active_template_storage_marker()?;
+        let manifest = FixedTemplateManifest {
+            format: "gwp-fixed-template".to_owned(),
+            content_sha256: fixed.content_sha256.clone(),
+            template_sha256: fixed.template_sha256.clone(),
+            previous_content_sha256: fixed.previous_content_sha256.clone(),
+            template_path: Some(
+                archive_relative
+                    .to_str()
+                    .ok_or(CoreError::StateUnavailable)?
+                    .to_owned(),
+            ),
+        };
+        let manifest_bytes =
+            serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
+        // The immutable content is durable before this single atomic pointer is advanced.
+        if let Err(error) =
+            self.atomic_write_relative(Path::new(ACTIVE_TEMPLATE_MANIFEST_FILE), &manifest_bytes)
+        {
+            if marker_created {
+                let _ =
+                    self.remove_relative_if_exists(Path::new(ACTIVE_TEMPLATE_STORAGE_MARKER_FILE));
+            }
+            return Err(error);
+        }
+        Ok(fixed.clone())
+    }
+
+    fn prepare_missing_template_copy(
+        &self,
+        contents: &[u8],
+        mut candidate: FixedTemplate,
+    ) -> CoreResult<PreparedFixedTemplate> {
+        if let Some(manifest) = self.read_active_template_manifest()? {
+            if manifest.content_sha256 != candidate.content_sha256
+                || manifest.template_sha256 != candidate.template_sha256
+            {
+                return Err(CoreError::FixedTemplateChecksumMismatch);
+            }
+            let mut candidate = candidate;
+            candidate.previous_content_sha256 = manifest.previous_content_sha256;
+            self.prepare_template_archive(contents, &candidate)?;
+            return Ok(PreparedFixedTemplate {
+                fixed: candidate,
+                needs_activation: true,
+            });
+        }
+        if self.active_template_storage_marker_exists()? {
+            let session = Self::read_project_session(&self.work_root)?
+                .ok_or(CoreError::FixedTemplateMissing)?;
+            let expected_content_sha256 = session
+                .pending_template_content_sha256
+                .as_ref()
+                .or(session.template_content_sha256.as_ref())
+                .ok_or(CoreError::FixedTemplateMissing)?;
+            if expected_content_sha256 != &candidate.content_sha256 {
+                return Err(CoreError::FixedTemplateChecksumMismatch);
+            }
+            candidate.previous_content_sha256 = session
+                .template_content_sha256
+                .filter(|sha256| sha256 != &candidate.content_sha256);
+            self.prepare_template_archive(contents, &candidate)?;
+            return Ok(PreparedFixedTemplate {
+                fixed: candidate,
+                needs_activation: true,
+            });
+        }
+        if let Some(manifest) = self.read_fixed_template_manifest()? {
+            if manifest.content_sha256 != candidate.content_sha256
+                || manifest.template_sha256 != candidate.template_sha256
+            {
+                return Err(CoreError::FixedTemplateChecksumMismatch);
+            }
+            self.prepare_template_archive(contents, &candidate)?;
+            return Ok(PreparedFixedTemplate {
+                fixed: candidate,
+                needs_activation: true,
+            });
+        }
+        Err(CoreError::FixedTemplateMissing)
+    }
+
+    fn ensure_replacement_identity_is_available(
+        &self,
+        candidate: &FixedTemplate,
+    ) -> CoreResult<()> {
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let existing_sha = connection
+            .query_row(
+                "SELECT sha256 FROM templates WHERE template_id = ?1 AND version = ?2",
+                params![candidate.template.template_id, candidate.template.version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_sha.is_some_and(|sha| sha != candidate.template_sha256) {
+            return Err(CoreError::TemplateReplacementIdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn read_active_template_manifest(&self) -> CoreResult<Option<FixedTemplateManifest>> {
+        self.read_template_manifest(Path::new(ACTIVE_TEMPLATE_MANIFEST_FILE))
+    }
+
+    fn active_template_storage_marker_exists(&self) -> CoreResult<bool> {
+        match self.read_relative_optional(Path::new(ACTIVE_TEMPLATE_STORAGE_MARKER_FILE))? {
+            None => Ok(false),
+            Some(bytes) if bytes == ACTIVE_TEMPLATE_STORAGE_MARKER => Ok(true),
+            Some(_) => Err(CoreError::FixedTemplateMissing),
+        }
+    }
+
+    /// Returns whether this call created the durable no-legacy-fallback marker.
+    fn ensure_active_template_storage_marker(&self) -> CoreResult<bool> {
+        if self.active_template_storage_marker_exists()? {
+            return Ok(false);
+        }
+        self.atomic_write_relative(
+            Path::new(ACTIVE_TEMPLATE_STORAGE_MARKER_FILE),
+            ACTIVE_TEMPLATE_STORAGE_MARKER,
+        )?;
+        Ok(true)
+    }
+
     fn read_fixed_template_manifest(&self) -> CoreResult<Option<FixedTemplateManifest>> {
-        let Some(bytes) = self.read_relative_optional(Path::new(FIXED_TEMPLATE_MANIFEST_FILE))?
-        else {
+        self.read_template_manifest(Path::new(LEGACY_FIXED_TEMPLATE_MANIFEST_FILE))
+    }
+
+    fn read_template_manifest(&self, relative: &Path) -> CoreResult<Option<FixedTemplateManifest>> {
+        let Some(bytes) = self.read_relative_optional(relative)? else {
             return Ok(None);
         };
         let manifest: FixedTemplateManifest =
@@ -1131,6 +1369,10 @@ impl Store {
         if manifest.format != "gwp-fixed-template"
             || !is_sha256_hex(&manifest.content_sha256)
             || !is_sha256_hex(&manifest.template_sha256)
+            || manifest
+                .previous_content_sha256
+                .as_deref()
+                .is_some_and(|value| !is_sha256_hex(value))
         {
             return Err(CoreError::FixedTemplateMissing);
         }
@@ -1193,10 +1435,199 @@ impl Store {
     }
 }
 
+fn installation_storage_parent(work_root: &Path) -> Option<&Path> {
+    let storage_parent = work_root.parent()?;
+    let work_root_name = work_root.file_name()?.to_str()?;
+    let storage_parent_name = storage_parent.file_name()?.to_str()?;
+    (work_root_name == INSTALLATION_WORK_ROOT_DIRECTORY
+        && storage_parent_name == INSTALLATION_STORAGE_PARENT_DIRECTORY)
+        .then_some(storage_parent)
+}
+
+/// Inspect only components that this application owns. In particular, do not walk arbitrary
+/// ancestors here: on macOS `/var` is often a legitimate symlink, while on Windows the two
+/// installation-adjacent storage components must be rejected before they can be followed as a
+/// junction or another reparse point.
+fn validate_existing_work_root_components(work_root: &Path) -> CoreResult<()> {
+    if let Some(storage_parent) = installation_storage_parent(work_root) {
+        validate_existing_work_root_directory(storage_parent)?;
+    }
+    validate_existing_work_root_directory(work_root)
+}
+
+fn validate_existing_work_root_directory(path: &Path) -> CoreResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_work_root_directory_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CoreError::WorkRootUnavailable),
+    }
+}
+
+fn validate_work_root_directory_metadata(metadata: &fs::Metadata) -> CoreResult<()> {
+    if is_link_or_reparse(metadata) {
+        return Err(CoreError::UnsafeDerivedPath);
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(CoreError::WorkRootUnavailable);
+    }
+    Ok(())
+}
+
+/// Called only from `Store::open`, which the service invokes after it has checked that the source
+/// root and this work root do not overlap. It is deliberately the first point that may create,
+/// probe, or otherwise mutate the work root.
+fn prepare_work_root_after_overlap_check(requested_work_root: &Path) -> CoreResult<PathBuf> {
+    validate_existing_work_root_components(requested_work_root)?;
+
+    if let Some(storage_parent) = installation_storage_parent(requested_work_root) {
+        // The executable's installation parent already exists. Create the application-owned
+        // components one at a time so `create_dir_all` cannot follow a newly inserted junction.
+        ensure_owned_work_root_directory(storage_parent)?;
+        validate_existing_work_root_directory(storage_parent)?;
+        ensure_owned_work_root_directory(requested_work_root)?;
+    } else {
+        // Non-Windows test and development roots retain the existing recursive behavior. Their
+        // final component is still checked above and again below; this intentionally avoids
+        // rejecting legitimate system-owned ancestors such as macOS `/var`.
+        ensure_generic_work_root_directory(requested_work_root)?;
+    }
+
+    validate_existing_work_root_components(requested_work_root)?;
+    let resolved_work_root = resolve_existing_work_root_path(requested_work_root)?;
+    probe_work_root_writable(&resolved_work_root)?;
+    Ok(resolved_work_root)
+}
+
+fn ensure_owned_work_root_directory(path: &Path) -> CoreResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_work_root_directory_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(CoreError::WorkRootUnavailable),
+            }
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| CoreError::WorkRootUnavailable)?;
+            validate_work_root_directory_metadata(&metadata)
+        }
+        Err(_) => Err(CoreError::WorkRootUnavailable),
+    }
+}
+
+fn ensure_generic_work_root_directory(path: &Path) -> CoreResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_work_root_directory_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|_| CoreError::WorkRootUnavailable)?;
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| CoreError::WorkRootUnavailable)?;
+            validate_work_root_directory_metadata(&metadata)
+        }
+        Err(_) => Err(CoreError::WorkRootUnavailable),
+    }
+}
+
+fn resolve_existing_work_root_path(work_root: &Path) -> CoreResult<PathBuf> {
+    let requested_work_root = if work_root.is_absolute() {
+        work_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(work_root)
+    };
+    validate_existing_work_root_components(&requested_work_root)?;
+    let storage_parent = installation_storage_parent(&requested_work_root).map(Path::to_path_buf);
+    let mut candidate = requested_work_root.clone();
+    let mut missing_components = Vec::new();
+
+    loop {
+        if candidate == requested_work_root
+            || storage_parent
+                .as_deref()
+                .is_some_and(|storage_parent| candidate == storage_parent)
+        {
+            // Check immediately before canonicalization so a junction inserted after an earlier
+            // check cannot redirect a lexical D: path to C: and be accepted.
+            validate_existing_work_root_directory(&candidate)?;
+        }
+        match fs::canonicalize(&candidate) {
+            Ok(mut resolved) => {
+                ensure_same_windows_volume(&requested_work_root, &resolved)?;
+                for component in missing_components.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = candidate
+                    .file_name()
+                    .ok_or(CoreError::WorkRootUnavailable)?
+                    .to_os_string();
+                missing_components.push(component);
+                candidate = candidate
+                    .parent()
+                    .ok_or(CoreError::WorkRootUnavailable)?
+                    .to_path_buf();
+            }
+            Err(_) => return Err(CoreError::WorkRootUnavailable),
+        }
+    }
+}
+
+fn ensure_same_windows_volume(requested: &Path, resolved: &Path) -> CoreResult<()> {
+    #[cfg(windows)]
+    {
+        if let (Some(requested_volume), Some(resolved_volume)) = (
+            windows_volume_letter(requested),
+            windows_volume_letter(resolved),
+        ) {
+            if requested_volume != resolved_volume {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (requested, resolved);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_volume_letter(path: &Path) -> Option<u8> {
+    let display = path.as_os_str().to_string_lossy();
+    let display = display.strip_prefix("\\\\?\\").unwrap_or(&display);
+    let bytes = display.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        .then(|| bytes[0].to_ascii_lowercase())
+}
+
+fn probe_work_root_writable(work_root: &Path) -> CoreResult<()> {
+    let sequence = WORK_ROOT_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let probe = work_root.join(format!(
+        ".gwp-work-root-probe-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        file.write_all(b"gwp-work-root-probe")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&probe);
+        return Err(CoreError::WorkRootUnavailable);
+    }
+    fs::remove_file(&probe).map_err(|_| CoreError::WorkRootUnavailable)
+}
+
 fn read_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<Option<Vec<u8>>> {
     if !is_safe_relative_path(relative) {
         return Err(CoreError::InvalidWorkPath);
     }
+    validate_existing_work_root_components(work_root)?;
     let root_metadata = match fs::symlink_metadata(work_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1205,7 +1636,8 @@ fn read_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<Opti
     if is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
         return Err(CoreError::UnsafeDerivedPath);
     }
-    let canonical_root = fs::canonicalize(work_root)?;
+    validate_existing_work_root_components(work_root)?;
+    let canonical_root = resolve_existing_work_root_path(work_root)?;
     let mut current = canonical_root.clone();
     let components = relative.components().collect::<Vec<_>>();
     let (file_component, parent_components) =
@@ -1249,6 +1681,7 @@ fn remove_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<()
     if !is_safe_relative_path(relative) {
         return Err(CoreError::InvalidWorkPath);
     }
+    validate_existing_work_root_components(work_root)?;
     let root_metadata = match fs::symlink_metadata(work_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1257,7 +1690,8 @@ fn remove_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<()
     if is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
         return Err(CoreError::UnsafeDerivedPath);
     }
-    let canonical_root = fs::canonicalize(work_root)?;
+    validate_existing_work_root_components(work_root)?;
+    let canonical_root = resolve_existing_work_root_path(work_root)?;
     let mut current = canonical_root.clone();
     let components = relative.components().collect::<Vec<_>>();
     let (file_component, parent_components) =
@@ -1315,6 +1749,10 @@ fn validate_project_session(state: &ProjectSessionState) -> CoreResult<()> {
             .template_content_sha256
             .as_deref()
             .is_some_and(|value| !is_sha256_hex(value))
+        || state
+            .pending_template_content_sha256
+            .as_deref()
+            .is_some_and(|value| !is_sha256_hex(value))
     {
         return Err(CoreError::StateUnavailable);
     }
@@ -1337,8 +1775,42 @@ fn fixed_template_from_bytes(
     Ok(FixedTemplate {
         content_sha256,
         template_sha256: snapshot.sha256,
+        previous_content_sha256: manifest.previous_content_sha256.clone(),
         template,
     })
+}
+
+fn fixed_template_from_input(
+    contents: &str,
+    template: &LabelTemplate,
+    previous_content_sha256: Option<String>,
+) -> CoreResult<FixedTemplate> {
+    let snapshot = template.snapshot()?;
+    Ok(FixedTemplate {
+        content_sha256: sha256_hex(contents.as_bytes()),
+        template_sha256: snapshot.sha256,
+        previous_content_sha256,
+        template: template.clone(),
+    })
+}
+
+fn template_archive_relative_path(content_sha256: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{TEMPLATE_ARCHIVE_DIRECTORY}/{content_sha256}.toml"
+    ))
+}
+
+fn active_template_archive_path(manifest: &FixedTemplateManifest) -> CoreResult<PathBuf> {
+    let relative = PathBuf::from(
+        manifest
+            .template_path
+            .as_deref()
+            .ok_or(CoreError::FixedTemplateMissing)?,
+    );
+    if relative != template_archive_relative_path(&manifest.content_sha256) {
+        return Err(CoreError::FixedTemplateMissing);
+    }
+    Ok(relative)
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -1387,6 +1859,33 @@ fn ensure_template_snapshot(
             Ok(())
         }
     }
+}
+
+fn load_template_snapshot_from_connection(
+    connection: &Connection,
+    template_id: &str,
+    version: u32,
+) -> CoreResult<Option<LabelTemplate>> {
+    let stored = connection
+        .query_row(
+            "SELECT sha256, canonical_json FROM templates WHERE template_id = ?1 AND version = ?2",
+            params![template_id, version],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_sha256, canonical_json)) = stored else {
+        return Ok(None);
+    };
+    let template = LabelTemplate::parse_json(&canonical_json).map_err(|_| CoreError::Database)?;
+    let snapshot = template.snapshot().map_err(|_| CoreError::Database)?;
+    if snapshot.template_id != template_id
+        || snapshot.version != version
+        || snapshot.sha256 != stored_sha256
+        || snapshot.canonical_json != canonical_json
+    {
+        return Err(CoreError::Database);
+    }
+    Ok(Some(template))
 }
 
 fn read_region_labels(
@@ -1967,7 +2466,9 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_polygon, PointNorm};
+    use std::fs;
+
+    use super::{prepare_work_root_after_overlap_check, validate_polygon, CoreError, PointNorm};
 
     fn points(values: &[(f64, f64)]) -> Vec<PointNorm> {
         values
@@ -1993,5 +2494,73 @@ mod tests {
     fn polygon_rejects_nonadjacent_endpoint_contact() {
         let polygon = points(&[(0.1, 0.1), (0.9, 0.1), (0.9, 0.8), (0.5, 0.1), (0.1, 0.8)]);
         assert!(validate_polygon(&polygon).is_err());
+    }
+
+    #[test]
+    fn work_root_preparation_creates_and_cleans_its_write_probe() {
+        let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+        let work_root = temporary
+            .path()
+            .join("GWP Annotator Data")
+            .join("PROJECT-LOCAL");
+
+        let resolved =
+            prepare_work_root_after_overlap_check(&work_root).expect("prepare synthetic work root");
+
+        assert!(resolved.is_dir());
+        assert!(
+            fs::read_dir(&resolved)
+                .expect("read prepared work root")
+                .next()
+                .is_none(),
+            "write probe must be removed before database creation"
+        );
+    }
+
+    #[test]
+    fn work_root_preparation_rejects_a_non_directory_target() {
+        let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+        let work_root = temporary
+            .path()
+            .join("GWP Annotator Data")
+            .join("PROJECT-LOCAL");
+        fs::create_dir_all(work_root.parent().expect("storage parent"))
+            .expect("create synthetic storage parent");
+        fs::write(&work_root, b"not a directory").expect("write synthetic target");
+
+        assert!(matches!(
+            prepare_work_root_after_overlap_check(&work_root),
+            Err(CoreError::WorkRootUnavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_root_preparation_rejects_a_non_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+        let work_root = temporary
+            .path()
+            .join("GWP Annotator Data")
+            .join("PROJECT-LOCAL");
+        fs::create_dir_all(&work_root).expect("create synthetic work root");
+        let original_permissions = fs::metadata(&work_root)
+            .expect("inspect synthetic work root")
+            .permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0o500);
+        fs::set_permissions(&work_root, blocked_permissions)
+            .expect("make synthetic root read-only");
+
+        let result = prepare_work_root_after_overlap_check(&work_root);
+
+        fs::set_permissions(&work_root, original_permissions)
+            .expect("restore synthetic work root permissions");
+        assert!(matches!(result, Err(CoreError::WorkRootUnavailable)));
     }
 }

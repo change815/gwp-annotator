@@ -52,7 +52,7 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 sh scripts/with-project-npm.sh run rust:b
 
 - Windows 10/11 deployments need WebView2 Runtime available from the offline installation media. The application does not fetch WebView2, codecs, models, templates, or cloud resources at runtime.
 - The production secret provider uses the platform credential store; the project work directory contains only derived data and the SQLite database.
-- The project work directory is selected through Tauri's local app-data path. The selected source root is never a write target.
+- On Windows, the project work directory follows the installation drive and is stored beside the installation folder as `GWP Annotator Data/PROJECT-LOCAL`; the UI shows the exact path. Keeping it outside the program folder reduces the chance that an upgrade or uninstall removes annotations. The selected source root is never a write target. Existing prototype data under Tauri's former local app-data path is left untouched and is not copied automatically.
 - Windows overwrite behavior is implemented with `ReplaceFileW` for existing derived files. It is covered by platform-neutral repeated-write tests here, but it must still be exercised on a Windows reference device; macOS verification is not Windows runtime evidence.
 - `rust:check:windows` is a best-effort compile check of the `x86_64-pc-windows-msvc` target using the project-local Rust toolchain. It is not Windows runtime evidence.
 - IPC commands use product semantics such as `scan_selected_root` and `deselect_representative`.

@@ -14,8 +14,8 @@ use crate::core::scan::{
     PublicScan, ScanSession, StoredAssetKind,
 };
 use crate::core::store::{
-    BackupResult, CapturedFrame, PointNorm, ProjectSessionState, RecoveryState, RegionDraft,
-    SaveFault, SavedRegion, Store,
+    BackupResult, CapturedFrame, PointNorm, PreparedFixedTemplate, ProjectSessionState,
+    RecoveryState, RegionDraft, SaveFault, SavedRegion, Store,
 };
 use crate::core::template::{parse_label_txt, LabelTemplate, LabelValue};
 
@@ -28,6 +28,7 @@ pub struct ProjectService {
     work_root: PathBuf,
     store: Mutex<Option<Store>>,
     active_session: Mutex<Option<ActiveSession>>,
+    template_activation: Mutex<()>,
     templates: Mutex<HashMap<TemplateKey, LabelTemplate>>,
 }
 
@@ -127,6 +128,7 @@ impl ProjectService {
             work_root: work_root.into(),
             store: Mutex::new(None),
             active_session: Mutex::new(None),
+            template_activation: Mutex::new(()),
             templates: Mutex::new(HashMap::new()),
         })
     }
@@ -165,7 +167,7 @@ impl ProjectService {
             }
             Err(error) => return Err(error),
         };
-        let (template, content_sha256) = match self.load_fixed_template() {
+        let (template, content_sha256, previous_content_sha256) = match self.load_fixed_template() {
             Ok(Some(template)) => template,
             Ok(None) | Err(CoreError::FixedTemplateMissing) => {
                 return Ok(StartupRestore {
@@ -187,10 +189,18 @@ impl ProjectService {
             }
             Err(error) => return Err(error),
         };
-        if saved
+        let session_matches_active =
+            saved.template_content_sha256.as_deref() == Some(content_sha256.as_str());
+        let pending_matches_active =
+            saved.pending_template_content_sha256.as_deref() == Some(content_sha256.as_str());
+        let prior_active_matches = saved
             .template_content_sha256
             .as_deref()
-            .is_some_and(|checksum| checksum != content_sha256)
+            .is_some_and(|checksum| previous_content_sha256.as_deref() == Some(checksum));
+        if saved.template_content_sha256.is_some()
+            && !session_matches_active
+            && !pending_matches_active
+            && !prior_active_matches
         {
             return Ok(StartupRestore {
                 status: RestoreStatus::FixedTemplateChecksumMismatch,
@@ -223,6 +233,13 @@ impl ProjectService {
             }
             None => (RestoreStatus::Restored, None, None),
         };
+        if !session_matches_active || saved.pending_template_content_sha256.is_some() {
+            self.write_session_for_active(
+                current_case_id.as_deref(),
+                current_asset_id.as_deref(),
+                Some(content_sha256),
+            )?;
+        }
         Ok(StartupRestore {
             status,
             scan: Some(scan),
@@ -238,6 +255,23 @@ impl ProjectService {
         self.install_fixed_template(input, template)
     }
 
+    pub fn replace_fixed_toml_template(&self, input: &str) -> CoreResult<TemplateDescriptor> {
+        self.ensure_active_roots_separate()?;
+        let template = LabelTemplate::parse_toml(input)?;
+        let _activation = self
+            .template_activation
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let prepared = {
+            let store = self.active_store()?;
+            store
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .prepare_fixed_template_replacement(input, &template)?
+        };
+        self.activate_prepared_fixed_template(prepared)
+    }
+
     /// TXT remains available only for an initial compatibility import. It is converted and fixed
     /// as TOML so later launches never need the original TXT source file.
     pub fn install_fixed_label_txt(&self, input: &str) -> CoreResult<TemplateDescriptor> {
@@ -250,7 +284,7 @@ impl ProjectService {
     pub fn current_fixed_template(&self) -> CoreResult<Option<TemplateDescriptor>> {
         self.ensure_active_roots_separate()?;
         self.load_fixed_template()
-            .map(|template| template.map(|(descriptor, _)| descriptor))
+            .map(|template| template.map(|(descriptor, _, _)| descriptor))
     }
 
     pub fn save_last_position(&self, case_id: &str, asset_id: &str) -> CoreResult<()> {
@@ -367,6 +401,10 @@ impl ProjectService {
 
     pub fn save_confirmed_region(&self, request: SaveRegionRequest) -> CoreResult<()> {
         self.ensure_active_roots_separate()?;
+        let _activation = self
+            .template_activation
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
         let draft = self.region_draft_for_request(request)?;
         let store = self.active_store()?;
         store
@@ -402,6 +440,10 @@ impl ProjectService {
 
     pub fn replace_region(&self, request: ReplaceRegionRequest) -> CoreResult<()> {
         self.ensure_active_roots_separate()?;
+        let _activation = self
+            .template_activation
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
         self.ensure_active_region_for_asset(
             &request.case_id,
             &request.replacement.asset_id,
@@ -689,29 +731,87 @@ impl ProjectService {
         contents: &str,
         template: LabelTemplate,
     ) -> CoreResult<TemplateDescriptor> {
+        let _activation = self
+            .template_activation
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let prepared = {
+            let store = self.active_store()?;
+            store
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .prepare_fixed_template_install(contents, &template)?
+        };
+        self.activate_prepared_fixed_template(prepared)
+    }
+
+    fn activate_prepared_fixed_template(
+        &self,
+        prepared: PreparedFixedTemplate,
+    ) -> CoreResult<TemplateDescriptor> {
+        let snapshot = prepared.fixed.template.snapshot()?;
+        let descriptor = TemplateDescriptor {
+            template_id: snapshot.template_id.clone(),
+            version: snapshot.version,
+            sha256: snapshot.sha256,
+            template: prepared.fixed.template.clone(),
+        };
+        if !prepared.needs_activation {
+            self.register_template(prepared.fixed.template)?;
+            self.write_template_session(Some(prepared.fixed.content_sha256), None)?;
+            return Ok(descriptor);
+        }
+
+        self.write_template_session(
+            prepared.fixed.previous_content_sha256.clone(),
+            Some(prepared.fixed.content_sha256.clone()),
+        )?;
+
+        let activation = self.active_store().and_then(|store| {
+            store
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .activate_prepared_fixed_template(&prepared.fixed)
+        });
+        if let Err(error) = activation {
+            // The active pointer did not advance. A pending session is harmless and is repaired
+            // on the next restore; best-effort cleanup avoids retaining it during this process.
+            let _ = self.write_template_session(prepared.fixed.previous_content_sha256, None);
+            return Err(error);
+        }
+
+        // The active manifest is authoritative. A failed final session write leaves the pending
+        // value, which restore_project_session recognizes and repairs, so this command never
+        // reports an already-active switch as a failure.
+        let _ = self.write_template_session(Some(prepared.fixed.content_sha256), None);
+        Ok(descriptor)
+    }
+
+    fn load_fixed_template(
+        &self,
+    ) -> CoreResult<Option<(TemplateDescriptor, String, Option<String>)>> {
         let fixed = {
             let store = self.active_store()?;
             store
                 .as_ref()
                 .ok_or(CoreError::NoActiveSession)?
-                .install_fixed_template(contents, &template)?
+                .fixed_template()?
         };
-        let descriptor = self.register_template(fixed.template)?;
-        self.write_session_for_active(None, None, Some(fixed.content_sha256))?;
-        Ok(descriptor)
-    }
-
-    fn load_fixed_template(&self) -> CoreResult<Option<(TemplateDescriptor, String)>> {
-        let store = self.active_store()?;
-        let fixed = store
-            .as_ref()
-            .ok_or(CoreError::NoActiveSession)?
-            .fixed_template()?;
         fixed
             .map(|fixed| {
                 let content_sha256 = fixed.content_sha256;
-                self.register_template(fixed.template)
-                    .map(|descriptor| (descriptor, content_sha256))
+                let previous_content_sha256 = fixed.previous_content_sha256;
+                let snapshot = fixed.template.snapshot()?;
+                Ok((
+                    TemplateDescriptor {
+                        template_id: snapshot.template_id,
+                        version: snapshot.version,
+                        sha256: snapshot.sha256,
+                        template: fixed.template,
+                    },
+                    content_sha256,
+                    previous_content_sha256,
+                ))
             })
             .transpose()
     }
@@ -740,6 +840,43 @@ impl ProjectService {
             current_asset_id: current_asset_id.map(str::to_owned),
             template_content_sha256: template_content_sha256
                 .or_else(|| previous.and_then(|state| state.template_content_sha256)),
+            pending_template_content_sha256: None,
+        };
+        let store = self.active_store()?;
+        store
+            .as_ref()
+            .ok_or(CoreError::NoActiveSession)?
+            .write_project_session(&state)
+    }
+
+    fn write_template_session(
+        &self,
+        template_content_sha256: Option<String>,
+        pending_template_content_sha256: Option<String>,
+    ) -> CoreResult<()> {
+        let source_root = {
+            let active = self.active()?;
+            active
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .source_root
+                .clone()
+        };
+        let source_root = source_root
+            .to_str()
+            .ok_or(CoreError::StateUnavailable)?
+            .to_owned();
+        let previous = Store::read_project_session(&self.work_root)?;
+        let (current_case_id, current_asset_id) = previous
+            .filter(|state| state.source_root == source_root)
+            .map(|state| (state.current_case_id, state.current_asset_id))
+            .unwrap_or((None, None));
+        let state = ProjectSessionState {
+            source_root,
+            current_case_id,
+            current_asset_id,
+            template_content_sha256,
+            pending_template_content_sha256,
         };
         let store = self.active_store()?;
         store
@@ -861,24 +998,49 @@ impl ProjectService {
     }
 
     fn template_for(&self, template_id: &str, template_version: u32) -> CoreResult<LabelTemplate> {
-        self.templates
+        let snapshot = {
+            let store = self.active_store()?;
+            store
+                .as_ref()
+                .ok_or(CoreError::NoActiveSession)?
+                .load_template_snapshot(template_id, template_version)?
+        };
+        if let Some(template) = snapshot {
+            return Ok(template);
+        }
+
+        let key = TemplateKey {
+            template_id: template_id.to_owned(),
+            version: template_version,
+        };
+        if let Some(template) = self
+            .templates
             .lock()
             .map_err(|_| CoreError::StateUnavailable)?
-            .get(&TemplateKey {
-                template_id: template_id.to_owned(),
-                version: template_version,
-            })
+            .get(&key)
             .cloned()
-            .ok_or(CoreError::TemplateNotLoaded)
+        {
+            return Ok(template);
+        }
+
+        Err(CoreError::TemplateNotLoaded)
     }
 
     fn region_draft_for_request(&self, request: SaveRegionRequest) -> CoreResult<RegionDraft> {
-        let template = self.template_for(&request.template_id, request.template_version)?;
+        let active = self
+            .current_fixed_template()?
+            .ok_or(CoreError::TemplateNotActive)?;
+        if active.template_id != request.template_id || active.version != request.template_version {
+            return Err(CoreError::TemplateNotActive);
+        }
+        if active.template.snapshot()?.sha256 != active.sha256 {
+            return Err(CoreError::TemplateNotActive);
+        }
         Ok(RegionDraft {
             region_id: request.region_id,
             asset_id: request.asset_id,
             polygon_norm: request.polygon_norm,
-            template,
+            template: active.template,
             labels: request.labels,
         })
     }
@@ -908,7 +1070,10 @@ impl ProjectService {
 
     fn ensure_roots_separate(&self, source_root: &Path) -> CoreResult<()> {
         let resolved_source = fs::canonicalize(source_root)?;
-        let resolved_work = resolve_path_for_overlap(&self.work_root)?;
+        // This preflight is intentionally read-only. It rejects an existing app-owned work-root
+        // component that is a symlink/junction before overlap resolution can follow it.
+        Store::validate_work_root_for_overlap(&self.work_root)?;
+        let resolved_work = Store::resolve_work_root_for_overlap(&self.work_root)?;
         if roots_overlap(&resolved_source, &resolved_work) {
             return Err(CoreError::SourceWorkOverlap);
         }
@@ -935,54 +1100,25 @@ impl ProjectService {
             sha256: snapshot.sha256,
             template: template.clone(),
         };
-        self.templates
+        let mut templates = self
+            .templates
             .lock()
-            .map_err(|_| CoreError::StateUnavailable)?
-            .insert(
-                TemplateKey {
-                    template_id: template.template_id.clone(),
-                    version: template.version,
-                },
-                template,
-            );
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let key = TemplateKey {
+            template_id: template.template_id.clone(),
+            version: template.version,
+        };
+        if let Some(existing) = templates.get(&key) {
+            if existing.snapshot()?.sha256 != descriptor.sha256 {
+                return Err(CoreError::TemplateSnapshotConflict);
+            }
+            return Ok(descriptor);
+        }
+        templates.insert(key, template);
         Ok(descriptor)
     }
 }
 
 fn roots_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
-}
-
-/// Resolve the existing portion of a path without creating it, then append the nonexistent tail.
-/// `canonicalize` follows both Unix symlinks and Windows junctions for the existing portion.
-fn resolve_path_for_overlap(path: &Path) -> CoreResult<PathBuf> {
-    let mut candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut missing_components = Vec::new();
-
-    loop {
-        match fs::canonicalize(&candidate) {
-            Ok(mut resolved) => {
-                for component in missing_components.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = candidate
-                    .file_name()
-                    .ok_or(CoreError::Filesystem)?
-                    .to_os_string();
-                missing_components.push(component);
-                candidate = candidate
-                    .parent()
-                    .ok_or(CoreError::Filesystem)?
-                    .to_path_buf();
-            }
-            Err(_) => return Err(CoreError::Filesystem),
-        }
-    }
 }

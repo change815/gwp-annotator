@@ -53,6 +53,7 @@ export interface SavedRegion {
   polygon_norm: PointNorm[];
   template_id: string;
   template_version: number;
+  template: LabelTemplate;
   labels: Record<string, LabelValue>;
 }
 
@@ -142,7 +143,9 @@ interface AppApi {
   readImageAsset(caseId: string, assetId: string): Promise<ImageAssetData>;
   savedRegionsForAsset(caseId: string, assetId: string): Promise<SavedRegion[]>;
   installFixedTomlTemplate(input: string): Promise<TemplateDescriptor>;
+  replaceFixedTomlTemplate(input: string): Promise<TemplateDescriptor>;
   installFixedLabelTxt(input: string): Promise<TemplateDescriptor>;
+  projectStorageLocation(): Promise<string>;
   updateRegionLabels(request: UpdateRegionLabelsRequest): Promise<void>;
   deleteRegion(caseId: string, assetId: string, regionId: string): Promise<void>;
   replaceRegion(request: ReplaceRegionRequest): Promise<void>;
@@ -211,8 +214,11 @@ const tauriApi: AppApi = {
     invoke<SavedRegion[]>("saved_regions_for_asset", { caseId, assetId }),
   installFixedTomlTemplate: (templateToml) =>
     invoke<TemplateDescriptor>("install_fixed_toml_template", { templateToml }),
+  replaceFixedTomlTemplate: (templateToml) =>
+    invoke<TemplateDescriptor>("replace_fixed_toml_template", { templateToml }),
   installFixedLabelTxt: (text) =>
     invoke<TemplateDescriptor>("install_fixed_label_txt", { text }),
+  projectStorageLocation: () => invoke<string>("project_storage_location"),
   updateRegionLabels: async (request) => invoke("update_region_labels", { request }),
   deleteRegion: async (caseId, assetId, regionId) => invoke("delete_region", { caseId, assetId, regionId }),
   replaceRegion: async (request) => invoke("replace_region", { request }),
@@ -254,6 +260,7 @@ interface DraftRegion {
 
 interface EditLabelsDraft {
   regionId: string;
+  template: LabelTemplate;
   values: Record<string, LabelValue>;
 }
 
@@ -283,6 +290,9 @@ interface State {
   editLabels: EditLabelsDraft | null;
   template: LabelTemplate | null;
   templateFileName: string | null;
+  templateInstallPending: boolean;
+  storageLocation: string | null;
+  storageLocationVisible: boolean;
   videoTime: number;
   videoDuration: number;
   videoPlaying: boolean;
@@ -313,6 +323,9 @@ const initialState = (): State => ({
   editLabels: null,
   template: null,
   templateFileName: null,
+  templateInstallPending: false,
+  storageLocation: null,
+  storageLocationVisible: false,
   videoTime: 0,
   videoDuration: 0,
   videoPlaying: false,
@@ -374,6 +387,15 @@ export function canAnnotate(representative: boolean, templateLoaded: boolean): b
   return representative && templateLoaded;
 }
 
+export type TemplateImportAction = "install_toml" | "replace_toml" | "install_txt" | "unsupported";
+
+export function templateImportAction(templateLoaded: boolean, fileName: string): TemplateImportAction {
+  const lowerName = fileName.toLowerCase();
+  if (lowerName.endsWith(".toml")) return templateLoaded ? "replace_toml" : "install_toml";
+  if (lowerName.endsWith(".txt") && !templateLoaded) return "install_txt";
+  return "unsupported";
+}
+
 export function shouldShowCustomCrosshair(
   representative: boolean,
   templateLoaded: boolean,
@@ -417,6 +439,12 @@ function formatError(error: unknown): string {
     TEMPLATE_NOT_LOADED: "请先加载标签模板。",
     FIXED_TEMPLATE_MISSING: "固定标签模板不可用，请重新选择 label-template-v1.toml。",
     FIXED_TEMPLATE_CHECKSUM_MISMATCH: "固定标签模板校验失败，请联系项目管理员后重新导入。",
+    FIXED_TEMPLATE_ALREADY_INSTALLED: "当前模板未能更换，请确认选择的是新的 TOML 模板。",
+    TEMPLATE_REPLACEMENT_IDENTITY_CONFLICT: "该模板 ID 和 version 已用于标注。请在 TOML 中增加 version，或更换 template_id。",
+    TEMPLATE_NOT_ACTIVE: "当前标注仍引用旧模板，请刷新后使用当前模板重试。",
+    TEMPLATE_SNAPSHOT_CONFLICT: "该模板版本已经用于标注。请在 TOML 中增加 version，或更换 template_id 后再导入。",
+    WORK_ROOT_UNAVAILABLE: "无法使用软件安装目录旁的数据保存位置。请打开“数据保存位置”核对目录、当前用户权限和磁盘空间；软件不会回退到 C 盘或 %LOCALAPPDATA%。",
+    UNSAFE_DERIVED_PATH: "数据保存路径包含不安全的链接、联接点或非普通文件，已拒绝操作。请检查“数据保存位置”后重试。",
     SAVED_ROOT_UNAVAILABLE: "上次的数据目录不可用，请连接磁盘后重新选择。",
     NOT_VIDEO_ASSET: "当前媒体不是 MP4 视频。",
     INVALID_CAPTURE: "无法截取当前视频帧。请确认本机可播放该 MP4。",
@@ -582,6 +610,7 @@ function mountMarkup(state: State): string {
     Boolean(state.labelDraft),
   );
   const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft;
+  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels);
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
@@ -592,14 +621,16 @@ function mountMarkup(state: State): string {
         <div class="header-actions">
           <button type="button" data-action="choose-root">更换数据目录</button>
           <button type="button" data-action="forget-position">忘记上次位置</button>
+          <button type="button" data-action="storage-location" aria-expanded="${state.storageLocationVisible}">数据保存位置</button>
           <span class="offline-status" data-testid="offline-status">本地离线</span>
         </div>
       </header>
       <p class="notice ${state.messageKind}" role="status" aria-live="polite">${escapeHtml(state.message)}</p>
+      ${state.storageLocationVisible ? `<section class="storage-location" aria-label="数据保存位置"><strong>数据保存位置</strong><output>${escapeHtml(state.storageLocation ?? "正在读取…")}</output><span>Windows 中该目录位于软件安装目录旁边；安装在 D 盘时，标注数据也保存在 D 盘。</span></section>` : ""}
       <section class="template-strip" aria-label="标签模板">
         <strong>标签模板</strong>
-        <span>${state.template ? `固定模板：${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。首次请选择 label-template-v1.toml。"}</span>
-        ${state.template ? "" : `<label class="file-button">首次导入模板<input data-action="template-file" type="file" accept=".toml,.txt,text/plain" aria-label="首次导入标签模板"></label>`}
+        <span>${state.template ? `当前模板：${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。请选择 label-template-v1.toml。"}</span>
+        <label class="file-button ${templateInputDisabled ? "disabled" : ""}">${state.templateInstallPending ? "正在验证…" : state.template ? "更换模板" : "导入模板"}<input data-action="template-file" type="file" accept="${state.template ? ".toml,text/plain" : ".toml,.txt,text/plain"}" aria-label="${state.template ? "更换标签模板" : "导入标签模板"}" ${templateInputDisabled ? "disabled" : ""}></label>
       </section>
       <div class="workspace-grid">
         <aside class="case-sidebar" aria-label="院区与病例">
@@ -661,7 +692,7 @@ function mountMarkup(state: State): string {
             ${state.regions
               .map(
                 (region, index) =>
-                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}">删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}">删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
@@ -679,7 +710,7 @@ function mountMarkup(state: State): string {
             </form>
           </section>
         </div>` : ""}
-      ${state.editLabels && state.template ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit">取消</button></header><p>确认后会保留本次标签修正的操作记录。</p><form data-edit-label-form>${state.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id])).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit">取消</button><button type="submit" ${labelsMeetRequiredFields(state.template.fields, state.editLabels.values) ? "" : "disabled"}>确认修改</button></div></form></section></div>` : ""}
+      ${state.editLabels ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit">取消</button></header><p>使用该区域原来的 ${escapeHtml(state.editLabels.template.template_id)} v${state.editLabels.template.version} 模板；确认后保留修正记录。</p><form data-edit-label-form>${state.editLabels.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id])).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit">取消</button><button type="submit" ${labelsMeetRequiredFields(state.editLabels.template.fields, state.editLabels.values) ? "" : "disabled"}>确认修改</button></div></form></section></div>` : ""}
     </main>`;
 }
 
@@ -739,6 +770,21 @@ function startApp(target: HTMLDivElement): void {
   const message = (text: string, kind: State["messageKind"] = "info") => {
     state.message = text;
     state.messageKind = kind;
+  };
+
+  const reconcileFailedTemplateReplacement = async (replacementError: unknown, fileName: string): Promise<void> => {
+    try {
+      const activeTemplate = await api.currentFixedTemplate();
+      state.template = activeTemplate?.template ?? null;
+      state.templateFileName = activeTemplate ? fileName : null;
+      state.labelValues = {};
+      message(
+        `更换标签模板失败：${formatError(replacementError)}；${activeTemplate ? "已根据后端当前模板刷新界面。" : "后端当前未加载标签模板。"}`,
+        "error",
+      );
+    } catch {
+      message(`更换标签模板失败：${formatError(replacementError)}；未能读取后端当前模板，界面保留原模板。`, "error");
+    }
   };
 
   const refreshRegions = async (): Promise<void> => {
@@ -1076,6 +1122,18 @@ function startApp(target: HTMLDivElement): void {
       }
       render();
     });
+    target.querySelector<HTMLButtonElement>('[data-action="storage-location"]')?.addEventListener("click", async () => {
+      state.storageLocationVisible = !state.storageLocationVisible;
+      render();
+      if (!state.storageLocationVisible || state.storageLocation) return;
+      try {
+        state.storageLocation = await api.projectStorageLocation();
+      } catch (error) {
+        state.storageLocationVisible = false;
+        message(formatError(error), "error");
+      }
+      render();
+    });
     target.querySelector<HTMLSelectElement>('[data-action="campus"]')?.addEventListener("change", async (event) => {
       state.campusCode = (event.currentTarget as HTMLSelectElement).value;
       const firstCase = selectedCampus(state)?.cases[0];
@@ -1145,7 +1203,11 @@ function startApp(target: HTMLDivElement): void {
       const regionId = target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.dataset.regionId;
       const region = state.regions.find((item) => item.region_id === regionId);
       if (!region) return;
-      state.editLabels = { regionId: region.region_id, values: structuredClone(region.labels) };
+      state.editLabels = {
+        regionId: region.region_id,
+        template: region.template,
+        values: structuredClone(region.labels),
+      };
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="delete-region"]')?.addEventListener("click", async (event) => {
@@ -1174,23 +1236,52 @@ function startApp(target: HTMLDivElement): void {
       const input = event.currentTarget as HTMLInputElement;
       const file = input.files?.[0];
       if (!file) return;
+      const replacing = Boolean(state.template);
+      const action = templateImportAction(replacing, file.name);
+      if (action === "unsupported") {
+        message("正式模板支持 .toml；.txt 仅用于首次兼容导入。", "error");
+        render();
+        return;
+      }
+      if (
+        replacing
+        && !window.confirm(
+          "确认更换当前标签模板？已有区域继续保留并使用原模板；新圈选和删除后重画将使用新模板，不会自动转换旧标签。",
+        )
+      ) {
+        input.value = "";
+        return;
+      }
+      state.templateInstallPending = true;
+      render();
       try {
         const contents = await file.text();
-        if (file.name.toLowerCase().endsWith(".txt")) {
+        if (action === "install_txt") {
           state.template = (await api.installFixedLabelTxt(contents)).template;
-        } else if (file.name.toLowerCase().endsWith(".toml")) {
-          state.template = (await api.installFixedTomlTemplate(contents)).template;
+        } else if (action === "replace_toml") {
+          try {
+            state.template = (await api.replaceFixedTomlTemplate(contents)).template;
+          } catch (error) {
+            await reconcileFailedTemplateReplacement(error, file.name);
+            return;
+          }
         } else {
-          message("正式模板仅支持 .toml；.txt 仅用于首次兼容导入。", "error");
-          render();
-          return;
+          state.template = (await api.installFixedTomlTemplate(contents)).template;
         }
         state.templateFileName = file.name;
-        message("固定标签模板已安装，后续启动将自动加载。", "success");
+        state.labelValues = {};
+        message(
+          replacing
+            ? "标签模板已更换。旧区域保留原模板，新圈选使用当前模板。"
+            : "标签模板已安装，后续启动将自动加载。",
+          "success",
+        );
       } catch (error) {
         message(formatError(error), "error");
+      } finally {
+        state.templateInstallPending = false;
+        render();
       }
-      render();
     });
     const form = target.querySelector<HTMLFormElement>("[data-label-form]");
     form?.addEventListener("change", (event) => {
@@ -1246,7 +1337,7 @@ function startApp(target: HTMLDivElement): void {
       const input = event.target as HTMLInputElement | HTMLSelectElement;
       const fieldId = input.dataset.labelField;
       const edit = state.editLabels;
-      const template = state.template;
+      const template = edit?.template;
       if (!fieldId || !edit || !template) return;
       const field = template.fields.find((item) => item.id === fieldId);
       if (!field) return;
@@ -1260,7 +1351,7 @@ function startApp(target: HTMLDivElement): void {
       const currentCase = selectedCase(state);
       const asset = selectedAsset(state);
       const edit = state.editLabels;
-      const template = state.template;
+      const template = edit?.template;
       if (!currentCase || !asset || !edit || !template || !labelsMeetRequiredFields(template.fields, edit.values)) return;
       try {
         await api.updateRegionLabels({ case_id: currentCase.case_id, asset_id: asset.asset_id, region_id: edit.regionId, template_id: template.template_id, template_version: template.version, labels: edit.values });
@@ -1411,8 +1502,8 @@ function startApp(target: HTMLDivElement): void {
         no_session: { text: "请选择本地数据根目录。", kind: "info" },
         restored: { text: "已恢复上次的数据目录、模板与浏览位置。", kind: "success" },
         saved_root_unavailable: { text: "上次的数据目录不可用，请连接磁盘后重新选择。", kind: "error" },
-        fixed_template_missing: { text: "已恢复数据目录，但固定模板不可用；请重新导入 label-template-v1.toml。", kind: "error" },
-        fixed_template_checksum_mismatch: { text: "固定模板校验失败；请联系项目管理员后重新导入。", kind: "error" },
+        fixed_template_missing: { text: "已恢复数据目录，但当前模板不可用；请重新导入对应的 TOML 模板。", kind: "error" },
+        fixed_template_checksum_mismatch: { text: "当前模板校验失败；请联系项目管理员后重新导入。", kind: "error" },
         last_media_unavailable: { text: "已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。", kind: "info" },
       };
       const restoreMessage = restoreMessages[restored.status];

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   autoCloseThreshold,
@@ -13,6 +13,8 @@ import {
   primaryDrawingButtonIsPressed,
   shouldHandleMediaNavigation,
   shouldShowCustomCrosshair,
+  templateImportAction,
+  type LabelTemplate,
   type PointNorm,
   type TemplateField,
 } from "./main";
@@ -22,6 +24,58 @@ const triangle: PointNorm[] = [
   { x: 0.8, y: 0.1 },
   { x: 0.4, y: 0.8 },
 ];
+
+const templateV1: LabelTemplate = {
+  format: "gwa-label-template",
+  version: 1,
+  template_id: "template-test",
+  fields: [],
+};
+
+const templateV2: LabelTemplate = { ...templateV1, version: 2 };
+
+function templateDescriptor(template: LabelTemplate, sha256: string): Record<string, unknown> {
+  return {
+    template_id: template.template_id,
+    version: template.version,
+    sha256,
+    template,
+  };
+}
+
+function restoredWithTemplate(template: LabelTemplate, sha256: string): Record<string, unknown> {
+  return {
+    status: "restored",
+    scan: { campuses: [] },
+    template: templateDescriptor(template, sha256),
+    current_case_id: null,
+    current_asset_id: null,
+  };
+}
+
+function mockAppApi(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    restoreProjectSession: vi.fn().mockResolvedValue({
+      status: "no_session",
+      scan: null,
+      template: null,
+      current_case_id: null,
+      current_asset_id: null,
+    }),
+    currentLocalDisplayScan: vi.fn().mockResolvedValue({ campuses: [] }),
+    projectStorageLocation: vi.fn().mockResolvedValue("D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL"),
+    ...overrides,
+  };
+}
+
+function chooseTemplateFile(fileName: string, contents = "version = 2"): void {
+  const input = document.querySelector<HTMLInputElement>('[data-action="template-file"]');
+  Object.defineProperty(input, "files", {
+    configurable: true,
+    value: [{ name: fileName, text: async () => contents }],
+  });
+  input?.dispatchEvent(new Event("change", { bubbles: true }));
+}
 
 describe("drawing geometry", () => {
   it("uses CSS-pixel distance with the documented automatic-close threshold", () => {
@@ -128,6 +182,14 @@ describe("template controls and representative gate", () => {
     expect(canAnnotate(false, true)).toBe(false);
     expect(canAnnotate(true, true)).toBe(true);
   });
+
+  it("allows TOML replacement while keeping TXT as first-import compatibility only", () => {
+    expect(templateImportAction(false, "label-template-v1.toml")).toBe("install_toml");
+    expect(templateImportAction(true, "label-template-v2.TOML")).toBe("replace_toml");
+    expect(templateImportAction(false, "legacy-label.txt")).toBe("install_txt");
+    expect(templateImportAction(true, "legacy-label.txt")).toBe("unsupported");
+    expect(templateImportAction(false, "labels.json")).toBe("unsupported");
+  });
 });
 
 describe("custom drawing crosshair", () => {
@@ -167,11 +229,150 @@ describe("local shell", () => {
     document.body.innerHTML = '<div id="app"></div>';
   });
 
+  afterEach(() => {
+    delete window.__GWP_API__;
+    vi.restoreAllMocks();
+  });
+
   it("renders an offline local status without a built-in medical template", () => {
     boot();
 
     expect(document.querySelector('[data-testid="offline-status"]')?.textContent).toBe("本地离线");
-    expect(document.body.textContent).toContain("未加载。首次请选择 label-template-v1.toml。");
+    expect(document.body.textContent).toContain("未加载。请选择 label-template-v1.toml。");
+    expect(document.querySelector<HTMLInputElement>('[data-action="template-file"]')?.disabled).toBe(false);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')).not.toBeNull();
     expect(document.querySelector<HTMLButtonElement>('[data-action="forget-position"]')?.disabled).toBe(false);
+  });
+
+  it("confirms and invokes the replacement API when a template is already active", async () => {
+    const replaceFixedTomlTemplate = vi.fn().mockResolvedValue(templateDescriptor(templateV2, "b".repeat(64)));
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(templateV1, "a".repeat(64))),
+      replaceFixedTomlTemplate,
+    }) as never;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    boot();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+    });
+
+    const input = document.querySelector<HTMLInputElement>('[data-action="template-file"]');
+    expect(input?.getAttribute("aria-label")).toBe("更换标签模板");
+    chooseTemplateFile("label-template-v2.toml");
+
+    await vi.waitFor(() => {
+      expect(replaceFixedTomlTemplate).toHaveBeenCalledWith("version = 2");
+      expect(document.body.textContent).toContain("当前模板：template-test v2");
+      expect(document.body.textContent).toContain("标签模板已更换");
+    });
+  });
+
+  it("leaves the active template unchanged when replacement is cancelled", async () => {
+    const replaceFixedTomlTemplate = vi.fn();
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(templateV1, "a".repeat(64))),
+      replaceFixedTomlTemplate,
+    }) as never;
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    boot();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+    });
+
+    chooseTemplateFile("label-template-v2.toml");
+
+    await Promise.resolve();
+    expect(replaceFixedTomlTemplate).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("当前模板：template-test v1");
+  });
+
+  it("reconciles to the backend template when replacement reports an error after switching it", async () => {
+    const replacementError = { code: "TEMPLATE_REPLACEMENT_IDENTITY_CONFLICT" };
+    const replaceFixedTomlTemplate = vi.fn().mockRejectedValue(replacementError);
+    const currentFixedTemplate = vi.fn().mockResolvedValue(templateDescriptor(templateV2, "b".repeat(64)));
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(templateV1, "a".repeat(64))),
+      replaceFixedTomlTemplate,
+      currentFixedTemplate,
+    }) as never;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    boot();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+    });
+
+    chooseTemplateFile("label-template-v2.toml");
+
+    await vi.waitFor(() => {
+      expect(currentFixedTemplate).toHaveBeenCalledOnce();
+      expect(document.body.textContent).toContain("当前模板：template-test v2");
+      expect(document.body.textContent).toContain("已根据后端当前模板刷新界面。");
+      expect(document.querySelector(".notice")?.classList.contains("error")).toBe(true);
+    });
+  });
+
+  it("clears the active template when failed replacement reload reports none", async () => {
+    const replaceFixedTomlTemplate = vi.fn().mockRejectedValue({ code: "FIXED_TEMPLATE_MISSING" });
+    const currentFixedTemplate = vi.fn().mockResolvedValue(null);
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(templateV1, "a".repeat(64))),
+      replaceFixedTomlTemplate,
+      currentFixedTemplate,
+    }) as never;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    boot();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+    });
+
+    chooseTemplateFile("label-template-v2.toml");
+
+    await vi.waitFor(() => {
+      expect(currentFixedTemplate).toHaveBeenCalledOnce();
+      expect(document.body.textContent).toContain("未加载。请选择 label-template-v1.toml。");
+      expect(document.body.textContent).toContain("后端当前未加载标签模板。");
+    });
+  });
+
+  it("retains the displayed template and reports an unrecoverable reload failure", async () => {
+    const replaceFixedTomlTemplate = vi.fn().mockRejectedValue({ code: "FIXED_TEMPLATE_MISSING" });
+    const currentFixedTemplate = vi.fn().mockRejectedValue({ code: "UNEXPECTED_ERROR" });
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue(restoredWithTemplate(templateV1, "a".repeat(64))),
+      replaceFixedTomlTemplate,
+      currentFixedTemplate,
+    }) as never;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    boot();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+    });
+
+    chooseTemplateFile("label-template-v2.toml");
+
+    await vi.waitFor(() => {
+      expect(currentFixedTemplate).toHaveBeenCalledOnce();
+      expect(document.body.textContent).toContain("当前模板：template-test v1");
+      expect(document.body.textContent).toContain("未能读取后端当前模板，界面保留原模板。");
+    });
+  });
+
+  it("shows the backend-provided project storage location", async () => {
+    const projectStorageLocation = vi
+      .fn()
+      .mockResolvedValue("D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL");
+    window.__GWP_API__ = mockAppApi({ projectStorageLocation }) as never;
+    boot();
+
+    document
+      .querySelector<HTMLButtonElement>('[data-action="storage-location"]')
+      ?.click();
+
+    await vi.waitFor(() => {
+      expect(projectStorageLocation).toHaveBeenCalledOnce();
+      expect(document.querySelector(".storage-location output")?.textContent).toBe(
+        "D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL",
+      );
+    });
   });
 });

@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(any(target_os = "windows", test))]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gwp_annotator_core::core::commands::{self as core_commands, CommandError};
@@ -100,6 +102,14 @@ fn install_fixed_toml_template(
 }
 
 #[tauri::command]
+fn replace_fixed_toml_template(
+    template_toml: String,
+    state: State<'_, AppState>,
+) -> Result<TemplateDescriptor, CommandError> {
+    core_commands::replace_fixed_toml_template(template_toml, state)
+}
+
+#[tauri::command]
 fn install_fixed_label_txt(
     text: String,
     state: State<'_, AppState>,
@@ -112,6 +122,18 @@ fn current_fixed_template(
     state: State<'_, AppState>,
 ) -> Result<Option<TemplateDescriptor>, CommandError> {
     core_commands::current_fixed_template(state)
+}
+
+#[tauri::command]
+fn project_storage_location(state: State<'_, AppState>) -> Result<String, CommandError> {
+    state
+        .service
+        .work_root()
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(CommandError {
+            code: "STATE_UNAVAILABLE",
+        })
 }
 
 #[tauri::command]
@@ -309,11 +331,33 @@ fn parse_byte_range(value: &str, length: usize) -> Option<(usize, usize)> {
     (end >= start).then_some((start, end))
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn work_root_beside_installation(executable: &Path) -> Option<PathBuf> {
+    let installation_dir = executable.parent()?;
+    let storage_parent = installation_dir.parent().unwrap_or(installation_dir);
+    Some(
+        storage_parent
+            .join("GWP Annotator Data")
+            .join("PROJECT-LOCAL"),
+    )
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol("gwp-media", media_protocol_response)
         .setup(|app| {
+            #[cfg(target_os = "windows")]
+            let work_root = {
+                let executable = std::env::current_exe()?;
+                work_root_beside_installation(&executable).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "executable path does not have an installation parent",
+                    )
+                })?
+            };
+            #[cfg(not(target_os = "windows"))]
             let work_root = app
                 .path()
                 .app_local_data_dir()?
@@ -338,8 +382,10 @@ fn main() {
             import_json_template,
             import_label_txt,
             install_fixed_toml_template,
+            replace_fixed_toml_template,
             install_fixed_label_txt,
             current_fixed_template,
+            project_storage_location,
             save_confirmed_region,
             update_region_labels,
             delete_region,
@@ -358,7 +404,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_byte_range;
+    use std::path::Path;
+
+    use super::{parse_byte_range, work_root_beside_installation};
 
     #[test]
     fn parses_supported_single_video_byte_ranges() {
@@ -370,5 +418,14 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=9-8", 100), None);
         assert_eq!(parse_byte_range("bytes=0-1,4-5", 100), None);
         assert_eq!(parse_byte_range("bytes=0-0", 0), None);
+    }
+
+    #[test]
+    fn places_project_data_beside_the_installation_directory() {
+        let executable = Path::new("/volume/apps/GWP Annotator/gwp-annotator-desktop.exe");
+        assert_eq!(
+            work_root_beside_installation(executable).as_deref(),
+            Some(Path::new("/volume/apps/GWP Annotator Data/PROJECT-LOCAL"))
+        );
     }
 }

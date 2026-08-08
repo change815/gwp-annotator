@@ -119,6 +119,29 @@ canvas:focus-visible {
   color: #155f3c;
 }
 
+.storage-location {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+  margin: 0 0 0.6rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid #b8c4cf;
+  background: #fff;
+  font-size: 0.82rem;
+}
+
+.storage-location output {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #18364a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.storage-location span {
+  grid-column: 2;
+  color: #526373;
+}
+
 .template-strip {
   flex-wrap: wrap;
   min-height: 44px;
@@ -150,6 +173,11 @@ canvas:focus-visible {
 .file-button:hover {
   border-color: #126b91;
   background: #edf6fa;
+}
+
+.file-button.disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .file-button input {
@@ -249,9 +277,19 @@ canvas:focus-visible {
 }
 
 .region-item > button:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
   width: 100%;
   min-height: 32px;
   text-align: left;
+}
+
+.region-item > button:first-child small {
+  color: #6b4f19;
+  font-size: 0.7rem;
+  font-weight: 600;
 }
 
 .region-actions {
@@ -685,6 +723,18 @@ canvas:focus-visible {
   .template-strip {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .template-strip > span {
+    flex: 0 0 auto;
+  }
+
+  .storage-location {
+    grid-template-columns: 1fr;
+  }
+
+  .storage-location span {
+    grid-column: 1;
   }
 
   .template-meta input {

@@ -34,6 +34,10 @@ pub enum CoreError {
     FixedTemplateChecksumMismatch,
     #[error("a different fixed project template is already installed")]
     FixedTemplateAlreadyInstalled,
+    #[error("the replacement template reuses an installed template ID and version with different content; increase the version or use a new template ID")]
+    TemplateReplacementIdentityConflict,
+    #[error("new regions must use the current fixed project template")]
+    TemplateNotActive,
     #[error("label values do not satisfy the template")]
     InvalidLabels,
     #[error("polygon is invalid")]
@@ -44,6 +48,8 @@ pub enum CoreError {
     InvalidOpaqueId,
     #[error("relative work-directory path is invalid")]
     InvalidWorkPath,
+    #[error("the installation-adjacent project storage is unavailable")]
+    WorkRootUnavailable,
     #[error("derived output path is unsafe")]
     UnsafeDerivedPath,
     #[error("a representative asset with saved regions cannot be deselected")]

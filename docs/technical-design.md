@@ -118,10 +118,10 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 
 ## 8. 本地工作目录与持久化
 
-数据根目录是只读输入。每个项目有单独的可写工作目录，例如：
+数据根目录是只读输入。Windows 工作目录跟随安装位置所在磁盘，并放在安装目录旁的独立文件夹中；例如程序安装在 `D:\Apps\GWP Annotator\` 时：
 
 ```text
-%LOCALAPPDATA%/GastricWhitePlaqueAnnotator/projects/PROJECT-01/
+D:/Apps/GWP Annotator Data/PROJECT-LOCAL/
   annotations.sqlite3
   captures/
     CASE-7Q2M8D4K/
@@ -160,51 +160,55 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 
 ## 9. 标签模板格式
 
-### 9.1 正式 JSON 模板
+### 9.1 正式 TOML 模板
 
-正式格式为 `label-template.v1.json`。医学负责人填入实际选项；以下 `选项A` 等仅是结构占位，不能作为默认医学词表发布。
+医生维护的正式格式为 `label-template-v1.toml`。医学负责人填入实际字段和选项；以下名称均为中性结构占位，不能作为默认医学词表发布。
 
-```json
-{
-  "format": "gwa-label-template",
-  "version": 1,
-  "template_id": "gastric-white-plaque-v1",
-  "fields": [
-    {
-      "id": "white_plaque_shape",
-      "label": "白斑形状",
-      "control": "single_select",
-      "required": true,
-      "options": [
-        { "id": "option_a", "label": "选项A（由医学负责人替换）" },
-        { "id": "option_b", "label": "选项B（由医学负责人替换）" }
-      ]
-    },
-    {
-      "id": "confidence",
-      "label": "置信度",
-      "control": "dropdown",
-      "required": true,
-      "options": [
-        { "id": "option_a", "label": "选项A（由医学负责人替换）" },
-        { "id": "option_b", "label": "选项B（由医学负责人替换）" }
-      ]
-    }
-  ]
-}
+```toml
+format = "gwa-label-template"
+version = 1
+template_id = "template-local"
+
+[[fields]]
+id = "field_alpha"
+label = "字段 A"
+control = "single_select"
+required = true
+
+[[fields.options]]
+id = "option_a"
+label = "选项 A"
+
+[[fields.options]]
+id = "option_b"
+label = "选项 B"
+
+[[fields]]
+id = "field_beta"
+label = "字段 B"
+control = "dropdown"
+required = true
+
+[[fields.options]]
+id = "option_a"
+label = "选项 A"
+
+[[fields.options]]
+id = "option_b"
+label = "选项 B"
 ```
 
-允许字段的 `control` 取值只有 `dropdown`、`single_select`、`multi_select`。`id` 和每个 `options[].id` 在各自作用域必须唯一且稳定；`required: true` 的字段必须至少有一个选项。模板变更产生新 `version`，旧标注仍由其存储的模板快照解释。
+允许字段的 `control` 取值只有 `dropdown`、`single_select`、`multi_select`。`id` 和每个选项 `id` 在各自作用域必须唯一且稳定；`required = true` 的字段必须至少有一个选项。模板变更应产生新 `version`，旧标注仍由 SQLite 中存储的规范化 JSON 快照解释；该 JSON 是内部表示，不是医生日常维护格式。
 
 ### 9.2 简化 `label.txt` 导入
 
 ```text
 # 仅为格式示例；没有内置医学选项
-*白斑形状=选项A|选项B
-*置信度=选项A|选项B
+*字段 A=选项 A|选项 B
+字段 B=选项 A|选项 B
 ```
 
-规则：空行和 `#` 注释忽略；行首 `*` 表示必填；等号左侧是显示名；竖线分隔选项。导入器为每个字段和选项生成稳定 ID，控件默认 `dropdown`，并要求用户预览、补全模板 ID 与版本后保存。需要单选/多选或显式 ID 时，使用 JSON 格式。
+规则：空行和 `#` 注释忽略；行首 `*` 表示必填；等号左侧是显示名；竖线分隔选项。导入器为每个字段和选项生成稳定 ID，控件默认 `dropdown`。TXT 仅用于首次兼容导入；需要单选、多选、显式 ID 或后续模板更换时使用 TOML。
 
 ## 10. 标注与训练导出格式
 
@@ -219,18 +223,18 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
   "project_id": "PROJECT-01",
   "templates": [
     {
-      "template_id": "gastric-white-plaque-v1",
+      "template_id": "template-local",
       "version": 1,
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "fields": [
         {
-          "id": "white_plaque_shape",
+          "id": "field_alpha",
           "control": "single_select",
           "required": true,
           "options": ["option_a", "option_b"]
         },
         {
-          "id": "confidence",
+          "id": "field_beta",
           "control": "dropdown",
           "required": true,
           "options": ["option_a", "option_b"]
@@ -249,12 +253,12 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
       "regions": [
         {
           "region_id": "REGION-01",
-          "template_id": "gastric-white-plaque-v1",
+          "template_id": "template-local",
           "template_version": 1,
           "polygon_norm": [[0.121, 0.220], [0.181, 0.241], [0.164, 0.301]],
           "labels": {
-            "white_plaque_shape": "option_a",
-            "confidence": "option_b"
+            "field_alpha": "option_a",
+            "field_beta": "option_b"
           }
         }
       ]
@@ -263,7 +267,7 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 }
 ```
 
-`templates` 包含所有被导出区域引用的模板版本、校验和与字段/选项 ID 快照；每个区域明确引用其保存时的模板版本。为避免把显示文本同错误的历史版本关联，生产导出还应在模板快照中保留完整的正式 JSON 模板；上例仅缩写了显示文字以突出数据关系。`polygon_norm` 的点顺序为圈选顺序，坐标必须在 `[0, 1]` 内。`labels` 的键和值分别是模板字段 ID 和选项 ID；多选值为数组。缺少、越界或与模板不匹配的值必须导致导入/导出校验失败。
+`templates` 包含所有被导出区域引用的模板版本、校验和与字段/选项 ID 快照；每个区域明确引用其保存时的模板版本。为避免把显示文本同错误的历史版本关联，生产导出还应保留从正式 TOML 生成的完整规范化模板快照；上例仅缩写显示文字以突出数据关系。`polygon_norm` 的点顺序为圈选顺序，坐标必须在 `[0, 1]` 内。`labels` 的键和值分别是模板字段 ID 和选项 ID；多选值为数组。缺少、越界或与模板不匹配的值必须导致导入/导出校验失败。
 
 ### 10.2 训练导出
 

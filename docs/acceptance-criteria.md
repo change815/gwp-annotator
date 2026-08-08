@@ -38,7 +38,7 @@ UI 自动化应使用合成夹具根目录，并把网络出口拦截为失败�
 | AC-09 | 图片显示坐标 | 在 100%、放大、平移及高 DPI 下，同一归一化多边形覆盖同一源图位置，导出像素坐标在误差 1 像素内。 | 渲染截图比较和 `normalized_geometry_roundtrip`。 |
 | AC-10 | 自动闭合自由圈选 | 左键起点后移动记录轨迹；满足至少 3 点、有效面积且回到定义阈值内时自动闭合并弹出标签窗口。 | Pointer Events E2E `lasso_auto_close`。 |
 | AC-11 | 无效轨迹 | 面积过小、点数不足或无法修复的自相交轨迹不得写入数据库，界面要求重画。 | `reject_invalid_polygon` 单元/集成测试。 |
-| AC-12 | 模板控件 | JSON 模板分别驱动下拉、单选、多选及必填校验；必填项未完成时 `OK` 不可用。 | `label_template_controls` E2E。 |
+| AC-12 | 模板控件 | TOML 模板分别驱动下拉、单选、多选及必填校验；必填项未完成时 `OK` 不可用。 | `label_template_controls` E2E。 |
 | AC-13 | 简化模板导入 | `label.txt` 的注释、必填星号和竖线选项可正确导入为下拉字段；重复字段/选项和空必填选项被拒绝。 | `label_txt_import_validation` 单元测试。 |
 | AC-14 | 标签医学边界 | 安装包和默认模板不含推测出的“白斑形状”或“置信度”医学选项；仅使用由医学负责人提供的模板选项。 | 源码/资源审查和 `no_builtin_medical_vocabulary` 测试。 |
 | AC-15 | `OK` 立即保存 | 一次有效 `OK` 在单一 SQLite 事务内生成区域和标签，界面只在提交成功后提示已保存。 | 故障注入测试 `save_is_atomic`。 |
@@ -55,11 +55,11 @@ UI 自动化应使用合成夹具根目录，并把网络出口拦截为失败�
 | AC-21 | 脱敏 ID | 同一合成病例跨重启扫描得到相同 `CASE-...`；变更原始媒体名、大小或修改时间会产生新 `ASSET-...` 并提示重新确认。 | `opaque_id_stability` 测试。 |
 | AC-22 | 不持久化姓名/路径 | SQLite、GWA-JSON、COCO、CSV、缩略图文件名、恢复文件和日志均不含合成的原始病例名、原始路径或路径分隔符字段。 | `privacy_leak_scan` 对所有产物执行字符串和 JSON 模式检查。 |
 | AC-23 | 本机显示边界 | 原始病例目录显示名只在本机侧栏会话中可见；重新扫描后由源目录重建，SQLite 不保存该字段。 | 内存/数据库模式审查与 E2E。 |
-| AC-24 | 截帧与缓存位置 | 截帧、缩略图、恢复文件、SQLite 和导出都在项目工作目录；源数据根目录中没有新增文件。 | `derived_files_outside_source_root` 集成测试。 |
+| AC-24 | 截帧与缓存位置 | 截帧、缩略图、恢复文件、SQLite 和导出都在项目工作目录；源数据根目录中没有新增文件。Windows 安装在 D 盘时，工作目录位于安装目录旁的 `GWP Annotator Data` 且同样在 D 盘。 | `derived_files_outside_source_root`、工作目录计算单测及 Windows 合成安装复测。 |
 | AC-25 | 崩溃恢复已保存数据 | 在 `OK` 提交后强制终止进程，重启后区域和标签仍存在且完整。 | `crash_after_commit_recovery` 故障注入测试。 |
 | AC-26 | 草稿不误提交 | 在标签窗口中、未点 `OK` 时强制终止进程；重启可恢复草稿视图，但数据库和导出均无该区域，需再次确认才保存。 | `draft_requires_reconfirmation` E2E。 |
 | AC-27 | 备份失败可见 | 模拟备份目标不可写时，已提交标注仍可读取，界面显示备份失败，不删除数据库或源媒体。 | `backup_failure_is_non_destructive` 测试。 |
-| AC-28 | 模板版本可解释 | 历史标注保存模板 ID、版本、校验和与快照；模板显示文本更新后，历史导出仍可按旧快照解释。 | `template_snapshot_roundtrip` 测试。 |
+| AC-28 | 模板版本可解释 | 当前 TOML 可在确认后更换；历史标注保存模板 ID、版本、校验和与快照，仍可按旧模板修改和解释。同一已使用 ID/version 的不同内容必须拒绝。 | `template_snapshot_roundtrip` 与 `controlled_template_replacement_preserves_historical_regions_and_snapshots` 测试。 |
 
 ## 5. 导出验收
 

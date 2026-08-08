@@ -121,6 +121,16 @@ pub fn install_fixed_toml_template(
         .map_err(Into::into)
 }
 
+pub fn replace_fixed_toml_template(
+    template_toml: String,
+    state: State<'_, AppState>,
+) -> Result<TemplateDescriptor, CommandError> {
+    state
+        .service
+        .replace_fixed_toml_template(&template_toml)
+        .map_err(Into::into)
+}
+
 pub fn install_fixed_label_txt(
     text: String,
     state: State<'_, AppState>,
@@ -267,11 +277,14 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::FixedTemplateMissing => "FIXED_TEMPLATE_MISSING",
         CoreError::FixedTemplateChecksumMismatch => "FIXED_TEMPLATE_CHECKSUM_MISMATCH",
         CoreError::FixedTemplateAlreadyInstalled => "FIXED_TEMPLATE_ALREADY_INSTALLED",
+        CoreError::TemplateReplacementIdentityConflict => "TEMPLATE_REPLACEMENT_IDENTITY_CONFLICT",
+        CoreError::TemplateNotActive => "TEMPLATE_NOT_ACTIVE",
         CoreError::InvalidLabels => "INVALID_LABELS",
         CoreError::InvalidPolygon => "INVALID_POLYGON",
         CoreError::TemplateSnapshotConflict => "TEMPLATE_SNAPSHOT_CONFLICT",
         CoreError::InvalidOpaqueId => "INVALID_OPAQUE_ID",
         CoreError::InvalidWorkPath => "INVALID_WORK_PATH",
+        CoreError::WorkRootUnavailable => "WORK_ROOT_UNAVAILABLE",
         CoreError::UnsafeDerivedPath => "UNSAFE_DERIVED_PATH",
         CoreError::RepresentativeHasRegions => "REPRESENTATIVE_HAS_REGIONS",
         CoreError::RegionNotFound => "REGION_NOT_FOUND",

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use data_encoding::HEXLOWER;
 use filetime::FileTime;
 use gwp_annotator_core::core::error::CoreError;
 use gwp_annotator_core::core::scan::{MediaKind, PublicAsset, PublicCase, PublicScan};
@@ -234,10 +235,10 @@ fn region_request(asset_id: String) -> SaveRegionRequest {
 }
 
 fn load_generic_template(service: &ProjectService) {
-    let template_json = serde_json::to_string(&generic_template()).expect("template JSON");
+    let template_toml = toml::to_string_pretty(&generic_template()).expect("template TOML");
     service
-        .import_json_template(&template_json)
-        .expect("load template");
+        .install_fixed_toml_template(&template_toml)
+        .expect("install template");
 }
 
 #[test]
@@ -1134,6 +1135,10 @@ fn source_and_work_roots_reject_same_and_nested_paths_before_scan() {
         child_service.scan_selected_root(&source_parent),
         Err(CoreError::SourceWorkOverlap)
     ));
+    assert!(
+        !child_work_root.exists(),
+        "overlap rejection must not create the selected source root's child work directory"
+    );
     assert_eq!(source_tree_snapshot(&source_parent), child_before);
 
     let work_parent = temporary.path().join("WORK-PARENT");
@@ -1146,6 +1151,118 @@ fn source_and_work_roots_reject_same_and_nested_paths_before_scan() {
         Err(CoreError::SourceWorkOverlap)
     ));
     assert_eq!(source_tree_snapshot(&work_parent), parent_before);
+}
+
+#[test]
+fn startup_session_read_does_not_create_missing_installation_storage() {
+    let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+    let storage_parent = temporary.path().join("GWP Annotator Data");
+    let work_root = storage_parent.join("PROJECT-LOCAL");
+    let service = service_with_work_root(&work_root);
+
+    assert_eq!(
+        service
+            .restore_project_session()
+            .expect("missing synthetic session"),
+        gwp_annotator_core::core::service::StartupRestore {
+            status: gwp_annotator_core::core::service::RestoreStatus::NoSession,
+            scan: None,
+            template: None,
+            current_case_id: None,
+            current_asset_id: None,
+        }
+    );
+    service
+        .forget_last_position()
+        .expect("forget must be a no-op when no session storage exists");
+    assert!(
+        !storage_parent.exists(),
+        "startup session pre-read and forget must not create installation-adjacent storage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reparse_work_root_components_are_rejected_before_session_access() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+
+    let outside_storage = temporary.path().join("OUTSIDE-STORAGE");
+    let outside_parent_target = outside_storage.join("PROJECT-LOCAL");
+    let outside_parent_session = outside_parent_target.join("session/project-session.json");
+    fs::create_dir_all(
+        outside_parent_session
+            .parent()
+            .expect("outside session parent"),
+    )
+    .expect("create outside parent fixture");
+    let parent_sentinel = b"outside-parent-session-must-not-be-read-or-written";
+    fs::write(&outside_parent_session, parent_sentinel).expect("write outside parent sentinel");
+
+    let installation_parent = temporary.path().join("INSTALL-PARENT-LINK");
+    fs::create_dir_all(&installation_parent).expect("create synthetic installation parent");
+    symlink(
+        &outside_storage,
+        installation_parent.join("GWP Annotator Data"),
+    )
+    .expect("create synthetic storage-parent link");
+    let parent_link_work_root = installation_parent
+        .join("GWP Annotator Data")
+        .join("PROJECT-LOCAL");
+    let parent_link_service = service_with_work_root(&parent_link_work_root);
+
+    assert!(matches!(
+        parent_link_service.restore_project_session(),
+        Err(CoreError::UnsafeDerivedPath)
+    ));
+    assert!(matches!(
+        parent_link_service.forget_last_position(),
+        Err(CoreError::UnsafeDerivedPath)
+    ));
+    assert_eq!(
+        fs::read(&outside_parent_session).expect("read unchanged parent sentinel"),
+        parent_sentinel
+    );
+    assert!(
+        !outside_parent_target.join("annotations.sqlite3").exists(),
+        "pre-read and forget must not create a database through the storage-parent link"
+    );
+
+    let root_link_parent = temporary
+        .path()
+        .join("INSTALL-ROOT-LINK/GWP Annotator Data");
+    fs::create_dir_all(&root_link_parent).expect("create synthetic root-link parent");
+    let outside_root_target = temporary.path().join("OUTSIDE-WORK-ROOT");
+    let outside_root_session = outside_root_target.join("session/project-session.json");
+    fs::create_dir_all(
+        outside_root_session
+            .parent()
+            .expect("outside root session parent"),
+    )
+    .expect("create outside root fixture");
+    let root_sentinel = b"outside-root-session-must-not-be-read-or-written";
+    fs::write(&outside_root_session, root_sentinel).expect("write outside root sentinel");
+    symlink(&outside_root_target, root_link_parent.join("PROJECT-LOCAL"))
+        .expect("create synthetic work-root link");
+    let root_link_service = service_with_work_root(&root_link_parent.join("PROJECT-LOCAL"));
+
+    assert!(matches!(
+        root_link_service.restore_project_session(),
+        Err(CoreError::UnsafeDerivedPath)
+    ));
+    assert!(matches!(
+        root_link_service.forget_last_position(),
+        Err(CoreError::UnsafeDerivedPath)
+    ));
+    assert_eq!(
+        fs::read(&outside_root_session).expect("read unchanged root sentinel"),
+        root_sentinel
+    );
+    assert!(
+        !outside_root_target.join("annotations.sqlite3").exists(),
+        "pre-read and forget must not create a database through the work-root link"
+    );
 }
 
 #[cfg(unix)]
@@ -1162,7 +1279,7 @@ fn resolved_symlink_overlap_is_rejected_before_scan_and_write() {
     let unsafe_service = service_with_work_root(&unsafe_work_alias);
     assert!(matches!(
         unsafe_service.scan_selected_root(&unsafe_source),
-        Err(CoreError::SourceWorkOverlap)
+        Err(CoreError::UnsafeDerivedPath)
     ));
     assert_eq!(source_tree_snapshot(&unsafe_source), unsafe_before);
 
@@ -1238,21 +1355,24 @@ fn fixed_toml_template_validates_labels_and_reloads_with_the_saved_session() {
         service
             .save_last_position(&case.case_id, &asset.asset_id)
             .expect("save current position");
-        assert_eq!(
-            fs::read_to_string(
+        let active_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(
                 fixture
                     .work_root
                     .join("templates")
-                    .join("label-template-v1.toml"),
+                    .join("active-template.manifest.json"),
             )
-            .expect("fixed TOML copy"),
+            .expect("active template manifest"),
+        )
+        .expect("parse active template manifest");
+        let active_template_path = active_manifest["template_path"]
+            .as_str()
+            .expect("active template path");
+        assert_eq!(
+            fs::read_to_string(fixture.work_root.join(active_template_path))
+                .expect("immutable fixed TOML copy"),
             V02_TOML_TEMPLATE
         );
-        assert!(fixture
-            .work_root
-            .join("templates")
-            .join("label-template-v1.manifest.json")
-            .is_file());
         assert!(matches!(
             service.install_fixed_toml_template(
                 &V02_TOML_TEMPLATE.replace("template-v02", "template-other",)
@@ -1280,6 +1400,501 @@ fn fixed_toml_template_validates_labels_and_reloads_with_the_saved_session() {
         "template-v02"
     );
     assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[test]
+fn controlled_template_replacement_preserves_historical_regions_and_snapshots() {
+    let fixture = fixture(1);
+    let (case, asset) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan fixture");
+        let (case, asset) = first_image(&scan);
+        let v1 = service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install V1");
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select representative");
+        service
+            .save_confirmed_region(v02_region_request(
+                "REGION-TEMPLATEVA",
+                asset.asset_id.clone(),
+                v02_labels("dropdown_a"),
+            ))
+            .expect("save V1 region");
+        service
+            .save_last_position(&case.case_id, &asset.asset_id)
+            .expect("persist current position before replacement");
+        let session_before_replacement: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .work_root
+                    .join("session")
+                    .join("project-session.json"),
+            )
+            .expect("session before replacement"),
+        )
+        .expect("parse session before replacement");
+
+        let conflicting_v1 = V02_TOML_TEMPLATE.replace("Dropdown A", "Changed Dropdown A");
+        assert!(matches!(
+            service.replace_fixed_toml_template(&conflicting_v1),
+            Err(CoreError::TemplateReplacementIdentityConflict)
+        ));
+        assert_eq!(
+            service
+                .current_fixed_template()
+                .expect("current template after rejected replacement")
+                .expect("active V1"),
+            v1
+        );
+
+        let v2_toml = V02_TOML_TEMPLATE
+            .replace("version = 1", "version = 2")
+            .replace("dropdown_a", "dropdown_c")
+            .replace("Dropdown A", "Dropdown C")
+            .replace("dropdown_b", "dropdown_d")
+            .replace("Dropdown B", "Dropdown D");
+        let v2 = service
+            .replace_fixed_toml_template(&v2_toml)
+            .expect("replace active template with V2");
+        assert_eq!(v2.template_id, "template-v02");
+        assert_eq!(v2.version, 2);
+        assert_eq!(
+            service
+                .current_fixed_template()
+                .expect("current V2")
+                .expect("active template"),
+            v2
+        );
+        let session_after_replacement: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .work_root
+                    .join("session")
+                    .join("project-session.json"),
+            )
+            .expect("session after replacement"),
+        )
+        .expect("parse session after replacement");
+        assert_eq!(
+            session_after_replacement["current_case_id"],
+            session_before_replacement["current_case_id"]
+        );
+        assert_eq!(
+            session_after_replacement["current_asset_id"],
+            session_before_replacement["current_asset_id"]
+        );
+        assert!(session_after_replacement["pending_template_content_sha256"].is_null());
+        assert!(matches!(
+            service.save_confirmed_region(v02_region_request(
+                "REGION-STALEVONE",
+                asset.asset_id.clone(),
+                v02_labels("dropdown_a"),
+            )),
+            Err(CoreError::TemplateNotActive)
+        ));
+
+        let mut v2_region = v02_region_request(
+            "REGION-TEMPLATEVB",
+            asset.asset_id.clone(),
+            v02_labels("dropdown_c"),
+        );
+        v2_region.template_version = 2;
+        service
+            .save_confirmed_region(v2_region)
+            .expect("save V2 region");
+
+        let saved = service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("saved regions");
+        let old_region = saved
+            .iter()
+            .find(|region| region.region_id == "REGION-TEMPLATEVA")
+            .expect("V1 region");
+        assert_eq!(old_region.template_version, 1);
+        assert_eq!(old_region.labels, v02_labels("dropdown_a"));
+        assert!(old_region
+            .template
+            .validate_label_values(&old_region.labels)
+            .is_ok());
+        assert!(old_region
+            .template
+            .validate_label_values(&v02_labels("dropdown_c"))
+            .is_err());
+        assert_eq!(
+            service
+                .template_snapshot_json("template-v02", 1)
+                .expect("V1 snapshot")
+                .expect("V1 snapshot present"),
+            serde_json::to_string(&v1.template).expect("canonical V1 snapshot")
+        );
+
+        let backup = service
+            .complete_case_and_backup(&case.case_id)
+            .expect("backup current template and database");
+        let backup_case_root = fixture.work_root.join("backups").join(&case.case_id);
+        let backup_directory = fs::read_dir(&backup_case_root)
+            .expect("backup case directory")
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                (entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("backup-{}-", backup.completed_at)))
+                .then_some(entry.file_name())
+            })
+            .expect("completed backup directory");
+        let backup_root = backup_case_root.join(backup_directory);
+        assert_eq!(
+            fs::read_to_string(backup_root.join("label-template-v1.toml"))
+                .expect("backup current template"),
+            v2_toml
+        );
+        let backup_connection = Connection::open(backup_root.join("annotations.sqlite3"))
+            .expect("open backup database");
+        assert_eq!(
+            backup_connection
+                .query_row("SELECT COUNT(*) FROM templates", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("backup template count"),
+            2
+        );
+        let backup_foreign_key_error: Option<String> = backup_connection
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()
+            .expect("foreign key check");
+        assert!(backup_foreign_key_error.is_none());
+
+        let mut pending_session = session_after_replacement;
+        pending_session["template_content_sha256"] =
+            session_before_replacement["template_content_sha256"].clone();
+        let active_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .work_root
+                    .join("templates")
+                    .join("active-template.manifest.json"),
+            )
+            .expect("active manifest"),
+        )
+        .expect("parse active manifest");
+        // The pending value contains the active content hash, not the template snapshot hash.
+        pending_session["pending_template_content_sha256"] =
+            active_manifest["content_sha256"].clone();
+        fs::write(
+            fixture
+                .work_root
+                .join("session")
+                .join("project-session.json"),
+            serde_json::to_vec(&pending_session).expect("serialize pending session"),
+        )
+        .expect("simulate interrupted session finalization");
+        (case, asset)
+    };
+
+    let reopened = service(&fixture);
+    let restored = reopened
+        .restore_project_session()
+        .expect("restore with V2 active");
+    assert_eq!(
+        restored.current_case_id.as_deref(),
+        Some(case.case_id.as_str())
+    );
+    assert_eq!(
+        restored.current_asset_id.as_deref(),
+        Some(asset.asset_id.as_str())
+    );
+    let repaired_session: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .work_root
+                .join("session")
+                .join("project-session.json"),
+        )
+        .expect("repaired session"),
+    )
+    .expect("parse repaired session");
+    assert!(repaired_session["pending_template_content_sha256"].is_null());
+    reopened
+        .update_region_labels(UpdateRegionLabelsRequest {
+            case_id: case.case_id.clone(),
+            asset_id: asset.asset_id.clone(),
+            region_id: "REGION-TEMPLATEVA".to_owned(),
+            template_id: "template-v02".to_owned(),
+            template_version: 1,
+            labels: v02_labels("dropdown_b"),
+        })
+        .expect("edit V1 region after restart using historical snapshot");
+    assert!(matches!(
+        reopened.update_region_labels(UpdateRegionLabelsRequest {
+            case_id: case.case_id.clone(),
+            asset_id: asset.asset_id.clone(),
+            region_id: "REGION-TEMPLATEVA".to_owned(),
+            template_id: "template-v02".to_owned(),
+            template_version: 2,
+            labels: v02_labels("dropdown_c"),
+        }),
+        Err(CoreError::TemplateSnapshotConflict)
+    ));
+    assert!(matches!(
+        reopened.update_region_labels(UpdateRegionLabelsRequest {
+            case_id: case.case_id,
+            asset_id: asset.asset_id,
+            region_id: "REGION-TEMPLATEVA".to_owned(),
+            template_id: "template-v02".to_owned(),
+            template_version: 1,
+            labels: v02_labels("dropdown_c"),
+        }),
+        Err(CoreError::InvalidLabels)
+    ));
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open project database");
+    let foreign_key_error: Option<String> = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()
+        .expect("foreign key check");
+    assert!(foreign_key_error.is_none());
+}
+
+#[test]
+fn concurrent_template_replacements_leave_the_active_manifest_and_session_consistent() {
+    let fixture = fixture(1);
+    let project_service = Arc::new(service(&fixture));
+    project_service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    project_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("install V1");
+
+    let v2_toml = V02_TOML_TEMPLATE
+        .replace("version = 1", "version = 2")
+        .replace("dropdown_a", "dropdown_c")
+        .replace("Dropdown A", "Dropdown C")
+        .replace("dropdown_b", "dropdown_d")
+        .replace("Dropdown B", "Dropdown D");
+    let v3_toml = V02_TOML_TEMPLATE
+        .replace("version = 1", "version = 3")
+        .replace("dropdown_a", "dropdown_e")
+        .replace("Dropdown A", "Dropdown E")
+        .replace("dropdown_b", "dropdown_f")
+        .replace("Dropdown B", "Dropdown F");
+    let barrier = Arc::new(Barrier::new(3));
+
+    let first_service = Arc::clone(&project_service);
+    let first_barrier = Arc::clone(&barrier);
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_service.replace_fixed_toml_template(&v2_toml)
+    });
+    let second_service = Arc::clone(&project_service);
+    let second_barrier = Arc::clone(&barrier);
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_service.replace_fixed_toml_template(&v3_toml)
+    });
+    barrier.wait();
+
+    let first = first.join().expect("first replacement thread");
+    let second = second.join().expect("second replacement thread");
+    assert!(first.is_ok(), "first replacement: {first:?}");
+    assert!(second.is_ok(), "second replacement: {second:?}");
+
+    let active = project_service
+        .current_fixed_template()
+        .expect("load active template")
+        .expect("active template");
+    assert!(matches!(active.version, 2 | 3));
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .work_root
+                .join("templates")
+                .join("active-template.manifest.json"),
+        )
+        .expect("active manifest"),
+    )
+    .expect("parse active manifest");
+    let session: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .work_root
+                .join("session")
+                .join("project-session.json"),
+        )
+        .expect("project session"),
+    )
+    .expect("parse project session");
+    assert_eq!(
+        session["template_content_sha256"],
+        manifest["content_sha256"]
+    );
+    assert!(session["pending_template_content_sha256"].is_null());
+}
+
+#[test]
+fn active_template_marker_allows_session_bound_explicit_recovery() {
+    let fixture = fixture(1);
+    let project_service = service(&fixture);
+    project_service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    project_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("install active template");
+
+    let templates = fixture.work_root.join("templates");
+    let active_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(templates.join("active-template.manifest.json")).expect("read active manifest"),
+    )
+    .expect("parse active manifest");
+    assert!(templates
+        .join("active-template-storage-v1.marker")
+        .is_file());
+    fs::remove_file(templates.join("active-template.manifest.json"))
+        .expect("remove active manifest");
+
+    let session_path = fixture
+        .work_root
+        .join("session")
+        .join("project-session.json");
+    let mut pending_session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_path).expect("read project session"))
+            .expect("parse project session");
+    pending_session["template_content_sha256"] = serde_json::Value::Null;
+    pending_session["pending_template_content_sha256"] = active_manifest["content_sha256"].clone();
+    fs::write(
+        &session_path,
+        serde_json::to_vec(&pending_session).expect("serialize pending session"),
+    )
+    .expect("simulate interruption before active manifest write");
+
+    assert_eq!(
+        service(&fixture)
+            .restore_project_session()
+            .expect("missing active manifest is reported")
+            .status,
+        RestoreStatus::FixedTemplateMissing
+    );
+
+    let recovery_service = service(&fixture);
+    recovery_service
+        .restore_project_session()
+        .expect("activate project for explicit recovery");
+    recovery_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("recover the session-bound TOML");
+    assert!(recovery_service
+        .current_fixed_template()
+        .expect("read explicitly recovered template")
+        .is_some());
+}
+
+#[test]
+fn active_template_marker_rejects_stale_legacy_recovery() {
+    let fixture = fixture(1);
+    let project_service = service(&fixture);
+    project_service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    project_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("install V1");
+    let v2_toml = V02_TOML_TEMPLATE.replace("version = 1", "version = 2");
+    project_service
+        .replace_fixed_toml_template(&v2_toml)
+        .expect("activate V2");
+
+    let templates = fixture.work_root.join("templates");
+    let v1_template = LabelTemplate::parse_toml(V02_TOML_TEMPLATE).expect("parse V1");
+    let v1_snapshot = v1_template.snapshot().expect("snapshot V1");
+    fs::write(templates.join("label-template-v1.toml"), V02_TOML_TEMPLATE)
+        .expect("write stale legacy template");
+    fs::write(
+        templates.join("label-template-v1.manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": "gwp-fixed-template",
+            "content_sha256": HEXLOWER.encode(Sha256::digest(V02_TOML_TEMPLATE.as_bytes()).as_slice()),
+            "template_sha256": v1_snapshot.sha256,
+        }))
+        .expect("serialize stale legacy manifest"),
+    )
+    .expect("write stale legacy manifest");
+    fs::remove_file(templates.join("active-template.manifest.json"))
+        .expect("remove V2 active manifest");
+
+    let recovery_service = service(&fixture);
+    recovery_service
+        .restore_project_session()
+        .expect("activate project for recovery");
+    assert!(matches!(
+        recovery_service.install_fixed_toml_template(V02_TOML_TEMPLATE),
+        Err(CoreError::FixedTemplateChecksumMismatch)
+    ));
+    recovery_service
+        .install_fixed_toml_template(&v2_toml)
+        .expect("recover session-bound V2");
+    assert_eq!(
+        recovery_service
+            .current_fixed_template()
+            .expect("read recovered V2")
+            .expect("V2 active")
+            .version,
+        2
+    );
+}
+
+#[test]
+fn legacy_template_can_be_migrated_to_an_active_manifest() {
+    let fixture = fixture(1);
+    let templates = fixture.work_root.join("templates");
+    fs::create_dir_all(&templates).expect("create legacy template directory");
+    let legacy_template = LabelTemplate::parse_toml(V02_TOML_TEMPLATE).expect("legacy template");
+    let legacy_snapshot = legacy_template.snapshot().expect("legacy snapshot");
+    let legacy_content_sha256 =
+        HEXLOWER.encode(Sha256::digest(V02_TOML_TEMPLATE.as_bytes()).as_slice());
+    fs::write(templates.join("label-template-v1.toml"), V02_TOML_TEMPLATE)
+        .expect("write legacy TOML");
+    fs::write(
+        templates.join("label-template-v1.manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": "gwp-fixed-template",
+            "content_sha256": legacy_content_sha256,
+            "template_sha256": legacy_snapshot.sha256,
+        }))
+        .expect("serialize legacy manifest"),
+    )
+    .expect("write legacy manifest");
+
+    let project_service = service(&fixture);
+    project_service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan legacy project");
+    assert_eq!(
+        project_service
+            .current_fixed_template()
+            .expect("read legacy template")
+            .expect("legacy template exists")
+            .version,
+        1
+    );
+    let v2_toml = V02_TOML_TEMPLATE
+        .replace("version = 1", "version = 2")
+        .replace("dropdown_a", "dropdown_c")
+        .replace("Dropdown A", "Dropdown C")
+        .replace("dropdown_b", "dropdown_d")
+        .replace("Dropdown B", "Dropdown D");
+    project_service
+        .replace_fixed_toml_template(&v2_toml)
+        .expect("migrate legacy project to active manifest");
+    assert!(templates
+        .join("active-template-storage-v1.marker")
+        .is_file());
+    assert!(templates.join("active-template.manifest.json").is_file());
 }
 
 #[test]
@@ -1353,20 +1968,36 @@ fn project_session_handles_forget_missing_media_missing_template_and_missing_roo
         RestoreStatus::LastMediaUnavailable
     );
 
-    fs::remove_file(
-        fixture
-            .work_root
-            .join("templates")
-            .join("label-template-v1.toml"),
+    let active_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .work_root
+                .join("templates")
+                .join("active-template.manifest.json"),
+        )
+        .expect("read active template manifest"),
     )
-    .expect("remove fixed TOML copy");
+    .expect("parse active template manifest");
+    let active_template_path = active_manifest["template_path"]
+        .as_str()
+        .expect("active template path");
+    fs::remove_file(fixture.work_root.join(active_template_path))
+        .expect("remove active template archive");
+    let missing_template_service = service(&fixture);
     assert_eq!(
-        service(&fixture)
+        missing_template_service
             .restore_project_session()
             .expect("restore with missing fixed template")
             .status,
         RestoreStatus::FixedTemplateMissing
     );
+    missing_template_service
+        .install_fixed_toml_template(V02_TOML_TEMPLATE)
+        .expect("restore the missing active template pointer from identical TOML");
+    assert!(missing_template_service
+        .current_fixed_template()
+        .expect("read restored fixed template")
+        .is_some());
 
     fs::remove_dir_all(&fixture.source_root).expect("remove synthetic root");
     assert_eq!(
