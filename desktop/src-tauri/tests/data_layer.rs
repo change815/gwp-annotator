@@ -7,11 +7,12 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use data_encoding::HEXLOWER;
 use filetime::FileTime;
+use gwp_annotator_core::core::commands::CommandError;
 use gwp_annotator_core::core::error::CoreError;
 use gwp_annotator_core::core::scan::{MediaKind, PublicAsset, PublicCase, PublicScan};
 use gwp_annotator_core::core::service::{
-    CaptureFrameRequest, ReplaceRegionRequest, RestoreStatus, SaveRegionRequest,
-    UpdateRegionLabelsRequest,
+    CaptureFrameRequest, RefineRegionGeometryRequest, ReplaceRegionRequest, RestoreStatus,
+    SaveRegionRequest, UpdateRegionLabelsRequest,
 };
 use gwp_annotator_core::core::store::{PointNorm, RecoveryState, SaveFault};
 use gwp_annotator_core::core::template::{
@@ -26,6 +27,18 @@ struct Fixture {
     source_root: PathBuf,
     work_root: PathBuf,
 }
+
+type RegionOperationRecord = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn fixture(images_per_case: usize) -> Fixture {
     fixture_with_campus_names(images_per_case, "CAMPUS-ALPHA", "CAMPUS-BETA")
@@ -243,6 +256,31 @@ fn region_request(asset_id: String) -> SaveRegionRequest {
             "field_alpha".to_owned(),
             LabelValue::Single("option_alpha".to_owned()),
         )]),
+    }
+}
+
+fn refined_polygon() -> Vec<PointNorm> {
+    vec![
+        PointNorm { x: 0.12, y: 0.14 },
+        PointNorm { x: 0.76, y: 0.16 },
+        PointNorm { x: 0.68, y: 0.72 },
+        PointNorm { x: 0.3, y: 0.82 },
+    ]
+}
+
+fn refine_region_request(
+    case_id: String,
+    asset_id: String,
+    region_id: impl Into<String>,
+    expected_polygon_norm: Vec<PointNorm>,
+    polygon_norm: Vec<PointNorm>,
+) -> RefineRegionGeometryRequest {
+    RefineRegionGeometryRequest {
+        case_id,
+        asset_id,
+        region_id: region_id.into(),
+        expected_polygon_norm,
+        polygon_norm,
     }
 }
 
@@ -469,7 +507,7 @@ fn legacy_v1_database_migrates_without_limit_and_preserves_data_after_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("schema version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let cases_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cases'",
@@ -2469,6 +2507,510 @@ fn template_snapshot_roundtrip() {
         .expect("snapshot");
     let parsed = LabelTemplate::parse_json(&snapshot).expect("snapshot JSON");
     assert_eq!(parsed.fields[0].id, "field_alpha");
+}
+
+#[test]
+fn geometry_refinement_updates_only_polygon_and_records_full_audit() {
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    load_generic_template(&service);
+    service
+        .select_representative(&case.case_id, &asset.asset_id)
+        .expect("select representative");
+    service
+        .save_confirmed_region(region_request(asset.asset_id.clone()))
+        .expect("save region");
+
+    let before = service
+        .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+        .expect("saved region")
+        .into_iter()
+        .next()
+        .expect("active region");
+    let refined = refined_polygon();
+    service
+        .refine_region_geometry(refine_region_request(
+            case.case_id.clone(),
+            asset.asset_id.clone(),
+            before.region_id.clone(),
+            before.polygon_norm.clone(),
+            refined.clone(),
+        ))
+        .expect("refine region geometry");
+
+    let after = service
+        .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+        .expect("refined region")
+        .into_iter()
+        .next()
+        .expect("active refined region");
+    assert_eq!(after.region_id, before.region_id);
+    assert_eq!(after.asset_id, before.asset_id);
+    assert_eq!(after.template_id, before.template_id);
+    assert_eq!(after.template_version, before.template_version);
+    assert_eq!(after.template, before.template);
+    assert_eq!(after.labels, before.labels);
+    assert_eq!(after.polygon_norm, refined);
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open audit database");
+    let operation_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM region_operations WHERE operation_kind = 'geometry_refined'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("geometry refinement audit count");
+    assert_eq!(operation_count, 1);
+    let audit: (
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT related_region_id, before_polygon_norm_json, before_labels_json, after_polygon_norm_json, after_labels_json
+             FROM region_operations
+             WHERE operation_kind = 'geometry_refined'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("geometry refinement audit");
+    assert_eq!(audit.0, None);
+    assert_eq!(
+        serde_json::from_str::<Vec<PointNorm>>(&audit.1).expect("before polygon"),
+        before.polygon_norm
+    );
+    assert_eq!(
+        serde_json::from_str::<BTreeMap<String, LabelValue>>(
+            audit.2.as_deref().expect("before labels")
+        )
+        .expect("parse before labels"),
+        before.labels
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<PointNorm>>(audit.3.as_deref().expect("after polygon"))
+            .expect("parse after polygon"),
+        refined
+    );
+    assert_eq!(
+        serde_json::from_str::<BTreeMap<String, LabelValue>>(
+            audit.4.as_deref().expect("after labels")
+        )
+        .expect("parse after labels"),
+        before.labels
+    );
+}
+
+#[test]
+fn geometry_refinement_rejects_stale_and_invalid_polygons_without_audit_changes() {
+    let fixture = fixture(1);
+    let service = service(&fixture);
+    let scan = service
+        .scan_selected_root(&fixture.source_root)
+        .expect("scan fixture");
+    let (case, asset) = first_image(&scan);
+    load_generic_template(&service);
+    service
+        .select_representative(&case.case_id, &asset.asset_id)
+        .expect("select representative");
+    service
+        .save_confirmed_region(region_request(asset.asset_id.clone()))
+        .expect("save region");
+    let before = service
+        .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+        .expect("saved region")
+        .into_iter()
+        .next()
+        .expect("active region");
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open audit database");
+    let database_before: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+                 (SELECT polygon_norm_json FROM regions WHERE region_id = ?1),
+                 (SELECT updated_at FROM regions WHERE region_id = ?1),
+                 (SELECT COUNT(*) FROM region_operations)",
+            params![before.region_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database state before stale refinement");
+
+    let mut stale_polygon = before.polygon_norm.clone();
+    stale_polygon[0].x = 0.11;
+    assert!(matches!(
+        service.refine_region_geometry(refine_region_request(
+            case.case_id.clone(),
+            asset.asset_id.clone(),
+            before.region_id.clone(),
+            stale_polygon,
+            refined_polygon(),
+        )),
+        Err(CoreError::RegionGeometryConflict)
+    ));
+    assert_eq!(
+        CommandError::from(CoreError::RegionGeometryConflict).code,
+        "REGION_GEOMETRY_CONFLICT"
+    );
+    assert!(matches!(
+        service.refine_region_geometry(refine_region_request(
+            case.case_id.clone(),
+            asset.asset_id.clone(),
+            before.region_id.clone(),
+            before.polygon_norm.clone(),
+            vec![PointNorm { x: 0.2, y: 0.2 }, PointNorm { x: 0.3, y: 0.3 }],
+        )),
+        Err(CoreError::InvalidPolygon)
+    ));
+
+    let database_after: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+                 (SELECT polygon_norm_json FROM regions WHERE region_id = ?1),
+                 (SELECT updated_at FROM regions WHERE region_id = ?1),
+                 (SELECT COUNT(*) FROM region_operations)",
+            params![before.region_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database state after rejected refinements");
+    assert_eq!(database_after, database_before);
+}
+
+#[test]
+fn geometry_refinement_rejects_inactive_mismatched_and_unrepresented_regions() {
+    let inactive_fixture = fixture(1);
+    let inactive_service = service(&inactive_fixture);
+    let inactive_scan = inactive_service
+        .scan_selected_root(&inactive_fixture.source_root)
+        .expect("scan inactive fixture");
+    let (inactive_case, inactive_asset) = first_image(&inactive_scan);
+    load_generic_template(&inactive_service);
+    inactive_service
+        .select_representative(&inactive_case.case_id, &inactive_asset.asset_id)
+        .expect("select inactive fixture representative");
+    inactive_service
+        .save_confirmed_region(region_request(inactive_asset.asset_id.clone()))
+        .expect("save inactive fixture region");
+    let inactive_region = inactive_service
+        .saved_regions_for_asset(&inactive_case.case_id, &inactive_asset.asset_id)
+        .expect("saved inactive fixture region")
+        .into_iter()
+        .next()
+        .expect("active region before deletion");
+    inactive_service
+        .delete_region(
+            &inactive_case.case_id,
+            &inactive_asset.asset_id,
+            &inactive_region.region_id,
+        )
+        .expect("delete region before refinement");
+    assert!(matches!(
+        inactive_service.refine_region_geometry(refine_region_request(
+            inactive_case.case_id.clone(),
+            inactive_asset.asset_id.clone(),
+            inactive_region.region_id.clone(),
+            inactive_region.polygon_norm,
+            refined_polygon(),
+        )),
+        Err(CoreError::RegionNotActive)
+    ));
+
+    let mismatch_fixture = fixture(2);
+    let mismatch_service = service(&mismatch_fixture);
+    let mismatch_scan = mismatch_service
+        .scan_selected_root(&mismatch_fixture.source_root)
+        .expect("scan mismatch fixture");
+    let (mismatch_case, first_asset) = first_image(&mismatch_scan);
+    let second_asset = all_images(&mismatch_scan)
+        .into_iter()
+        .find_map(|(candidate_case, asset)| {
+            (candidate_case.case_id == mismatch_case.case_id
+                && asset.asset_id != first_asset.asset_id)
+                .then_some(asset)
+        })
+        .expect("second image in same case");
+    load_generic_template(&mismatch_service);
+    mismatch_service
+        .select_representative(&mismatch_case.case_id, &first_asset.asset_id)
+        .expect("select first representative");
+    mismatch_service
+        .select_representative(&mismatch_case.case_id, &second_asset.asset_id)
+        .expect("select second representative");
+    mismatch_service
+        .save_confirmed_region(region_request(first_asset.asset_id.clone()))
+        .expect("save mismatch fixture region");
+    let mismatch_region = mismatch_service
+        .saved_regions_for_asset(&mismatch_case.case_id, &first_asset.asset_id)
+        .expect("saved mismatch fixture region")
+        .into_iter()
+        .next()
+        .expect("mismatch region");
+    assert!(matches!(
+        mismatch_service.refine_region_geometry(refine_region_request(
+            mismatch_case.case_id,
+            second_asset.asset_id,
+            mismatch_region.region_id,
+            mismatch_region.polygon_norm,
+            refined_polygon(),
+        )),
+        Err(CoreError::UnknownSessionItem)
+    ));
+
+    let representative_fixture = fixture(1);
+    let (representative_case, representative_asset, representative_region) = {
+        let representative_service = service(&representative_fixture);
+        let representative_scan = representative_service
+            .scan_selected_root(&representative_fixture.source_root)
+            .expect("scan representative fixture");
+        let (case, asset) = first_image(&representative_scan);
+        load_generic_template(&representative_service);
+        representative_service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select representative");
+        representative_service
+            .save_confirmed_region(region_request(asset.asset_id.clone()))
+            .expect("save representative fixture region");
+        let region = representative_service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("saved representative fixture region")
+            .into_iter()
+            .next()
+            .expect("representative region");
+        (case, asset, region)
+    };
+    let connection = Connection::open(representative_fixture.work_root.join("annotations.sqlite3"))
+        .expect("open representative database");
+    connection
+        .execute(
+            "DELETE FROM representative_assets WHERE case_id = ?1 AND asset_id = ?2",
+            params![representative_case.case_id, representative_asset.asset_id],
+        )
+        .expect("remove representative selection");
+    drop(connection);
+    let representative_service = service(&representative_fixture);
+    representative_service
+        .scan_selected_root(&representative_fixture.source_root)
+        .expect("rescan representative fixture");
+    assert!(matches!(
+        representative_service.refine_region_geometry(refine_region_request(
+            representative_case.case_id,
+            representative_asset.asset_id,
+            representative_region.region_id,
+            representative_region.polygon_norm,
+            refined_polygon(),
+        )),
+        Err(CoreError::AssetNotRepresentative)
+    ));
+}
+
+#[test]
+fn v3_to_v4_region_operation_migration_preserves_audit_and_allows_refinement() {
+    let fixture = fixture(1);
+    let (case, asset, region) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan migration fixture");
+        let (case, asset) = first_image(&scan);
+        load_generic_template(&service);
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select migration representative");
+        service
+            .save_confirmed_region(region_request(asset.asset_id.clone()))
+            .expect("save migration region");
+        let region = service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("saved migration region")
+            .into_iter()
+            .next()
+            .expect("migration region");
+        (case, asset, region)
+    };
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open v4 database for downgrade");
+    connection
+        .execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            CREATE TABLE region_operations_v3 (
+                operation_id INTEGER PRIMARY KEY,
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced')),
+                subject_region_id TEXT NOT NULL REFERENCES regions(region_id),
+                related_region_id TEXT REFERENCES regions(region_id),
+                occurred_at INTEGER NOT NULL,
+                before_polygon_norm_json TEXT,
+                before_labels_json TEXT,
+                after_polygon_norm_json TEXT,
+                after_labels_json TEXT
+            );
+            INSERT INTO region_operations_v3 (
+                operation_id,
+                operation_kind,
+                subject_region_id,
+                related_region_id,
+                occurred_at,
+                before_polygon_norm_json,
+                before_labels_json,
+                after_polygon_norm_json,
+                after_labels_json
+            )
+            SELECT
+                operation_id,
+                operation_kind,
+                subject_region_id,
+                related_region_id,
+                occurred_at,
+                before_polygon_norm_json,
+                before_labels_json,
+                after_polygon_norm_json,
+                after_labels_json
+            FROM region_operations;
+            DROP TABLE region_operations;
+            ALTER TABLE region_operations_v3 RENAME TO region_operations;
+            PRAGMA user_version = 3;
+            COMMIT;
+            ",
+        )
+        .expect("downgrade audit table to v3");
+    let old_audit: RegionOperationRecord = connection
+        .query_row(
+            "SELECT operation_id, operation_kind, subject_region_id, related_region_id, occurred_at,
+                    before_polygon_norm_json, before_labels_json, after_polygon_norm_json, after_labels_json
+             FROM region_operations
+             WHERE operation_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .expect("v3 operation snapshot");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("v3 schema version"),
+        3
+    );
+    drop(connection);
+
+    let migrated = service(&fixture);
+    migrated
+        .scan_selected_root(&fixture.source_root)
+        .expect("open and migrate v3 database");
+    migrated
+        .refine_region_geometry(refine_region_request(
+            case.case_id.clone(),
+            asset.asset_id.clone(),
+            region.region_id.clone(),
+            region.polygon_norm,
+            refined_polygon(),
+        ))
+        .expect("refine after v3 to v4 migration");
+
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("inspect migrated database");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("v4 schema version"),
+        4
+    );
+    let preserved_audit: RegionOperationRecord = connection
+        .query_row(
+            "SELECT operation_id, operation_kind, subject_region_id, related_region_id, occurred_at,
+                    before_polygon_norm_json, before_labels_json, after_polygon_norm_json, after_labels_json
+             FROM region_operations
+             WHERE operation_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .expect("preserved v3 audit");
+    assert_eq!(preserved_audit, old_audit);
+    let operations = connection
+        .prepare("SELECT operation_id, operation_kind FROM region_operations ORDER BY operation_id")
+        .expect("operation query")
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("operation rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("operations");
+    assert_eq!(
+        operations,
+        vec![
+            (1, "created".to_owned()),
+            (2, "geometry_refined".to_owned())
+        ]
+    );
+    let foreign_key_error: Option<String> = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()
+        .expect("foreign key check");
+    assert!(foreign_key_error.is_none());
+}
+
+#[test]
+fn future_database_schema_is_rejected_without_migration() {
+    let fixture = fixture(1);
+    {
+        let service = service(&fixture);
+        service
+            .scan_selected_root(&fixture.source_root)
+            .expect("create current database");
+    }
+    let connection = Connection::open(fixture.work_root.join("annotations.sqlite3"))
+        .expect("open current database");
+    connection
+        .pragma_update(None, "user_version", 5_i64)
+        .expect("mark future schema");
+    drop(connection);
+
+    let reopened = service(&fixture);
+    assert!(matches!(
+        reopened.scan_selected_root(&fixture.source_root),
+        Err(CoreError::DatabaseSchemaUnsupported)
+    ));
+    assert_eq!(
+        CommandError::from(CoreError::DatabaseSchemaUnsupported).code,
+        "DATABASE_SCHEMA_UNSUPPORTED"
+    );
 }
 
 fn collect_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

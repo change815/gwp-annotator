@@ -1,19 +1,19 @@
-# GWP Annotator — Stage 2 Core
+# GWP Annotator Desktop
 
-This directory contains the Stage 2 desktop foundation: a Tauri 2 shell, a Rust core, and a local SQLite data layer. The clinician-facing browser and drawing workflow are intentionally deferred to later stages.
+This directory contains the current Tauri 2 desktop application, Rust core, clinician workbench, and local SQLite archive for offline image/video annotation.
 
 ## Scope delivered here
 
-- Tauri 2 + native TypeScript placeholder shell with a strict offline CSP (`connect-src 'none'`).
-- Read-only two-campus scan of direct case directories and direct JPG/JPEG/MP4 files.
+- Tauri 2 + native TypeScript/Canvas clinician workbench with a strict offline CSP (`connect-src 'none'`).
+- Read-only scan of one or more arbitrarily named campus directories and their direct case JPG/JPEG/MP4 files.
 - Date-descending case ordering, stable opaque-ID tie-breaking, and natural media ordering.
 - Process-only source mapping: source names and paths are kept only in Rust memory. A dedicated local-UI IPC response exposes temporary campus `display_name` and case `display_label`; neither enters SQLite, recovery, cache, export, or logs.
 - HMAC-derived `CASE-...` and `ASSET-...` identifiers; tests inject a fixed secret. The production provider uses the operating-system credential store, isolated from the project work directory.
 - ProjectService rejects identical, nested, and canonicalized symlink/junction-overlapping source/work roots before scanning or writing. The SQLite work directory is opened lazily, after that check, so an unsafe configuration cannot create a database inside a source tree.
-- SQLite migrations, WAL, `synchronous=FULL`, unlimited representative-asset selection, template snapshots, and one confirmed-region transaction. A representative with saved regions cannot be deselected.
+- SQLite schema v4 migrations, WAL, `synchronous=FULL`, unlimited representative-asset selection, immutable template snapshots, audited region correction, and atomic source-pixel boundary refinement. A representative with saved regions cannot be deselected.
 - Derived-file writes validate every output-directory component, reject symlinks and Windows reparse points, verify the resolved parent remains under the work root, and use a same-directory temporary file. Existing Windows targets are replaced through `ReplaceFileW`; non-Windows uses same-volume rename semantics.
 - Database startup reserves and validates `annotations.sqlite3`, `annotations.sqlite3-journal`, `annotations.sqlite3-wal`, and `annotations.sqlite3-shm` as regular work-root files before SQLite opens them, re-reserves and validates the full set after migration/WAL setup, and does so before every core database operation. The primary database uses SQLite's no-follow open flag. SQLite exposes no separate rusqlite no-follow handle for every later rollback-journal/WAL/SHM VFS open, so a hostile same-user rename exactly between those checks and a SQLite sidecar open remains outside the atomic guarantee; the work root must remain application-controlled.
-- JSON label-template validation plus simplified `label.txt` import. No default domain vocabulary or template is bundled.
+- Strict UTF-8 TOML label-template validation plus first-import `label.txt` compatibility. No default domain vocabulary or template is bundled.
 
 ## Local build and test
 
@@ -56,7 +56,7 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 sh scripts/with-project-npm.sh run rust:b
 - Windows overwrite behavior is implemented with `ReplaceFileW` for existing derived files. It is covered by platform-neutral repeated-write tests here, but it must still be exercised on a Windows reference device; macOS verification is not Windows runtime evidence.
 - `rust:check:windows` is a best-effort compile check of the `x86_64-pc-windows-msvc` target using the project-local Rust toolchain. It is not Windows runtime evidence.
 - IPC commands use product semantics such as `scan_selected_root` and `deselect_representative`.
-- The current Stage 2 core scans MP4 metadata for browsing order but does not implement video playback, frame extraction, export, or any clinical UI.
+- The current application plays locally supported MP4 files and persists current-frame PNG captures under the application work directory; it does not modify source media or implement video tracking.
 
 ## Test fixture policy
 

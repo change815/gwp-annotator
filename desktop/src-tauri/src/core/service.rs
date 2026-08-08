@@ -74,6 +74,15 @@ pub struct UpdateRegionLabelsRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct RefineRegionGeometryRequest {
+    pub case_id: String,
+    pub asset_id: String,
+    pub region_id: String,
+    pub expected_polygon_norm: Vec<PointNorm>,
+    pub polygon_norm: Vec<PointNorm>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ReplaceRegionRequest {
     pub case_id: String,
     pub old_region_id: String,
@@ -426,6 +435,21 @@ impl ProjectService {
             .as_ref()
             .ok_or(CoreError::NoActiveSession)?
             .update_region_labels(&request.region_id, &template, &request.labels)
+    }
+
+    pub fn refine_region_geometry(&self, request: RefineRegionGeometryRequest) -> CoreResult<()> {
+        self.ensure_active_roots_separate()?;
+        self.persisted_image_asset(&request.case_id, &request.asset_id)?;
+        let store = self.active_store()?;
+        store
+            .as_ref()
+            .ok_or(CoreError::NoActiveSession)?
+            .refine_region_geometry(
+                &request.region_id,
+                &request.asset_id,
+                &request.expected_polygon_norm,
+                &request.polygon_norm,
+            )
     }
 
     pub fn delete_region(&self, case_id: &str, asset_id: &str, region_id: &str) -> CoreResult<()> {

@@ -2,20 +2,20 @@
 
 ## 1. 设计结论
 
-推荐实现为 **Rust + Tauri 2 + TypeScript 前端（原生 DOM/Canvas 2D）+ SQLite** 的单机 Windows 桌面应用：Rust 负责目录扫描、ID 脱敏、SQLite、原子写入和导出；Tauri 使用 Windows WebView2 承载轻量界面；前端使用 HTML `video`、`CanvasRenderingContext2D` 和 Pointer Events 显示媒体、绘制覆盖层及实现自由圈选。
+推荐实现为 **Rust + Tauri 2 + TypeScript 前端（原生 DOM/Canvas 2D）+ SQLite** 的单机 Windows 桌面应用：Rust 负责目录扫描、ID 脱敏、SQLite、原子写入和导出；Tauri 使用 Windows WebView2 承载轻量界面；前端使用 HTML `video`、`CanvasRenderingContext2D` 和 Pointer Events 显示媒体、绘制覆盖层、实现自由圈选及源图像像素级边界精修。
 
 此选择优先满足 V0.1 的离线、轻量、启动快、浏览快和本地文件访问需求。它不引入本地模型、GPU、服务端、账号或网络依赖。
 
 ### 已确认范围
 
 - Windows 单机，默认离线；仅服务胃癌术中白斑区域标注。
-- 一个或多个任意命名（可含中文）的院区目录、病例选择、左右键媒体浏览、按需数量的代表图、自由圈选、多区域、模板标签、MP4 播放和当前帧截取。
+- 一个或多个任意命名（可含中文）的院区目录、病例选择、左右键媒体浏览、按需数量的代表图、自由圈选、多区域、受限边界精修、模板标签、MP4 播放和当前帧截取。
 - 原始 JPG/MP4 永不改写；所有输出只使用脱敏病例 ID。
 - 不含模型预测、分期、强制双人标注、审核、登录、云服务或自动医疗诊断。
 
 ### 后续可选功能
 
-模板可视化编辑、区域编辑/撤销、更多媒体编码兼容、筛选、双人标注、审核、账户、同步和模型辅助均留待后续版本；它们不改变本设计中的本地标注数据格式。
+模板可视化编辑、孔洞/多组件区域、顶点拖拽、更多媒体编码兼容、筛选、双人标注、审核、账户、同步和模型辅助均留待后续版本。V0.3 的边界精修仍只产生单个无孔洞简单多边形。
 
 ### 唯一待确认问题
 
@@ -105,7 +105,13 @@ asset_id = "ASSET-" + Base32(HMAC-SHA-256(project_secret, case_id + NUL + raw_me
 
 仅已选代表图可进入 `Drawing`。每次 `OK` 只创建一个区域；已有区域继续显示，因而一个代表图可保存多个区域。无效、多边形面积过小或自相交无法修复时应提示重画，不能写入不完整几何。
 
-### 6.3 标签窗口
+### 6.3 边界精修
+
+V0.3 只对当前选中的已保存区域创建内存精修草稿。笔刷直径为 `4 / 8 / 16 / 24` 原图像素，不随缩放或高 DPI 改变；起点在区域内时整笔执行内擦，起点在区域外且笔刷接触区域时整笔执行外扩。每笔松开后重建轮廓，产生空区域、孔洞、多个不连通组件或非简单边界时整笔拒绝，不得自动填洞、取最大轮廓或改用凸包。
+
+精修支持撤销一步、取消和 `Esc`。只有明确确认“保存修正”后，后端才在单个事务内验证提交基线、更新当前区域多边形并写入 `geometry_refined` 前后快照；区域 ID、模板和标签保持不变。
+
+### 6.4 标签窗口
 
 闭合后弹出小型模态窗口。窗口按模板的 `control` 渲染下拉、单选或多选控件；`required: true` 的字段没有有效选择时禁用 `OK` 并显示该字段错误。窗口只保存稳定字段 ID 和选项 ID，显示文字来自模板。
 
@@ -148,13 +154,14 @@ D:/Apps/GWP Annotator Data/PROJECT-LOCAL/
 | `cases` | `case_id`, `campus_code`, `representative_count`, `updated_at` | `campus_code` 是不透明 HMAC ID；不存储原始院区/病例名或路径。 |
 | `assets` | `asset_id`, `case_id`, `kind`, `width`, `height`, `source_fingerprint` | `kind` 为 `original_image` 或 `captured_frame`；指纹是不可逆的 HMAC 输出。 |
 | `representative_assets` | `case_id`, `asset_id`, `selected_at` | 一个病例可按需保留任意数量的代表图。 |
-| `regions` | `region_id`, `asset_id`, `polygon_norm_json`, `template_id`, `template_version`, `created_at` | 一个区域一行，顶点为归一化坐标。 |
+| `regions` | `region_id`, `asset_id`, `polygon_norm_json`, `template_id`, `template_version`, `status`, `updated_at` | 一个当前或历史区域一行；当前几何为归一化单简单多边形。 |
 | `region_label_values` | `region_id`, `field_id`, `value_json` | 单选/下拉保存一个 option ID；多选保存 option ID 数组。 |
 | `templates` | `template_id`, `version`, `sha256`, `canonical_json` | 保存已使用模板的不可变快照，不含患者信息。 |
+| `region_operations` | `operation_kind`, `subject_region_id`, `occurred_at`, `before_*`, `after_*` | 保存创建、标签修改、删除、替换和边界精修的前后快照。 |
 
 ### 8.2 自动保存与崩溃恢复
 
-1. `OK` 后在单个 SQLite 事务内写入 `regions`、标签值和更新时间，提交成功后才在界面显示“已保存”。数据库使用 WAL 和 `synchronous=FULL`。
+1. 标签窗口 `OK` 或“保存修正”后，在单个 SQLite 事务内写入当前状态和操作记录，提交成功后才在界面显示“已保存”。数据库使用 WAL 和 `synchronous=FULL`。
 2. 每次捕获帧先写 `*.tmp`，完成并校验后原子重命名；启动时清理未引用的临时文件，不触碰源目录。
 3. 当前病例的脱敏 ID、当前媒体 ID、视图变换和未确认轨迹每 2 秒原子写入 `recovery/session-state.json`。异常退出后可恢复到该工作状态，但未点击 `OK` 的区域始终标为草稿，必须再次确认才会进入数据库。
 4. 每次正常关闭和每 20 次提交后创建可轮换的 SQLite 备份快照。备份失败必须提示，不得影响已经成功提交的事务。
@@ -167,7 +174,7 @@ D:/Apps/GWP Annotator Data/PROJECT-LOCAL/
 
 导入器在 TOML 解析前必须严格以 UTF-8 解码输入字节。任何解码错误、解码结果中的 Unicode 替换字符 `U+FFFD` 或明显乱码均使导入失败；界面提示用户用 UTF-8 重新保存后再试。不得猜测、尝试或记录 GBK/系统代码页转换。通过字节编码检查后，才执行 TOML 语法、字段 ID 和业务校验。
 
-项目升级时，内容校验和与模板摘要均匹配的历史固定副本和 SQLite 模板快照可以按结构读取，即使其显示文字带有明确旧乱码；这是模板内容不可改写的历史解释兼容，不是新的导入豁免。前端隐藏圈选准星并禁用“删除后重画”，Rust 保存边界再次拒绝用该模板创建或替换区域；旧区域的查看、标签修正和删除仍保留。
+项目升级时，内容校验和与模板摘要均匹配的历史固定副本和 SQLite 模板快照可以按结构读取，即使其显示文字带有明确旧乱码；这是模板内容不可改写的历史解释兼容，不是新的导入豁免。前端隐藏圈选准星并禁用“重画并替换”，Rust 保存边界再次拒绝用该模板创建或替换区域；旧区域的查看、标签修正、边界精修和删除仍保留。
 
 ```toml
 format = "gwa-label-template"

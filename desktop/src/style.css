@@ -338,6 +338,7 @@ canvas:focus-visible {
 
 .media-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 0.7rem;
@@ -345,6 +346,48 @@ canvas:focus-visible {
   padding: 0.45rem 0.65rem;
   border-bottom: 1px solid #c7d1da;
   background: #f9fafb;
+}
+
+.refinement-toolbar {
+  display: flex;
+  flex: 1 0 100%;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  padding-top: 0.45rem;
+  border-top: 1px solid #c7d1da;
+  color: #344b5e;
+}
+
+.refinement-toolbar > strong {
+  color: #18364a;
+  white-space: nowrap;
+}
+
+.refinement-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.refinement-toolbar select {
+  min-height: 32px;
+  padding: 0.2rem 1.7rem 0.2rem 0.45rem;
+  border: 1px solid #8495a4;
+  background: #fff;
+}
+
+.refinement-toolbar .primary-action {
+  border-color: #0a6288;
+  color: #fff;
+  background: #0b668c;
+}
+
+.refinement-toolbar .primary-action:hover:not(:disabled) {
+  border-color: #084d6b;
+  background: #095777;
 }
 
 .media-toolbar > div:first-child {
@@ -392,6 +435,10 @@ canvas:focus-visible {
 }
 
 .canvas-frame.crosshair-ready canvas {
+  cursor: none;
+}
+
+.canvas-frame.refinement-mode canvas {
   cursor: none;
 }
 
@@ -462,6 +509,11 @@ canvas:focus-visible {
 .canvas-hint.ready {
   border-color: #176e49;
   color: #155f3c;
+}
+
+.canvas-hint.refinement-hint {
+  border-color: #6b7280;
+  color: #263b4b;
 }
 
 .loading-cover {
@@ -573,6 +625,8 @@ canvas:focus-visible {
 
 .region-list {
   flex: 1;
+  grid-auto-rows: max-content;
+  align-content: start;
 }
 
 .annotation-state {
@@ -713,6 +767,11 @@ canvas:focus-visible {
   .media-toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .refinement-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
   }
 
   .header-actions,

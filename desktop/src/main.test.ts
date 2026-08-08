@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   autoCloseThreshold,
   boot,
+  brushDiameterCssPixels,
   canAnnotate,
   canAutoClose,
+  canStartRefinement,
   clearCrosshairPointerState,
   customCrosshairMarkup,
   decodeUtf8Template,
@@ -13,6 +15,7 @@ import {
   LEGACY_TEMPLATE_ENCODING_WARNING,
   polygonArea,
   primaryDrawingButtonIsPressed,
+  refinementFailureMessage,
   shouldHandleMediaNavigation,
   shouldShowCustomCrosshair,
   TEMPLATE_UTF8_IMPORT_ERROR,
@@ -23,6 +26,7 @@ import {
   type PointNorm,
   type TemplateField,
 } from "./main";
+import { refinePolygonWithStroke } from "./refinement";
 
 const triangle: PointNorm[] = [
   { x: 0.1, y: 0.1 },
@@ -38,6 +42,21 @@ const templateV1: LabelTemplate = {
 };
 
 const templateV2: LabelTemplate = { ...templateV1, version: 2 };
+
+const syntheticRegion = {
+  region_id: "REGION-SYNTHETIC",
+  asset_id: "ASSET-SYNTHETIC",
+  polygon_norm: [
+    { x: 0.2, y: 0.2 },
+    { x: 0.8, y: 0.2 },
+    { x: 0.8, y: 0.8 },
+    { x: 0.2, y: 0.8 },
+  ],
+  template_id: templateV1.template_id,
+  template_version: templateV1.version,
+  template: templateV1,
+  labels: {},
+};
 
 const legacyDamagedTemplate: LabelTemplate = {
   ...templateV1,
@@ -82,6 +101,7 @@ function mockAppApi(overrides: Record<string, unknown> = {}): Record<string, unk
     }),
     currentLocalDisplayScan: vi.fn().mockResolvedValue({ campuses: [] }),
     projectStorageLocation: vi.fn().mockResolvedValue("D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL"),
+    refineRegionGeometry: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -94,6 +114,138 @@ function chooseTemplateFile(fileName: string, contents: string | Uint8Array = "v
     value: [{ name: fileName, arrayBuffer: async () => bytes.slice().buffer }],
   });
   input?.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function installSyntheticMediaDom(): void {
+  const context = {
+    setTransform: vi.fn(),
+    clearRect: vi.fn(),
+    drawImage: vi.fn(),
+    beginPath: vi.fn(),
+    moveTo: vi.fn(),
+    lineTo: vi.fn(),
+    closePath: vi.fn(),
+    stroke: vi.fn(),
+    fill: vi.fn(),
+    arc: vi.fn(),
+  };
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as never);
+  vi.spyOn(HTMLCanvasElement.prototype, "clientWidth", "get").mockReturnValue(100);
+  vi.spyOn(HTMLCanvasElement.prototype, "clientHeight", "get").mockReturnValue(100);
+  vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue({
+    x: 0,
+    y: 0,
+    top: 0,
+    right: 100,
+    bottom: 100,
+    left: 0,
+    width: 100,
+    height: 100,
+    toJSON: () => ({}),
+  });
+  vi.stubGlobal("ResizeObserver", class {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  });
+  vi.stubGlobal("Image", class {
+    naturalWidth = 100;
+    naturalHeight = 100;
+    onload: ((event: Event) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+
+    set src(_value: string) {
+      queueMicrotask(() => this.onload?.(new Event("load")));
+    }
+  });
+}
+
+function loadedRefinementApi(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const scan = {
+    campuses: [
+      {
+        campus_code: "CAMPUS-SYNTHETIC",
+        case_count: 1,
+        cases: [
+          {
+            case_id: "CASE-SYNTHETIC",
+            date: "2026-08-09",
+            assets: [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image", size_bytes: 1024 }],
+          },
+        ],
+      },
+    ],
+  };
+  return mockAppApi({
+    restoreProjectSession: vi.fn().mockResolvedValue({
+      status: "restored",
+      scan,
+      template: templateDescriptor(templateV1, "a".repeat(64)),
+      current_case_id: "CASE-SYNTHETIC",
+      current_asset_id: "ASSET-SYNTHETIC",
+    }),
+    currentLocalDisplayScan: vi.fn().mockResolvedValue({
+      campuses: [
+        {
+          campus_code: "CAMPUS-SYNTHETIC",
+          display_name: "合成院区",
+          cases: [{ case_id: "CASE-SYNTHETIC", date: "2026-08-09", display_label: "合成病例" }],
+        },
+      ],
+    }),
+    representativeAssetIds: vi.fn().mockResolvedValue(["ASSET-SYNTHETIC"]),
+    savedRegionsForAsset: vi.fn().mockResolvedValue([syntheticRegion]),
+    readImageAsset: vi.fn().mockResolvedValue({
+      asset_id: "ASSET-SYNTHETIC",
+      mime_type: "image/png",
+      data_base64: "synthetic",
+    }),
+    recordImageDimensions: vi.fn().mockResolvedValue(undefined),
+    saveLastPosition: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  });
+}
+
+function dispatchPointer(
+  canvas: HTMLCanvasElement,
+  type: "pointerdown" | "pointerup" | "pointercancel" | "lostpointercapture",
+  x: number,
+  y: number,
+): void {
+  const event = new MouseEvent(type, {
+    bubbles: true,
+    button: 0,
+    buttons: type === "pointerdown" ? 1 : 0,
+    clientX: x,
+    clientY: y,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: 1 },
+    pointerType: { value: "mouse" },
+  });
+  canvas.dispatchEvent(event);
+}
+
+function installPointerCaptureMocks(canvas: HTMLCanvasElement): void {
+  Object.assign(canvas, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+    hasPointerCapture: vi.fn().mockReturnValue(true),
+  });
+}
+
+async function openSyntheticRefinement(api: Record<string, unknown>): Promise<void> {
+  installSyntheticMediaDom();
+  window.__GWP_API__ = api as never;
+  boot();
+  await vi.waitFor(() => {
+    const entry = document.querySelector<HTMLButtonElement>('[data-action="refine-region"]');
+    expect(entry?.disabled).toBe(false);
+  });
+  document.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.click();
+  await vi.waitFor(() => {
+    expect(document.querySelector('[aria-label="边界精修"]')).not.toBeNull();
+  });
 }
 
 const chineseToml = `
@@ -144,6 +296,26 @@ describe("drawing geometry", () => {
     expect(primaryDrawingButtonIsPressed(1)).toBe(true);
     expect(primaryDrawingButtonIsPressed(2)).toBe(false);
     expect(primaryDrawingButtonIsPressed(3)).toBe(true);
+  });
+});
+
+describe("refinement UI helpers", () => {
+  it("keeps brush size in source-image pixels and scales only its canvas display", () => {
+    expect(brushDiameterCssPixels(16, 0.5)).toBe(8);
+    expect(brushDiameterCssPixels(16, 2)).toBe(32);
+    expect(brushDiameterCssPixels(16, Number.NaN)).toBe(0);
+  });
+
+  it("requires a selected saved region, loaded image, and representative image", () => {
+    expect(canStartRefinement(syntheticRegion, true, true)).toBe(true);
+    expect(canStartRefinement(null, true, true)).toBe(false);
+    expect(canStartRefinement(syntheticRegion, false, true)).toBe(false);
+    expect(canStartRefinement(syntheticRegion, true, false)).toBe(false);
+  });
+
+  it("provides a specific Chinese message for an atomic failed stroke", () => {
+    expect(refinementFailureMessage("detached")).toContain("必须接触当前区域");
+    expect(refinementFailureMessage("hole")).toContain("孔洞");
   });
 });
 
@@ -296,6 +468,7 @@ describe("local shell", () => {
 
   afterEach(() => {
     delete window.__GWP_API__;
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -307,6 +480,151 @@ describe("local shell", () => {
     expect(document.querySelector<HTMLInputElement>('[data-action="template-file"]')?.disabled).toBe(false);
     expect(document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')).not.toBeNull();
     expect(document.querySelector<HTMLButtonElement>('[data-action="forget-position"]')?.disabled).toBe(false);
+  });
+
+  it("shows the selected-region refinement entry and source-pixel brush controls", async () => {
+    await openSyntheticRefinement(loadedRefinementApi());
+
+    const brush = document.querySelector<HTMLSelectElement>('[data-action="refinement-brush"]');
+    expect(document.body.textContent).toContain("精修边界");
+    expect(document.body.textContent).toContain("笔刷粗细");
+    expect(document.body.textContent).toContain("原图像素");
+    expect(Array.from(brush?.options ?? [], (option) => option.value)).toEqual(["4", "8", "16", "24"]);
+    expect(brush?.value).toBe("8");
+    expect(document.querySelector('[data-drawing-crosshair]')).toBeNull();
+    expect(document.querySelector('[data-canvas-frame]')?.classList.contains("refinement-mode")).toBe(true);
+  });
+
+  it("saves expected and current polygons without retransmitting labels", async () => {
+    const refineRegionGeometry = vi.fn().mockResolvedValue(undefined);
+    const api = loadedRefinementApi({ refineRegionGeometry });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticRefinement(api);
+
+    const canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 22, 50);
+    dispatchPointer(canvas, "pointerup", 5, 50);
+
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+    });
+    document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.click();
+
+    await vi.waitFor(() => expect(refineRegionGeometry).toHaveBeenCalledOnce());
+    const request = refineRegionGeometry.mock.calls[0][0] as Record<string, unknown>;
+    expect(request).toMatchObject({
+      case_id: "CASE-SYNTHETIC",
+      asset_id: "ASSET-SYNTHETIC",
+      region_id: "REGION-SYNTHETIC",
+      expected_polygon_norm: syntheticRegion.polygon_norm,
+    });
+    const expected = refinePolygonWithStroke(
+      syntheticRegion.polygon_norm,
+      100,
+      100,
+      [{ x: 0.22, y: 0.5 }, { x: 0.05, y: 0.5 }],
+      8,
+    );
+    expect(expected.ok).toBe(true);
+    if (!expected.ok) throw new Error(`Expected synthetic refinement to succeed: ${expected.reason}`);
+    expect(request.polygon_norm).toEqual(expected.polygon);
+    expect(request).not.toHaveProperty("labels");
+  });
+
+  it("cancels by button or Escape without calling the refinement API", async () => {
+    const refineRegionGeometry = vi.fn().mockResolvedValue(undefined);
+    const api = loadedRefinementApi({ refineRegionGeometry });
+    await openSyntheticRefinement(api);
+
+    document.querySelector<HTMLButtonElement>('[data-action="refinement-cancel"]')?.click();
+    expect(document.querySelector('[aria-label="边界精修"]')).toBeNull();
+    document.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.click();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+
+    expect(document.querySelector('[aria-label="边界精修"]')).toBeNull();
+    expect(refineRegionGeometry).not.toHaveBeenCalled();
+  });
+
+  it("undoes the latest stroke before applying and saving a different stroke", async () => {
+    const refineRegionGeometry = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticRefinement(loadedRefinementApi({ refineRegionGeometry }));
+
+    let canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 22, 50);
+    dispatchPointer(canvas, "pointerup", 5, 50);
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-undo"]')?.disabled).toBe(false);
+    });
+    document.querySelector<HTMLButtonElement>('[data-action="refinement-undo"]')?.click();
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(true);
+
+    canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 78, 50);
+    dispatchPointer(canvas, "pointerup", 95, 50);
+    document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.click();
+    await vi.waitFor(() => expect(refineRegionGeometry).toHaveBeenCalledOnce());
+
+    const expected = refinePolygonWithStroke(
+      syntheticRegion.polygon_norm,
+      100,
+      100,
+      [{ x: 0.78, y: 0.5 }, { x: 0.95, y: 0.5 }],
+      8,
+    );
+    expect(expected.ok).toBe(true);
+    if (!expected.ok) throw new Error(`Expected synthetic refinement to succeed: ${expected.reason}`);
+    expect(refineRegionGeometry.mock.calls[0][0].polygon_norm).toEqual(expected.polygon);
+  });
+
+  it("keeps completed draft edits across pointer termination and a save conflict", async () => {
+    const refineRegionGeometry = vi.fn().mockRejectedValue({ code: "REGION_GEOMETRY_CONFLICT" });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticRefinement(loadedRefinementApi({ refineRegionGeometry }));
+
+    let canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 22, 50);
+    dispatchPointer(canvas, "pointerup", 22, 50);
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+    });
+
+    canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 24, 50);
+    dispatchPointer(canvas, "pointercancel", 24, 50);
+    dispatchPointer(canvas, "pointerdown", 24, 50);
+    dispatchPointer(canvas, "lostpointercapture", 24, 50);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+
+    document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.click();
+    await vi.waitFor(() => {
+      expect(document.querySelector(".notice")?.textContent).toContain("请刷新后重试");
+    });
+    expect(document.querySelector('[aria-label="边界精修"]')).not.toBeNull();
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+  });
+
+  it("keeps the draft unchanged and reports Chinese guidance when a stroke fails", async () => {
+    await openSyntheticRefinement(loadedRefinementApi());
+
+    const brush = document.querySelector<HTMLSelectElement>('[data-action="refinement-brush"]') as HTMLSelectElement;
+    brush.value = "4";
+    brush.dispatchEvent(new Event("change", { bubbles: true }));
+    const canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 5, 5);
+    dispatchPointer(canvas, "pointerup", 5, 5);
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".notice")?.textContent).toContain("必须接触当前区域");
+    });
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-undo"]')?.disabled).toBe(true);
   });
 
   it("confirms and invokes the replacement API when a template is already active", async () => {

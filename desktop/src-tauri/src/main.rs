@@ -7,8 +7,9 @@ use std::sync::Arc;
 use gwp_annotator_core::core::commands::{self as core_commands, CommandError};
 use gwp_annotator_core::core::scan::{LocalDisplayScan, PublicScan};
 use gwp_annotator_core::core::service::{
-    CaptureFrameRequest, ReplaceRegionRequest, RepresentativeSelection, SaveRegionRequest,
-    StartupRestore, TemplateDescriptor, UpdateRegionLabelsRequest,
+    CaptureFrameRequest, RefineRegionGeometryRequest, ReplaceRegionRequest,
+    RepresentativeSelection, SaveRegionRequest, StartupRestore, TemplateDescriptor,
+    UpdateRegionLabelsRequest,
 };
 use gwp_annotator_core::core::store::{BackupResult, CapturedFrame, SavedRegion};
 use gwp_annotator_core::{AppState, ProjectService, SystemCredentialSecretProvider};
@@ -150,6 +151,14 @@ fn update_region_labels(
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
     core_commands::update_region_labels(request, state)
+}
+
+#[tauri::command]
+fn refine_region_geometry(
+    request: RefineRegionGeometryRequest,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    core_commands::refine_region_geometry(request, state)
 }
 
 #[tauri::command]
@@ -388,6 +397,7 @@ fn main() {
             project_storage_location,
             save_confirmed_region,
             update_region_labels,
+            refine_region_geometry,
             delete_region,
             replace_region,
             capture_video_frame,

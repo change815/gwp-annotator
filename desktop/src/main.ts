@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import {
+  BRUSH_DIAMETERS,
+  pointInPolygonNorm,
+  refinePolygonWithStroke,
+  type NormalizedPoint,
+  type RefinementFailure,
+  type RefinementMode,
+} from "./refinement";
 import "./style.css";
 
 export type MediaKind = "image" | "video";
@@ -42,10 +50,7 @@ export interface LocalDisplayScan {
   campuses: LocalDisplayCampus[];
 }
 
-export interface PointNorm {
-  x: number;
-  y: number;
-}
+export type PointNorm = NormalizedPoint;
 
 export interface SavedRegion {
   region_id: string;
@@ -154,6 +159,7 @@ interface AppApi {
   saveLastPosition(caseId: string, assetId: string): Promise<void>;
   recordImageDimensions(caseId: string, assetId: string, width: number, height: number): Promise<void>;
   saveConfirmedRegion(request: SaveRegionRequest): Promise<void>;
+  refineRegionGeometry(request: RefineRegionGeometryRequest): Promise<void>;
 }
 
 interface SaveRegionRequest {
@@ -178,6 +184,14 @@ interface ReplaceRegionRequest {
   case_id: string;
   old_region_id: string;
   replacement: SaveRegionRequest;
+}
+
+interface RefineRegionGeometryRequest {
+  case_id: string;
+  asset_id: string;
+  region_id: string;
+  expected_polygon_norm: PointNorm[];
+  polygon_norm: PointNorm[];
 }
 
 interface CaptureFrameRequest {
@@ -230,6 +244,7 @@ const tauriApi: AppApi = {
   saveConfirmedRegion: async (request) => {
     await invoke("save_confirmed_region", { request });
   },
+  refineRegionGeometry: async (request) => invoke("refine_region_geometry", { request }),
 };
 
 interface DisplayCase extends PublicCase {
@@ -262,6 +277,22 @@ interface EditLabelsDraft {
   regionId: string;
   template: LabelTemplate;
   values: Record<string, LabelValue>;
+}
+
+interface RefinementStroke {
+  pointerId: number;
+  mode: RefinementMode;
+  points: PointNorm[];
+}
+
+interface RefinementDraft {
+  regionId: string;
+  originalPolygon: PointNorm[];
+  polygon: PointNorm[];
+  history: PointNorm[][];
+  brushDiameterPx: number;
+  stroke: RefinementStroke | null;
+  saving: boolean;
 }
 
 export interface CrosshairState {
@@ -299,6 +330,7 @@ interface State {
   capturePending: boolean;
   backupPending: boolean;
   crosshair: CrosshairState;
+  refinement: RefinementDraft | null;
   message: string;
   messageKind: "info" | "error" | "success";
 }
@@ -332,6 +364,7 @@ const initialState = (): State => ({
   capturePending: false,
   backupPending: false,
   crosshair: { pointerInCanvas: false, x: 0, y: 0 },
+  refinement: null,
   message: "请选择本地数据根目录。",
   messageKind: "info",
 });
@@ -551,6 +584,33 @@ export function shouldShowCustomCrosshair(
   return representative && templateLoaded && !panMode && pointerInCanvas && imageReady && !labelDialogOpen;
 }
 
+export function canStartRefinement(
+  selectedRegion: SavedRegion | null,
+  imageReady: boolean,
+  representative: boolean,
+): boolean {
+  return Boolean(selectedRegion && imageReady && representative);
+}
+
+export function brushDiameterCssPixels(brushDiameterPx: number, imageScale: number): number {
+  if (!Number.isFinite(brushDiameterPx) || !Number.isFinite(imageScale)) return 0;
+  return Math.max(0, brushDiameterPx * imageScale);
+}
+
+export function refinementFailureMessage(reason: RefinementFailure): string {
+  const messages: Record<RefinementFailure, string> = {
+    empty: "本笔会擦除整个区域，边界未改变。",
+    disconnected: "本笔会把区域分成多个部分，边界未改变。",
+    hole: "本笔会在区域内形成孔洞，边界未改变。",
+    detached: "外扩笔划必须接触当前区域，边界未改变。",
+    too_small: "本笔会使区域小到无法可靠保存，边界未改变。",
+    non_manifold: "本笔会形成无法保存的复杂边界，边界未改变。",
+    invalid_input: "本笔输入无效，边界未改变。",
+    too_complex: "当前边界或笔划过于复杂，边界未改变。",
+  };
+  return messages[reason];
+}
+
 export function clearCrosshairPointerState(crosshair: CrosshairState): CrosshairState {
   return { ...crosshair, pointerInCanvas: false };
 }
@@ -596,6 +656,9 @@ function formatError(error: unknown): string {
     INVALID_CAPTURE: "无法截取当前视频帧。请确认本机可播放该 MP4。",
     REGION_NOT_FOUND: "该区域已不存在，请刷新后重试。",
     REGION_NOT_ACTIVE: "该区域已被删除或替换，请刷新后重试。",
+    REGION_GEOMETRY_CONFLICT: "该区域已在其他操作中变化，请刷新后重试。",
+    UNSUPPORTED_GEOMETRY_TOPOLOGY: "修正后的边界包含不支持的复杂结构，请调整笔划后重试。",
+    DATABASE_SCHEMA_UNSUPPORTED: "标注数据库来自更高版本的软件，请升级 GWP Annotator 后再打开。",
     INVALID_LABELS: "请完成所有必填标签。",
     INVALID_POLYGON: "圈选无效，请重新绘制闭合区域。",
   };
@@ -748,6 +811,9 @@ function mountMarkup(state: State): string {
   const templateReady = templateAllowsNewAnnotations(state.template);
   const annotationReady = canAnnotate(isRepresentative, templateReady);
   const imageReady = Boolean(state.image && state.imageAssetId === asset?.asset_id);
+  const selectedRegion = state.regions.find((region) => region.region_id === state.selectedRegionId) ?? null;
+  const refining = Boolean(state.refinement);
+  const interactionLocked = refining ? "disabled" : "";
   const crosshairVisible = shouldShowCustomCrosshair(
     isRepresentative,
     templateReady,
@@ -756,8 +822,8 @@ function mountMarkup(state: State): string {
     imageReady,
     Boolean(state.labelDraft),
   );
-  const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft;
-  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels);
+  const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft && !refining;
+  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || refining;
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
@@ -766,8 +832,8 @@ function mountMarkup(state: State): string {
       <header class="app-header">
         <div><h1 id="app-title">GWP Annotator</h1><p>本地医生标注工作台</p></div>
         <div class="header-actions">
-          <button type="button" data-action="choose-root">更换数据目录</button>
-          <button type="button" data-action="forget-position">忘记上次位置</button>
+          <button type="button" data-action="choose-root" ${interactionLocked}>更换数据目录</button>
+          <button type="button" data-action="forget-position" ${interactionLocked}>忘记上次位置</button>
           <button type="button" data-action="storage-location" aria-expanded="${state.storageLocationVisible}">数据保存位置</button>
           <span class="offline-status" data-testid="offline-status">本地离线</span>
         </div>
@@ -781,7 +847,7 @@ function mountMarkup(state: State): string {
       </section>
       <div class="workspace-grid">
         <aside class="case-sidebar" aria-label="院区与病例">
-          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 ? "disabled" : ""}>
+          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || refining ? "disabled" : ""}>
             ${state.campuses
               .map(
                 (item) =>
@@ -793,7 +859,7 @@ function mountMarkup(state: State): string {
             ${(campus?.cases ?? [])
               .map(
                 (item) =>
-                  `<button type="button" role="option" aria-selected="${item.case_id === state.caseId}" class="case-item ${item.case_id === state.caseId ? "selected" : ""}" data-case-id="${escapeHtml(item.case_id)}"><span>${escapeHtml(item.displayLabel)}</span><small>${escapeHtml(item.date ?? "日期未识别")}</small></button>`,
+                  `<button type="button" role="option" aria-selected="${item.case_id === state.caseId}" class="case-item ${item.case_id === state.caseId ? "selected" : ""}" data-case-id="${escapeHtml(item.case_id)}" ${interactionLocked}><span>${escapeHtml(item.displayLabel)}</span><small>${escapeHtml(item.date ?? "日期未识别")}</small></button>`,
               )
               .join("") || `<p class="empty-copy">选择根目录后显示院区和病例。</p>`}
           </div>
@@ -802,22 +868,31 @@ function mountMarkup(state: State): string {
           <div class="media-toolbar">
             <div><strong>${currentCase ? escapeHtml(currentCase.displayLabel) : "未选择病例"}</strong><span>${asset ? `${currentIndex} / ${media.length}` : ""}</span></div>
             <div class="media-actions">
-              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 ? "disabled" : ""}>上一张</button>
-              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 ? "disabled" : ""}>下一张</button>
-              <button type="button" data-action="fit" ${isImage ? "" : "disabled"}>适配</button>
-              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
-              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
+              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || refining ? "disabled" : ""}>上一张</button>
+              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || refining ? "disabled" : ""}>下一张</button>
+              <button type="button" data-action="fit" ${isImage && !refining ? "" : "disabled"}>适配</button>
+              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage && !refining ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
+              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending && !refining ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
             </div>
+            ${state.refinement ? `<div class="refinement-toolbar" role="toolbar" aria-label="边界精修">
+              <strong>边界精修</strong>
+              <label>笔刷粗细<select data-action="refinement-brush" aria-label="笔刷粗细（原图像素）" ${state.refinement.saving ? "disabled" : ""}>${BRUSH_DIAMETERS.map((diameter) => `<option value="${diameter}" ${diameter === state.refinement?.brushDiameterPx ? "selected" : ""}>${diameter}</option>`).join("")}</select></label>
+              <span>原图像素</span>
+              <button type="button" data-action="refinement-undo" ${state.refinement.history.length > 0 && !state.refinement.stroke && !state.refinement.saving ? "" : "disabled"}>撤销一步</button>
+              <button type="button" class="primary-action" data-action="refinement-save" ${state.refinement.history.length > 0 && !state.refinement.stroke && !state.refinement.saving ? "" : "disabled"}>${state.refinement.saving ? "正在保存…" : "保存修正"}</button>
+              <button type="button" data-action="refinement-cancel" ${state.refinement.saving ? "disabled" : ""}>取消</button>
+            </div>` : ""}
           </div>
-          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""}" data-canvas-frame>
+          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""} ${refining ? "refinement-mode" : ""}" data-canvas-frame>
             ${!asset ? `<p class="empty-copy">从左侧选择病例。</p>` : ""}
             ${asset?.media_kind === "video" && currentCase ? `<div class="video-player"><video data-video-player preload="metadata" src="gwp-media://localhost/video/${encodeURIComponent(currentCase.case_id)}/${encodeURIComponent(asset.asset_id)}"></video><div class="video-controls"><button type="button" data-action="video-play">${state.videoPlaying ? "暂停" : "播放"}</button><input data-action="video-seek" type="range" min="0" max="${Math.max(state.videoDuration, 0)}" value="${Math.min(state.videoTime, state.videoDuration || 0)}" step="0.01" aria-label="视频进度"><output data-video-time>${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}</output><button type="button" data-action="capture-frame" ${state.capturePending ? "disabled" : ""}>${state.capturePending ? "正在截帧…" : "截取当前帧"}</button></div><p>截帧仅保存到本应用工作目录，并归属于当前病例；原始病例目录保持只读。</p></div>` : ""}
             ${isImage ? `<canvas data-drawing-canvas aria-label="图片标注画布" tabindex="0"></canvas>` : ""}
-            ${isImage ? customCrosshairMarkup(crosshairVisible, state.crosshair.x, state.crosshair.y) : ""}
+            ${isImage && !refining ? customCrosshairMarkup(crosshairVisible, state.crosshair.x, state.crosshair.y) : ""}
             ${state.imageLoading ? `<div class="loading-cover">正在读取图片…</div>` : ""}
             ${isImage && !isRepresentative ? `<div class="canvas-hint">请先将当前图片选择为代表图，才可圈选。</div>` : ""}
             ${isImage && isRepresentative && !state.template ? `<div class="canvas-hint">请先加载标签模板，才可保存圈选。</div>` : ""}
-            ${isImage && annotationReady ? `<div class="canvas-hint ready">左键开始自由圈选，回到起点附近自动闭合。</div>` : ""}
+            ${isImage && annotationReady && !refining ? `<div class="canvas-hint ready">左键开始自由圈选，回到起点附近自动闭合。</div>` : ""}
+            ${isImage && state.refinement ? `<div class="canvas-hint refinement-hint">起点在区域内为内擦，区域外为外扩；一笔内模式锁定。</div>` : ""}
           </div>
           <div class="media-strip" aria-label="当前病例媒体序列">
             ${media
@@ -825,9 +900,9 @@ function mountMarkup(state: State): string {
                 const representative = state.representativeIds.has(item.asset_id);
                 const isCurrent = index === state.assetIndex;
                 const toggle = item.media_kind === "image"
-                  ? `<button type="button" class="representative-button" data-action="representative" data-asset-id="${escapeHtml(item.asset_id)}" ${representative && state.regions.some((region) => region.asset_id === item.asset_id) ? "title=\"已有保存区域，不能取消\"" : ""}>${representative ? "取消代表" : "设为代表"}</button>`
+                  ? `<button type="button" class="representative-button" data-action="representative" data-asset-id="${escapeHtml(item.asset_id)}" ${interactionLocked} ${representative && state.regions.some((region) => region.asset_id === item.asset_id) ? "title=\"已有保存区域，不能取消\"" : ""}>${representative ? "取消代表" : "设为代表"}</button>`
                   : `<span class="deferred-badge">可播放与截帧</span>`;
-                return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"}">${assetLabel(item, index)}</button>${toggle}</article>`;
+                return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"} ${interactionLocked}>${assetLabel(item, index)}</button>${toggle}</article>`;
               })
               .join("")}
           </div>
@@ -839,7 +914,7 @@ function mountMarkup(state: State): string {
             ${state.regions
               .map(
                 (region, index) =>
-                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}">区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}">修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady ? "" : "disabled"}>删除后重画</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}">删除</button></div>` : ""}</article>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="refine-region" data-region-id="${escapeHtml(region.region_id)}" ${canStartRefinement(selectedRegion, imageReady, isRepresentative) && !refining ? "" : "disabled"}>精修边界</button><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady && !refining ? "" : "disabled"}>重画并替换</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
@@ -907,6 +982,43 @@ function drawPolygon(
   context.fillStyle = active ? "rgba(249, 115, 22, 0.12)" : "rgba(14, 116, 144, 0.12)";
   context.stroke();
   if (!active && points.length >= 3) context.fill();
+}
+
+function drawRefinementOverlay(
+  context: CanvasRenderingContext2D,
+  refinement: RefinementDraft,
+  transform: Transform,
+  image: HTMLImageElement,
+  pointer: CrosshairState,
+): void {
+  const stroke = refinement.stroke;
+  if (stroke && stroke.points.length > 0) {
+    context.beginPath();
+    stroke.points.forEach((point, index) => {
+      const x = transform.x + point.x * image.naturalWidth * transform.scale;
+      const y = transform.y + point.y * image.naturalHeight * transform.scale;
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    context.lineWidth = brushDiameterCssPixels(refinement.brushDiameterPx, transform.scale);
+    context.strokeStyle = stroke.mode === "add" ? "rgba(25, 114, 69, 0.42)" : "rgba(180, 35, 24, 0.42)";
+    context.stroke();
+  }
+
+  if (!pointer.pointerInCanvas) return;
+  const normalizedPointer = normalizedFromPointer(pointer, transform, image);
+  if (!normalizedPointer) return;
+  const mode = stroke?.mode ?? (pointInPolygonNorm(normalizedPointer, refinement.polygon) ? "subtract" : "add");
+  const diameter = brushDiameterCssPixels(refinement.brushDiameterPx, transform.scale);
+  context.beginPath();
+  context.arc(pointer.x, pointer.y, diameter / 2, 0, Math.PI * 2);
+  context.lineWidth = 1.5;
+  context.strokeStyle = mode === "add" ? "#197245" : "#b42318";
+  context.fillStyle = mode === "add" ? "rgba(25, 114, 69, 0.14)" : "rgba(180, 35, 24, 0.14)";
+  context.fill();
+  context.stroke();
 }
 
 function startApp(target: HTMLDivElement): void {
@@ -1074,9 +1186,12 @@ function startApp(target: HTMLDivElement): void {
       image.naturalHeight * transform.scale,
     );
     for (const region of state.regions) {
+      const polygon = state.refinement?.regionId === region.region_id
+        ? state.refinement.polygon
+        : region.polygon_norm;
       drawPolygon(
         context,
-        region.polygon_norm,
+        polygon,
         transform,
         image,
         region.region_id === state.selectedRegionId ? "#b45309" : "#0e7490",
@@ -1085,6 +1200,9 @@ function startApp(target: HTMLDivElement): void {
     }
     if (state.drawing) {
       drawPolygon(context, state.drawing.points, transform, image, "#c2410c", true);
+    }
+    if (state.refinement) {
+      drawRefinementOverlay(context, state.refinement, transform, image, state.crosshair);
     }
   };
 
@@ -1104,14 +1222,17 @@ function startApp(target: HTMLDivElement): void {
         Boolean(state.labelDraft),
       );
       const crosshair = canvas.parentElement?.querySelector<HTMLElement>("[data-drawing-crosshair]");
-      if (!crosshair) return;
+      if (!crosshair) {
+        if (state.refinement) draw(canvas);
+        return;
+      }
       crosshair.classList.toggle("visible", visible);
       crosshair.dataset.drawingCrosshair = visible ? "visible" : "hidden";
       crosshair.style.setProperty("--crosshair-x", `${Math.round(state.crosshair.x)}px`);
       crosshair.style.setProperty("--crosshair-y", `${Math.round(state.crosshair.y)}px`);
     };
     const recordMousePosition = (event: PointerEvent): void => {
-      if (event.pointerType !== "mouse") return;
+      if (event.pointerType !== "mouse" && !state.refinement) return;
       const pointer = canvasPoint(event, canvas);
       state.crosshair = {
         pointerInCanvas: pointer.x >= 0 && pointer.y >= 0 && pointer.x <= canvas.clientWidth && pointer.y <= canvas.clientHeight,
@@ -1122,7 +1243,7 @@ function startApp(target: HTMLDivElement): void {
     };
     canvas.addEventListener("pointerenter", recordMousePosition);
     canvas.addEventListener("pointerleave", (event) => {
-      if (event.pointerType !== "mouse") return;
+      if (event.pointerType !== "mouse" && !state.refinement) return;
       state.crosshair.pointerInCanvas = false;
       updateCrosshair();
     });
@@ -1131,6 +1252,23 @@ function startApp(target: HTMLDivElement): void {
       const image = state.image;
       const asset = selectedAsset(state);
       if (!image || !asset) return;
+      if (state.refinement) {
+        if (event.button !== 0 || state.refinement.saving) return;
+        const point = normalizedFromPointer(canvasPoint(event, canvas), fitTransform(canvas, image, state.view), image);
+        if (!point) {
+          message("请在图片范围内开始精修。", "error");
+          render();
+          return;
+        }
+        state.refinement.stroke = {
+          pointerId: event.pointerId,
+          mode: pointInPolygonNorm(point, state.refinement.polygon) ? "subtract" : "add",
+          points: [point],
+        };
+        canvas.setPointerCapture(event.pointerId);
+        draw(canvas);
+        return;
+      }
       if (event.button === 1 || event.button === 2 || state.panMode) {
         panOrigin = canvasPoint(event, canvas);
         canvas.setPointerCapture(event.pointerId);
@@ -1172,6 +1310,22 @@ function startApp(target: HTMLDivElement): void {
         draw(canvas);
         return;
       }
+      if (state.refinement?.stroke) {
+        if (state.refinement.stroke.pointerId !== event.pointerId) return;
+        if (!primaryDrawingButtonIsPressed(event.buttons)) {
+          state.refinement.stroke = null;
+          draw(canvas);
+          return;
+        }
+        const point = normalizedFromPointer(pointer, fitTransform(canvas, image, state.view), image);
+        if (!point) return;
+        const last = state.refinement.stroke.points.at(-1);
+        if (!last || last.x !== point.x || last.y !== point.y) {
+          state.refinement.stroke.points.push(point);
+          draw(canvas);
+        }
+        return;
+      }
       if (!state.drawing) return;
       if (!primaryDrawingButtonIsPressed(event.buttons)) {
         state.drawing = null;
@@ -1211,6 +1365,12 @@ function startApp(target: HTMLDivElement): void {
         draw(canvas);
       }
     });
+    const cancelRefinementStroke = (event: PointerEvent): boolean => {
+      if (!state.refinement?.stroke || state.refinement.stroke.pointerId !== event.pointerId) return false;
+      state.refinement.stroke = null;
+      draw(canvas);
+      return true;
+    };
     const stopPointer = (event: PointerEvent) => {
       panOrigin = null;
       state.crosshair = clearCrosshairPointerState(state.crosshair);
@@ -1223,13 +1383,53 @@ function startApp(target: HTMLDivElement): void {
       }
       if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     };
-    canvas.addEventListener("pointerup", stopPointer);
-    canvas.addEventListener("pointercancel", stopPointer);
-    canvas.addEventListener("lostpointercapture", stopPointer);
+    canvas.addEventListener("pointerup", (event) => {
+      const refinement = state.refinement;
+      const stroke = refinement?.stroke;
+      const image = state.image;
+      if (!refinement || !stroke || stroke.pointerId !== event.pointerId || !image) {
+        stopPointer(event);
+        return;
+      }
+      const finalPoint = normalizedFromPointer(
+        canvasPoint(event, canvas),
+        fitTransform(canvas, image, state.view),
+        image,
+      );
+      const lastPoint = stroke.points.at(-1);
+      if (finalPoint && (!lastPoint || lastPoint.x !== finalPoint.x || lastPoint.y !== finalPoint.y)) {
+        stroke.points.push(finalPoint);
+      }
+      const result = refinePolygonWithStroke(
+        refinement.polygon,
+        image.naturalWidth,
+        image.naturalHeight,
+        stroke.points,
+        refinement.brushDiameterPx,
+      );
+      refinement.stroke = null;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      if (!result.ok) {
+        message(refinementFailureMessage(result.reason), "error");
+        render();
+        return;
+      }
+      refinement.history.push(structuredClone(refinement.polygon));
+      refinement.polygon = result.polygon;
+      message(result.mode === "add" ? "已加入一笔外扩修正。" : "已加入一笔内擦修正。", "success");
+      render();
+    });
+    canvas.addEventListener("pointercancel", (event) => {
+      if (!cancelRefinementStroke(event)) stopPointer(event);
+    });
+    canvas.addEventListener("lostpointercapture", (event) => {
+      if (!cancelRefinementStroke(event)) stopPointer(event);
+    });
     canvas.addEventListener("wheel", (event) => {
       const image = state.image;
       if (!image) return;
       event.preventDefault();
+      if (state.refinement) return;
       const pointer = canvasPoint(event, canvas);
       const before = normalizedFromPointer(pointer, fitTransform(canvas, image, state.view), image);
       if (!before) return;
@@ -1355,9 +1555,91 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelectorAll<HTMLButtonElement>("[data-region-id]").forEach((button) => {
       button.addEventListener("click", () => {
+        if (state.refinement) return;
         state.selectedRegionId = button.dataset.regionId ?? null;
         render();
       });
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.addEventListener("click", (event) => {
+      const currentCase = selectedCase(state);
+      const asset = selectedAsset(state);
+      const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
+      const region = state.regions.find((item) => item.region_id === regionId) ?? null;
+      const imageReady = Boolean(state.image && state.imageAssetId === asset?.asset_id);
+      const representative = Boolean(asset && state.representativeIds.has(asset.asset_id));
+      if (!currentCase || !asset || !region || !canStartRefinement(region, imageReady, representative)) {
+        message("请先选择当前代表图中的已保存区域。", "error");
+        render();
+        return;
+      }
+      state.panMode = false;
+      state.crosshair.pointerInCanvas = false;
+      state.refinement = {
+        regionId: region.region_id,
+        originalPolygon: structuredClone(region.polygon_norm),
+        polygon: structuredClone(region.polygon_norm),
+        history: [],
+        brushDiameterPx: BRUSH_DIAMETERS[1],
+        stroke: null,
+        saving: false,
+      };
+      message("已进入边界精修。绿色表示外扩，红色表示内擦。", "info");
+      render();
+    });
+    target.querySelector<HTMLSelectElement>('[data-action="refinement-brush"]')?.addEventListener("change", (event) => {
+      if (!state.refinement || state.refinement.saving) return;
+      const diameter = Number((event.currentTarget as HTMLSelectElement).value);
+      if (!BRUSH_DIAMETERS.includes(diameter)) return;
+      state.refinement.brushDiameterPx = diameter;
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="refinement-undo"]')?.addEventListener("click", () => {
+      const refinement = state.refinement;
+      if (!refinement || refinement.stroke || refinement.saving) return;
+      const previous = refinement.history.pop();
+      if (!previous) return;
+      refinement.polygon = previous;
+      message("已撤销上一步边界修正。", "info");
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="refinement-cancel"]')?.addEventListener("click", () => {
+      if (!state.refinement || state.refinement.saving) return;
+      state.refinement = null;
+      state.crosshair.pointerInCanvas = false;
+      message("已丢弃全部未保存的边界修正。", "info");
+      render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.addEventListener("click", async () => {
+      const refinement = state.refinement;
+      const currentCase = selectedCase(state);
+      const asset = selectedAsset(state);
+      if (!refinement || refinement.history.length === 0 || refinement.stroke || !currentCase || !asset) return;
+      if (!window.confirm("确认保存当前边界修正？保存后将更新该区域的几何边界。")) return;
+      refinement.saving = true;
+      render();
+      try {
+        await api.refineRegionGeometry({
+          case_id: currentCase.case_id,
+          asset_id: asset.asset_id,
+          region_id: refinement.regionId,
+          expected_polygon_norm: refinement.originalPolygon,
+          polygon_norm: refinement.polygon,
+        });
+      } catch (error) {
+        refinement.saving = false;
+        message(formatError(error), "error");
+        render();
+        return;
+      }
+      state.refinement = null;
+      state.crosshair.pointerInCanvas = false;
+      try {
+        await refreshRegions();
+        message("边界修正已保存。", "success");
+      } catch (error) {
+        message(`边界已保存，但区域列表刷新失败：${formatError(error)}`, "error");
+      }
+      render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.addEventListener("click", () => {
       const regionId = target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.dataset.regionId;
@@ -1639,6 +1921,13 @@ function startApp(target: HTMLDivElement): void {
   };
 
   window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.refinement && !state.refinement.saving) {
+      state.refinement = null;
+      state.crosshair.pointerInCanvas = false;
+      message("已丢弃全部未保存的边界修正。", "info");
+      render();
+      return;
+    }
     if (event.key === "Escape" && state.labelDraft) {
       state.labelDraft = null;
       state.labelValues = {};
@@ -1650,6 +1939,7 @@ function startApp(target: HTMLDivElement): void {
       return;
     }
     if (!shouldHandleMediaNavigation(event)) return;
+    if (state.refinement) return;
     const currentCase = selectedCase(state);
     if (!currentCase) return;
     if (event.key === "ArrowLeft" && state.assetIndex > 0) {

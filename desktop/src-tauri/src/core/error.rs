@@ -8,6 +8,8 @@ pub enum CoreError {
     Filesystem,
     #[error("database operation failed")]
     Database,
+    #[error("database schema version is unsupported")]
+    DatabaseSchemaUnsupported,
     #[error("selected root must contain at least one valid campus directory")]
     InvalidCampusLayout,
     #[error("source root and project work root must not overlap")]
@@ -58,6 +60,8 @@ pub enum CoreError {
     RegionNotFound,
     #[error("requested region is no longer active")]
     RegionNotActive,
+    #[error("region geometry changed before this refinement could be saved")]
+    RegionGeometryConflict,
     #[error("requested asset is not a source video")]
     NotVideoAsset,
     #[error("captured frame data is invalid")]

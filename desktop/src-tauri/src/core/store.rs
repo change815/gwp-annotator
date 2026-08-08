@@ -35,7 +35,7 @@ const PROJECT_SESSION_FILE: &str = "session/project-session.json";
 const BACKUP_FORMAT: &str = "gwp-case-backup";
 const INSTALLATION_STORAGE_PARENT_DIRECTORY: &str = "GWP Annotator Data";
 const INSTALLATION_WORK_ROOT_DIRECTORY: &str = "PROJECT-LOCAL";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const INTERSECTION_EPSILON: f64 = 1e-12;
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -553,6 +553,84 @@ impl Store {
             Some(&labels_json(&before_labels)?),
             Some(&polygon_json),
             Some(&labels_json(labels)?),
+            updated_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn refine_region_geometry(
+        &self,
+        region_id: &str,
+        asset_id: &str,
+        expected_polygon_norm: &[PointNorm],
+        polygon_norm: &[PointNorm],
+    ) -> CoreResult<()> {
+        if !is_opaque_id(region_id, "REGION-") || !is_opaque_id(asset_id, "ASSET-") {
+            return Err(CoreError::InvalidOpaqueId);
+        }
+        validate_polygon(polygon_norm)?;
+        let new_polygon_json =
+            serde_json::to_string(polygon_norm).map_err(|_| CoreError::InvalidPolygon)?;
+
+        self.verify_database_artifacts_safe()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored_asset_id, current_polygon_json, status) = transaction
+            .query_row(
+                "SELECT asset_id, polygon_norm_json, status FROM regions WHERE region_id = ?1",
+                params![region_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(CoreError::RegionNotFound)?;
+        if status != "active" {
+            return Err(CoreError::RegionNotActive);
+        }
+        if stored_asset_id != asset_id {
+            return Err(CoreError::UnknownSessionItem);
+        }
+        let is_representative: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM representative_assets WHERE asset_id = ?1",
+                params![asset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if is_representative.is_none() {
+            return Err(CoreError::AssetNotRepresentative);
+        }
+        let current_polygon: Vec<PointNorm> =
+            serde_json::from_str(&current_polygon_json).map_err(|_| CoreError::Database)?;
+        if current_polygon != expected_polygon_norm {
+            return Err(CoreError::RegionGeometryConflict);
+        }
+
+        let labels = read_region_labels(&transaction, region_id)?;
+        let labels_json = labels_json(&labels)?;
+        let updated_at = now_millis();
+        transaction.execute(
+            "UPDATE regions SET polygon_norm_json = ?1, updated_at = ?2 WHERE region_id = ?3",
+            params![new_polygon_json, updated_at, region_id],
+        )?;
+        insert_region_operation(
+            &transaction,
+            "geometry_refined",
+            region_id,
+            None,
+            Some(&current_polygon_json),
+            Some(&labels_json),
+            Some(&new_polygon_json),
+            Some(&labels_json),
             updated_at,
         )?;
         transaction.commit()?;
@@ -2082,15 +2160,22 @@ fn configure_and_migrate(connection: &mut Connection) -> CoreResult<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
 
     let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(CoreError::DatabaseSchemaUnsupported);
+    }
     if version < 1 && !table_exists(connection, "cases")? {
-        create_v3_schema(connection)?;
+        create_v4_schema(connection)?;
         return Ok(());
     } else if version < 2 {
         migrate_legacy_cases_to_v2(connection)?;
         version = 2;
     }
-    if version < SCHEMA_VERSION {
+    if version < 3 {
         migrate_v2_to_v3(connection)?;
+        version = 3;
+    }
+    if version < SCHEMA_VERSION {
+        migrate_v3_to_v4(connection)?;
     } else {
         // A partially upgraded directory may retain this named v1 trigger even after its
         // user_version changed. It is harmless to remove and keeps reopening idempotent.
@@ -2111,7 +2196,7 @@ fn table_exists(connection: &Connection, table: &str) -> CoreResult<bool> {
         .is_some())
 }
 
-fn create_v3_schema(connection: &mut Connection) -> CoreResult<()> {
+fn create_v4_schema(connection: &mut Connection) -> CoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "
@@ -2162,7 +2247,7 @@ fn create_v3_schema(connection: &mut Connection) -> CoreResult<()> {
         );
         CREATE TABLE IF NOT EXISTS region_operations (
             operation_id INTEGER PRIMARY KEY,
-            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced')),
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced', 'geometry_refined')),
             subject_region_id TEXT NOT NULL REFERENCES regions(region_id),
             related_region_id TEXT REFERENCES regions(region_id),
             occurred_at INTEGER NOT NULL,
@@ -2216,6 +2301,52 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> CoreResult<()> {
         PRAGMA user_version = 3;
         ",
     )?;
+    transaction.commit()?;
+    verify_foreign_keys(connection)
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> CoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        CREATE TABLE region_operations_v4 (
+            operation_id INTEGER PRIMARY KEY,
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('created', 'labels_updated', 'deleted', 'replaced', 'geometry_refined')),
+            subject_region_id TEXT NOT NULL REFERENCES regions(region_id),
+            related_region_id TEXT REFERENCES regions(region_id),
+            occurred_at INTEGER NOT NULL,
+            before_polygon_norm_json TEXT,
+            before_labels_json TEXT,
+            after_polygon_norm_json TEXT,
+            after_labels_json TEXT
+        );
+        INSERT INTO region_operations_v4 (
+            operation_id,
+            operation_kind,
+            subject_region_id,
+            related_region_id,
+            occurred_at,
+            before_polygon_norm_json,
+            before_labels_json,
+            after_polygon_norm_json,
+            after_labels_json
+        )
+        SELECT
+            operation_id,
+            operation_kind,
+            subject_region_id,
+            related_region_id,
+            occurred_at,
+            before_polygon_norm_json,
+            before_labels_json,
+            after_polygon_norm_json,
+            after_labels_json
+        FROM region_operations;
+        DROP TABLE region_operations;
+        ALTER TABLE region_operations_v4 RENAME TO region_operations;
+        ",
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     verify_foreign_keys(connection)
 }

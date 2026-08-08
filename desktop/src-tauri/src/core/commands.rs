@@ -6,8 +6,9 @@ use tauri::State;
 use crate::core::error::CoreError;
 use crate::core::scan::{ImageAssetData, LocalDisplayScan, PublicScan};
 use crate::core::service::{
-    CaptureFrameRequest, ProjectService, ReplaceRegionRequest, RepresentativeSelection,
-    SaveRegionRequest, StartupRestore, TemplateDescriptor, UpdateRegionLabelsRequest,
+    CaptureFrameRequest, ProjectService, RefineRegionGeometryRequest, ReplaceRegionRequest,
+    RepresentativeSelection, SaveRegionRequest, StartupRestore, TemplateDescriptor,
+    UpdateRegionLabelsRequest,
 };
 use crate::core::store::{BackupResult, CapturedFrame, SavedRegion};
 
@@ -167,6 +168,16 @@ pub fn update_region_labels(
         .map_err(Into::into)
 }
 
+pub fn refine_region_geometry(
+    request: RefineRegionGeometryRequest,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .refine_region_geometry(request)
+        .map_err(Into::into)
+}
+
 pub fn delete_region(
     case_id: String,
     asset_id: String,
@@ -289,6 +300,7 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::RepresentativeHasRegions => "REPRESENTATIVE_HAS_REGIONS",
         CoreError::RegionNotFound => "REGION_NOT_FOUND",
         CoreError::RegionNotActive => "REGION_NOT_ACTIVE",
+        CoreError::RegionGeometryConflict => "REGION_GEOMETRY_CONFLICT",
         CoreError::NotVideoAsset => "NOT_VIDEO_ASSET",
         CoreError::InvalidCapture => "INVALID_CAPTURE",
         CoreError::InvalidAssetDimensions => "INVALID_ASSET_DIMENSIONS",
@@ -297,6 +309,7 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::InvalidSecret => "INVALID_SECRET",
         CoreError::Filesystem => "FILESYSTEM_ERROR",
         CoreError::Database => "DATABASE_ERROR",
+        CoreError::DatabaseSchemaUnsupported => "DATABASE_SCHEMA_UNSUPPORTED",
         CoreError::StateUnavailable => "STATE_UNAVAILABLE",
         CoreError::FaultInjected => "FAULT_INJECTED",
     }
