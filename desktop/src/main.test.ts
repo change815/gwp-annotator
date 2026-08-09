@@ -1519,6 +1519,18 @@ describe("local shell", () => {
     expect(chooseAndScanRoot).not.toHaveBeenCalled();
   });
 
+  it("explains that a failed backup does not discard regions already saved with OK", async () => {
+    const completeCaseAndBackup = vi.fn().mockRejectedValue({ code: "FILESYSTEM_ERROR" });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ completeCaseAndBackup }));
+
+    document.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.click();
+
+    await vi.waitFor(() => expect(completeCaseAndBackup).toHaveBeenCalledWith("CASE-SYNTHETIC"));
+    expect(document.body.textContent).toContain("备份文件写入失败");
+    expect(document.body.textContent).toContain("已点击 OK 保存的标注仍保留在本地数据库中");
+  });
+
   it("cancels an unfinished replacement lasso with a right click without leaking its target", async () => {
     const saveConfirmedRegion = vi.fn().mockResolvedValue(undefined);
     const replaceRegion = vi.fn().mockResolvedValue(undefined);

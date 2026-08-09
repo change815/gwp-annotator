@@ -1023,10 +1023,12 @@ impl Store {
         destination.close().map_err(|_| CoreError::Database)?;
         drop(connection);
 
-        // SQLite has closed its writer before this explicit file flush. The directory flush at
-        // publication time then makes both the database entry and its contents durable.
+        // SQLite has closed its writer before this explicit file flush. Windows FlushFileBuffers
+        // requires a handle with write access, even though this step does not modify the snapshot.
+        // The directory publication step then makes both the entry and its contents durable.
         OpenOptions::new()
             .read(true)
+            .write(true)
             .open(&snapshot_paths.main)?
             .sync_all()?;
 

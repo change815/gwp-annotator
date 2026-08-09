@@ -1731,7 +1731,12 @@ function startApp(target: HTMLDivElement): void {
         const result = await api.completeCaseAndBackup(currentCase.case_id);
         message(`病例已完成并备份（包含 ${result.capture_count} 张截帧）。`, "success");
       } catch (error) {
-        message(formatError(error), "error");
+        message(
+          errorCode(error) === "FILESYSTEM_ERROR"
+            ? "备份文件写入失败。已点击 OK 保存的标注仍保留在本地数据库中；请检查“数据保存位置”的写入权限和磁盘空间后重试。"
+            : formatError(error),
+          "error",
+        );
       }
       state.backupPending = false;
       render();
