@@ -299,6 +299,8 @@ interface RefinementDraft {
   saving: boolean;
 }
 
+type ProjectLoadSource = "startup" | "selection" | "reload";
+
 export interface CrosshairState {
   pointerInCanvas: boolean;
   x: number;
@@ -321,8 +323,10 @@ interface State {
   drawing: DrawingDraft | null;
   labelDraft: RegionDraft | null;
   labelValues: Record<string, LabelValue>;
+  labelSubmitPending: boolean;
   replaceRegionId: string | null;
   editLabels: EditLabelsDraft | null;
+  editLabelSubmitPending: boolean;
   template: LabelTemplate | null;
   templateFileName: string | null;
   templateInstallPending: boolean;
@@ -333,6 +337,7 @@ interface State {
   videoPlaying: boolean;
   capturePending: boolean;
   backupPending: boolean;
+  projectLoadPending: ProjectLoadSource | null;
   crosshair: CrosshairState;
   refinement: RefinementDraft | null;
   message: string;
@@ -355,8 +360,10 @@ const initialState = (): State => ({
   drawing: null,
   labelDraft: null,
   labelValues: {},
+  labelSubmitPending: false,
   replaceRegionId: null,
   editLabels: null,
+  editLabelSubmitPending: false,
   template: null,
   templateFileName: null,
   templateInstallPending: false,
@@ -367,6 +374,7 @@ const initialState = (): State => ({
   videoPlaying: false,
   capturePending: false,
   backupPending: false,
+  projectLoadPending: null,
   crosshair: { pointerInCanvas: false, x: 0, y: 0 },
   refinement: null,
   message: "请选择本地数据根目录。",
@@ -779,8 +787,9 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
-function controlMarkup(field: TemplateField, value: LabelValue | undefined): string {
+function controlMarkup(field: TemplateField, value: LabelValue | undefined, disabled = false): string {
   const required = field.required ? " <span class=\"required\">必填</span>" : "";
+  const disabledAttribute = disabled ? "disabled" : "";
   if (field.control === "dropdown") {
     const options = [
       `<option value="">请选择</option>`,
@@ -789,13 +798,13 @@ function controlMarkup(field: TemplateField, value: LabelValue | undefined): str
           `<option value="${escapeHtml(option.id)}" ${value === option.id ? "selected" : ""}>${escapeHtml(option.label)}</option>`,
       ),
     ].join("");
-    return `<label class="field-label">${escapeHtml(field.label)}${required}<select data-label-field="${escapeHtml(field.id)}" aria-label="${escapeHtml(field.label)}">${options}</select></label>`;
+    return `<label class="field-label">${escapeHtml(field.label)}${required}<select data-label-field="${escapeHtml(field.id)}" aria-label="${escapeHtml(field.label)}" ${disabledAttribute}>${options}</select></label>`;
   }
   if (field.control === "single_select") {
     return `<fieldset class="field-set"><legend>${escapeHtml(field.label)}${required}</legend>${field.options
       .map(
         (option) =>
-          `<label><input type="radio" name="${escapeHtml(field.id)}" data-label-field="${escapeHtml(field.id)}" value="${escapeHtml(option.id)}" ${value === option.id ? "checked" : ""}>${escapeHtml(option.label)}</label>`,
+          `<label><input type="radio" name="${escapeHtml(field.id)}" data-label-field="${escapeHtml(field.id)}" value="${escapeHtml(option.id)}" ${value === option.id ? "checked" : ""} ${disabledAttribute}>${escapeHtml(option.label)}</label>`,
       )
       .join("")}</fieldset>`;
   }
@@ -803,9 +812,21 @@ function controlMarkup(field: TemplateField, value: LabelValue | undefined): str
   return `<fieldset class="field-set"><legend>${escapeHtml(field.label)}${required}</legend>${field.options
     .map(
       (option) =>
-        `<label><input type="checkbox" data-label-field="${escapeHtml(field.id)}" value="${escapeHtml(option.id)}" ${selected.includes(option.id) ? "checked" : ""}>${escapeHtml(option.label)}</label>`,
+        `<label><input type="checkbox" data-label-field="${escapeHtml(field.id)}" value="${escapeHtml(option.id)}" ${selected.includes(option.id) ? "checked" : ""} ${disabledAttribute}>${escapeHtml(option.label)}</label>`,
     )
     .join("")}</fieldset>`;
+}
+
+function annotationOperationIsLocked(state: State): boolean {
+  return Boolean(
+    state.drawing
+    || state.labelDraft
+    || state.labelSubmitPending
+    || state.replaceRegionId
+    || state.editLabels
+    || state.editLabelSubmitPending
+    || state.refinement,
+  );
 }
 
 function mountMarkup(state: State): string {
@@ -821,7 +842,11 @@ function mountMarkup(state: State): string {
   const refining = Boolean(state.refinement);
   const drawing = Boolean(state.drawing);
   const geometryDraftActive = refining || drawing;
-  const interactionLocked = geometryDraftActive ? "disabled" : "";
+  const annotationOperationLocked = annotationOperationIsLocked(state);
+  const projectLoadPending = Boolean(state.projectLoadPending);
+  const interactionLocked = annotationOperationLocked || projectLoadPending ? "disabled" : "";
+  const chooseRootLocked = annotationOperationLocked
+    || (projectLoadPending && state.projectLoadPending !== "startup");
   const crosshairVisible = shouldShowCustomCrosshair(
     isRepresentative,
     templateReady,
@@ -831,7 +856,7 @@ function mountMarkup(state: State): string {
     Boolean(state.labelDraft),
   );
   const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft && !refining;
-  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || geometryDraftActive;
+  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || geometryDraftActive || projectLoadPending;
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
@@ -840,7 +865,8 @@ function mountMarkup(state: State): string {
       <header class="app-header">
         <div><h1 id="app-title">GWP Annotator</h1><p>本地医生标注工作台</p></div>
         <div class="header-actions">
-          <button type="button" data-action="choose-root" ${interactionLocked}>更换数据目录</button>
+          <button type="button" data-action="choose-root" ${chooseRootLocked ? "disabled" : ""}>${state.projectLoadPending === "selection" ? "正在选择数据目录…" : "更换数据目录"}</button>
+          <button type="button" data-action="reload-project" ${interactionLocked}>${state.projectLoadPending === "reload" ? "正在重新加载…" : state.projectLoadPending === "startup" ? "正在恢复项目…" : "重新加载项目数据"}</button>
           <button type="button" data-action="forget-position" ${interactionLocked}>忘记上次位置</button>
           <button type="button" data-action="storage-location" aria-expanded="${state.storageLocationVisible}">数据保存位置</button>
           <span class="offline-status" data-testid="offline-status">本地离线</span>
@@ -855,7 +881,7 @@ function mountMarkup(state: State): string {
       </section>
       <div class="workspace-grid">
         <aside class="case-sidebar" aria-label="院区与病例">
-          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || geometryDraftActive ? "disabled" : ""}>
+          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>
             ${state.campuses
               .map(
                 (item) =>
@@ -876,11 +902,11 @@ function mountMarkup(state: State): string {
           <div class="media-toolbar">
             <div><strong>${currentCase ? escapeHtml(currentCase.displayLabel) : "未选择病例"}</strong><span>${asset ? `${currentIndex} / ${media.length}` : ""}</span></div>
             <div class="media-actions">
-              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || geometryDraftActive ? "disabled" : ""}>上一张</button>
-              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || geometryDraftActive ? "disabled" : ""}>下一张</button>
-              <button type="button" data-action="fit" ${isImage && !geometryDraftActive ? "" : "disabled"}>适配</button>
-              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage && !geometryDraftActive ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
-              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending && !geometryDraftActive ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
+              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>上一张</button>
+              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>下一张</button>
+              <button type="button" data-action="fit" ${isImage && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>适配</button>
+              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
+              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
             </div>
             ${state.refinement ? `<div class="refinement-toolbar" role="toolbar" aria-label="边界精修">
               <strong>边界精修</strong>
@@ -900,7 +926,7 @@ function mountMarkup(state: State): string {
             ${isImage && !isRepresentative ? `<div class="canvas-hint">请先将当前图片选择为代表图，才可圈选。</div>` : ""}
             ${isImage && isRepresentative && !state.template ? `<div class="canvas-hint">请先加载标签模板，才可保存圈选。</div>` : ""}
             ${isImage && annotationReady && !geometryDraftActive ? `<div class="canvas-hint ready">单击左键开始圈选。</div>` : ""}
-            ${isImage && state.drawing ? `<div class="canvas-hint ready">移动鼠标勾画，回到起点附近自动闭合；Esc 取消。</div>` : ""}
+            ${isImage && state.drawing ? `<div class="canvas-hint ready">移动鼠标勾画，回到起点附近自动闭合；右键或 Esc 取消。</div>` : ""}
             ${isImage && state.refinement ? `<div class="canvas-hint refinement-hint">起点在区域内为内擦，区域外为外扩；一笔内模式锁定。</div>` : ""}
           </div>
           <div class="media-strip" aria-label="当前病例媒体序列">
@@ -917,7 +943,7 @@ function mountMarkup(state: State): string {
           </div>
         </section>
         <aside class="region-sidebar" aria-label="区域列表">
-          <div class="region-sidebar-header"><h2>已保存区域</h2><button type="button" data-action="reload-regions" ${isImage && imageReady && !geometryDraftActive ? "" : "disabled"}>重新加载勾画</button></div>
+          <div class="region-sidebar-header"><h2>已保存区域</h2><button type="button" data-action="reload-regions" ${isImage && imageReady && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>重新加载当前图片</button></div>
           <p>${asset && isImage ? `${state.regions.length} 个区域` : "选择图片后查看"}</p>
           <div class="region-list">
             ${state.regions
@@ -933,15 +959,15 @@ function mountMarkup(state: State): string {
       ${state.labelDraft && state.template ? `
         <div class="modal-backdrop" data-action="cancel-draft">
           <section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="label-dialog-title" data-label-dialog tabindex="-1">
-            <header><h2 id="label-dialog-title">填写区域标签</h2><button type="button" data-action="cancel-draft" aria-label="取消">取消</button></header>
+            <header><h2 id="label-dialog-title">填写区域标签</h2><button type="button" data-action="cancel-draft" aria-label="取消" ${state.labelSubmitPending ? "disabled" : ""}>取消</button></header>
             <p>${state.replaceRegionId ? "将替换已保存区域；确认后旧区域保留操作记录但不再用于训练。" : "区域尚未保存。完成必填项后才可确认。"}</p>
             <form data-label-form>
-              ${state.template.fields.map((field) => controlMarkup(field, state.labelValues[field.id])).join("")}
-              <div class="dialog-actions"><button type="button" data-action="cancel-draft">取消</button><button type="submit" ${labelsMeetRequiredFields(state.template.fields, state.labelValues) ? "" : "disabled"}>OK</button></div>
+              ${state.template.fields.map((field) => controlMarkup(field, state.labelValues[field.id], state.labelSubmitPending)).join("")}
+              <div class="dialog-actions"><button type="button" data-action="cancel-draft" ${state.labelSubmitPending ? "disabled" : ""}>取消</button><button type="submit" ${state.labelSubmitPending || !labelsMeetRequiredFields(state.template.fields, state.labelValues) ? "disabled" : ""}>${state.labelSubmitPending ? "正在保存…" : "OK"}</button></div>
             </form>
           </section>
         </div>` : ""}
-      ${state.editLabels ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit">取消</button></header><p>使用该区域原来的 ${escapeHtml(state.editLabels.template.template_id)} v${state.editLabels.template.version} 模板；确认后保留修正记录。</p><form data-edit-label-form>${state.editLabels.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id])).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit">取消</button><button type="submit" ${labelsMeetRequiredFields(state.editLabels.template.fields, state.editLabels.values) ? "" : "disabled"}>确认修改</button></div></form></section></div>` : ""}
+      ${state.editLabels ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button></header><p>使用该区域原来的 ${escapeHtml(state.editLabels.template.template_id)} v${state.editLabels.template.version} 模板；确认后保留修正记录。</p><form data-edit-label-form>${state.editLabels.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id], state.editLabelSubmitPending)).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button><button type="submit" ${state.editLabelSubmitPending || !labelsMeetRequiredFields(state.editLabels.template.fields, state.editLabels.values) ? "disabled" : ""}>${state.editLabelSubmitPending ? "正在保存…" : "确认修改"}</button></div></form></section></div>` : ""}
     </main>`;
 }
 
@@ -1036,12 +1062,51 @@ function startApp(target: HTMLDivElement): void {
     activeAppKeydownHandler = null;
   }
   const state = initialState();
+  state.projectLoadPending = "startup";
   const api = getApi();
   let panOrigin: PointNorm | null = null;
+  let projectLoadEpoch = 1;
+
+  const isCurrentProjectLoad = (epoch: number | undefined): boolean => {
+    return epoch === undefined || epoch === projectLoadEpoch;
+  };
+
+  const beginProjectLoad = (source: Exclude<ProjectLoadSource, "startup">): number => {
+    projectLoadEpoch += 1;
+    state.projectLoadPending = source;
+    render();
+    return projectLoadEpoch;
+  };
+
+  const finishProjectLoad = (epoch: number): void => {
+    if (!isCurrentProjectLoad(epoch)) return;
+    state.projectLoadPending = null;
+    render();
+  };
 
   const message = (text: string, kind: State["messageKind"] = "info") => {
     state.message = text;
     state.messageKind = kind;
+  };
+
+  const discardUnsavedAnnotation = (): boolean => {
+    if (state.labelSubmitPending) return false;
+    if (!state.drawing && !state.labelDraft && !state.replaceRegionId) return false;
+    const hadGeometry = Boolean(state.drawing || state.labelDraft);
+    state.drawing = null;
+    state.labelDraft = null;
+    state.labelValues = {};
+    state.replaceRegionId = null;
+    state.crosshair.pointerInCanvas = false;
+    message(hadGeometry ? "已丢弃未完成的圈选。" : "已取消重画替换。", "info");
+    return true;
+  };
+
+  const cancelLabelEdit = (): boolean => {
+    if (!state.editLabels || state.editLabelSubmitPending) return false;
+    state.editLabels = null;
+    message("已取消标签修改。", "info");
+    return true;
   };
 
   const reconcileFailedTemplateReplacement = async (replacementError: unknown, fileName: string): Promise<void> => {
@@ -1059,7 +1124,8 @@ function startApp(target: HTMLDivElement): void {
     }
   };
 
-  const refreshRegions = async (): Promise<number> => {
+  const refreshRegions = async (expectedProjectLoadEpoch?: number): Promise<number> => {
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return state.regions.length;
     const currentCase = selectedCase(state);
     const asset = selectedAsset(state);
     if (!currentCase || !asset || asset.media_kind !== "image") {
@@ -1070,6 +1136,7 @@ function startApp(target: HTMLDivElement): void {
     const requestedCaseId = currentCase.case_id;
     const requestedAssetId = asset.asset_id;
     const regions = await api.savedRegionsForAsset(requestedCaseId, requestedAssetId);
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return state.regions.length;
     if (selectedCase(state)?.case_id !== requestedCaseId || selectedAsset(state)?.asset_id !== requestedAssetId) {
       return state.regions.length;
     }
@@ -1080,7 +1147,8 @@ function startApp(target: HTMLDivElement): void {
     return state.regions.length;
   };
 
-  const loadImage = async (): Promise<void> => {
+  const loadImage = async (expectedProjectLoadEpoch?: number): Promise<void> => {
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return;
     const currentCase = selectedCase(state);
     const asset = selectedAsset(state);
     if (!currentCase || !asset || asset.media_kind !== "image") {
@@ -1100,27 +1168,32 @@ function startApp(target: HTMLDivElement): void {
     try {
       const payload = await api.readImageAsset(requestedCase, requestedAsset);
       const image = await imageFromPayload(payload);
+      if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return;
       if (selectedCase(state)?.case_id !== requestedCase || selectedAsset(state)?.asset_id !== requestedAsset) return;
       state.image = image;
       state.imageAssetId = requestedAsset;
       state.imageLoading = false;
       void api.recordImageDimensions(requestedCase, requestedAsset, image.naturalWidth, image.naturalHeight).catch(() => {
-        if (selectedCase(state)?.case_id === requestedCase && selectedAsset(state)?.asset_id === requestedAsset) {
+        if (
+          isCurrentProjectLoad(expectedProjectLoadEpoch)
+          && selectedCase(state)?.case_id === requestedCase
+          && selectedAsset(state)?.asset_id === requestedAsset
+        ) {
           message("图片尺寸未能记录；不影响当前标注。", "info");
           render();
         }
       });
     } catch (error) {
-      if (selectedAsset(state)?.asset_id === requestedAsset) {
+      if (isCurrentProjectLoad(expectedProjectLoadEpoch) && selectedAsset(state)?.asset_id === requestedAsset) {
         state.imageLoading = false;
         message(formatError(error), "error");
       }
     }
-    render();
+    if (isCurrentProjectLoad(expectedProjectLoadEpoch)) render();
   };
 
   const selectCase = async (caseId: string): Promise<void> => {
-    if (state.drawing || state.refinement) return;
+    if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
     const previousCase = selectedCase(state);
     const previousAsset = selectedAsset(state);
     if (previousCase && previousAsset) saveViewport(previousCase.case_id, previousAsset.asset_id, state.view);
@@ -1145,7 +1218,7 @@ function startApp(target: HTMLDivElement): void {
   };
 
   const selectAsset = async (index: number): Promise<void> => {
-    if (state.drawing || state.refinement) return;
+    if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
     const currentCase = selectedCase(state);
     if (!currentCase || index < 0 || index >= currentCase.assets.length) return;
     const previousAsset = selectedAsset(state);
@@ -1162,28 +1235,123 @@ function startApp(target: HTMLDivElement): void {
     await api.saveLastPosition(currentCase.case_id, currentCase.assets[index].asset_id);
   };
 
-  const applyScan = async (scan: PublicScan, preferredCaseId?: string | null, preferredAssetId?: string | null): Promise<void> => {
+  const applyScan = async (
+    scan: PublicScan,
+    preferredCaseId?: string | null,
+    preferredAssetId?: string | null,
+    expectedProjectLoadEpoch?: number,
+  ): Promise<boolean> => {
     const local = await api.currentLocalDisplayScan();
-    state.campuses = mergeScans(scan, local);
-    const preferredCampus = state.campuses.find((campus) => campus.cases.some((item) => item.case_id === preferredCaseId));
-    const campus = preferredCampus ?? state.campuses[0];
-    state.campusCode = campus?.campusCode ?? null;
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+    const campuses = mergeScans(scan, local);
+    const preferredCampus = campuses.find((campus) => campus.cases.some((item) => item.case_id === preferredCaseId));
+    const campus = preferredCampus ?? campuses[0];
     const activeCase = campus?.cases.find((item) => item.case_id === preferredCaseId) ?? campus?.cases[0];
+    const representativeIds = activeCase
+      ? await api.representativeAssetIds(activeCase.case_id)
+      : [];
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+
+    state.campuses = campuses;
+    state.campusCode = campus?.campusCode ?? null;
     if (!activeCase) {
+      state.caseId = null;
+      state.assetIndex = 0;
+      state.representativeIds = new Set();
+      state.regions = [];
+      state.selectedRegionId = null;
+      state.image = null;
+      state.imageAssetId = null;
+      state.imageLoading = false;
       render();
-      return;
+      return true;
     }
     state.caseId = activeCase.case_id;
     state.assetIndex = Math.max(0, activeCase.assets.findIndex((asset) => asset.asset_id === preferredAssetId));
     const restoredAsset = activeCase.assets[state.assetIndex];
     state.view = restoredAsset ? loadSavedViewport(activeCase.case_id, restoredAsset.asset_id) ?? { zoom: 1, panX: 0, panY: 0 } : { zoom: 1, panX: 0, panY: 0 };
-    state.representativeIds = new Set(await api.representativeAssetIds(activeCase.case_id));
+    state.representativeIds = new Set(representativeIds);
     state.regions = [];
     state.selectedRegionId = null;
-    await refreshRegions();
-    await loadImage();
-    const activeAsset = selectedAsset(state);
-    if (activeAsset) await api.saveLastPosition(activeCase.case_id, activeAsset.asset_id);
+    await refreshRegions(expectedProjectLoadEpoch);
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+    await loadImage(expectedProjectLoadEpoch);
+    return isCurrentProjectLoad(expectedProjectLoadEpoch);
+  };
+
+  const currentImageRegionSummary = (): string => {
+    return selectedAsset(state)?.media_kind === "image"
+      ? `当前图片已加载 ${state.regions.length} 个已保存区域。`
+      : "";
+  };
+
+  const applyRestoredProject = async (
+    restored: StartupRestore,
+    fallbackScan: PublicScan | null = null,
+    expectedProjectLoadEpoch?: number,
+  ): Promise<boolean> => {
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+    let template = restored.template?.template ?? null;
+    let templateFileName = restored.template ? "label-template-v1.toml" : null;
+
+    // A root picker has already selected the backend root. Retain the legacy
+    // template lookup only when a backend restore has no descriptor yet.
+    if (!restored.template && fallbackScan) {
+      const fixedTemplate = await api.currentFixedTemplate();
+      if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+      template = fixedTemplate?.template ?? null;
+      templateFileName = fixedTemplate ? "label-template-v1.toml" : null;
+    }
+
+    const scan = restored.scan ?? fallbackScan;
+    if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return false;
+    state.template = template;
+    state.templateFileName = templateFileName;
+    state.labelValues = {};
+    if (!scan) return false;
+    return applyScan(scan, restored.current_case_id, restored.current_asset_id, expectedProjectLoadEpoch);
+  };
+
+  const announceProjectRestore = (
+    restored: StartupRestore,
+    source: "startup" | "reload" | "selection",
+    applied: boolean,
+  ): void => {
+    const regionSummary = applied ? currentImageRegionSummary() : "";
+    const appendSummary = (text: string): string => `${text}${regionSummary}`;
+    let result: { text: string; kind: State["messageKind"] };
+
+    if (source === "selection" && applied) {
+      result = {
+        text: appendSummary(state.template ? "已加载所选数据目录。" : "已加载所选数据目录，但标签模板不可用；请重新导入对应的 TOML 模板。"),
+        kind: state.template ? "success" : "error",
+      };
+    } else if (source === "reload") {
+      const reloadMessages: Record<RestoreStatus, { text: string; kind: State["messageKind"] }> = {
+        no_session: { text: "尚未选择数据根目录，请先选择。", kind: "info" },
+        restored: { text: appendSummary("项目数据已重新加载。"), kind: "success" },
+        saved_root_unavailable: { text: "上次的数据目录不可用，请重新选择。", kind: "error" },
+        fixed_template_missing: { text: appendSummary("项目数据已重新加载，但标签模板不可用；请重新导入对应的 TOML 模板。"), kind: "error" },
+        fixed_template_checksum_mismatch: { text: appendSummary("项目数据已重新加载，但当前模板校验失败；请联系项目管理员后重新导入。"), kind: "error" },
+        last_media_unavailable: { text: appendSummary("项目数据已重新加载；上次媒体不存在，已打开该病例的首个媒体。"), kind: "info" },
+      };
+      result = reloadMessages[restored.status];
+    } else {
+      const startupMessages: Record<RestoreStatus, { text: string; kind: State["messageKind"] }> = {
+        no_session: { text: "请选择本地数据根目录。", kind: "info" },
+        restored: { text: appendSummary("已恢复上次的数据目录、模板与浏览位置。"), kind: "success" },
+        saved_root_unavailable: { text: "上次的数据目录不可用，请连接磁盘后重新选择。", kind: "error" },
+        fixed_template_missing: { text: appendSummary("已恢复数据目录。当前模板不可用；请重新导入对应的 TOML 模板。"), kind: "error" },
+        fixed_template_checksum_mismatch: { text: appendSummary("当前模板校验失败。请联系项目管理员后重新导入。"), kind: "error" },
+        last_media_unavailable: { text: appendSummary("已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。"), kind: "info" },
+      };
+      result = startupMessages[restored.status];
+    }
+
+    message(
+      templateHasEncodingDamage(state.template) ? LEGACY_TEMPLATE_ENCODING_WARNING : result.text,
+      templateHasEncodingDamage(state.template) ? "error" : result.kind,
+    );
   };
 
   const draw = (canvas: HTMLCanvasElement): void => {
@@ -1233,7 +1401,10 @@ function startApp(target: HTMLDivElement): void {
     const observer = new ResizeObserver(() => draw(canvas));
     observer.observe(canvas);
     draw(canvas);
-    canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    canvas.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      if (discardUnsavedAnnotation()) render();
+    });
     const updateCrosshair = (): void => {
       const asset = selectedAsset(state);
       const visible = shouldShowCustomCrosshair(
@@ -1272,6 +1443,11 @@ function startApp(target: HTMLDivElement): void {
     });
     canvas.addEventListener("pointerdown", (event) => {
       recordMousePosition(event);
+      if (event.button === 2) {
+        event.preventDefault();
+        if (discardUnsavedAnnotation()) render();
+        return;
+      }
       const image = state.image;
       const asset = selectedAsset(state);
       if (!image || !asset) return;
@@ -1293,7 +1469,7 @@ function startApp(target: HTMLDivElement): void {
         return;
       }
       if (state.drawing) return;
-      if (event.button === 1 || event.button === 2 || state.panMode) {
+      if (event.button === 1 || state.panMode) {
         panOrigin = canvasPoint(event, canvas);
         canvas.setPointerCapture(event.pointerId);
         return;
@@ -1457,34 +1633,42 @@ function startApp(target: HTMLDivElement): void {
 
   const bindEvents = (): void => {
     target.querySelector<HTMLButtonElement>('[data-action="choose-root"]')?.addEventListener("click", async () => {
-      if (state.drawing || state.refinement) return;
+      if (
+        annotationOperationIsLocked(state)
+        || (state.projectLoadPending && state.projectLoadPending !== "startup")
+      ) return;
+      const epoch = beginProjectLoad("selection");
       try {
         const scan = await api.chooseAndScanRoot();
+        if (!isCurrentProjectLoad(epoch)) return;
         if (!scan) {
           message("未选择数据根目录。", "info");
-          render();
           return;
         }
-        await applyScan(scan);
-        try {
-          const fixedTemplate = await api.currentFixedTemplate();
-          state.template = fixedTemplate?.template ?? null;
-          state.templateFileName = fixedTemplate ? "label-template-v1.toml" : null;
-        } catch (error) {
-          state.template = null;
-          state.templateFileName = null;
-          throw error;
-        }
-        message(
-          templateHasEncodingDamage(state.template)
-            ? LEGACY_TEMPLATE_ENCODING_WARNING
-            : `已扫描 ${state.campuses.length} 个院区。`,
-          templateHasEncodingDamage(state.template) ? "error" : "success",
-        );
-        render();
+        const restored = await api.restoreProjectSession();
+        if (!isCurrentProjectLoad(epoch)) return;
+        const applied = await applyRestoredProject(restored, scan, epoch);
+        if (!isCurrentProjectLoad(epoch)) return;
+        announceProjectRestore(restored, "selection", applied);
       } catch (error) {
-        message(formatError(error), "error");
-        render();
+        if (isCurrentProjectLoad(epoch)) message(formatError(error), "error");
+      } finally {
+        finishProjectLoad(epoch);
+      }
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="reload-project"]')?.addEventListener("click", async () => {
+      if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
+      const epoch = beginProjectLoad("reload");
+      try {
+        const restored = await api.restoreProjectSession();
+        if (!isCurrentProjectLoad(epoch)) return;
+        const applied = await applyRestoredProject(restored, null, epoch);
+        if (!isCurrentProjectLoad(epoch)) return;
+        announceProjectRestore(restored, "reload", applied);
+      } catch (error) {
+        if (isCurrentProjectLoad(epoch)) message(`重新加载项目数据失败：${formatError(error)}`, "error");
+      } finally {
+        finishProjectLoad(epoch);
       }
     });
     target.querySelector<HTMLButtonElement>('[data-action="forget-position"]')?.addEventListener("click", async () => {
@@ -1510,6 +1694,7 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLSelectElement>('[data-action="campus"]')?.addEventListener("change", async (event) => {
+      if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
       state.campusCode = (event.currentTarget as HTMLSelectElement).value;
       const firstCase = selectedCampus(state)?.cases[0];
       await selectCase(firstCase?.case_id ?? "");
@@ -1533,7 +1718,13 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.addEventListener("click", async () => {
       const currentCase = selectedCase(state);
-      if (state.drawing || state.refinement || !currentCase || !window.confirm("确认完成本病例并创建可恢复备份？")) return;
+      if (
+        annotationOperationIsLocked(state)
+        || state.projectLoadPending
+        || state.backupPending
+        || !currentCase
+        || !window.confirm("确认完成本病例并创建可恢复备份？")
+      ) return;
       state.backupPending = true;
       render();
       try {
@@ -1546,7 +1737,7 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="reload-regions"]')?.addEventListener("click", async () => {
-      if (state.drawing || state.refinement) return;
+      if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
       try {
         const count = await refreshRegions();
         message(`已从本地数据库重新加载 ${count} 个已保存区域。`, "success");
@@ -1557,7 +1748,7 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelectorAll<HTMLButtonElement>('[data-action="representative"]').forEach((button) => {
       button.addEventListener("click", async () => {
-        if (state.drawing || state.refinement) return;
+        if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
         const currentCase = selectedCase(state);
         const assetId = button.dataset.assetId;
         if (!currentCase || !assetId) return;
@@ -1762,6 +1953,7 @@ function startApp(target: HTMLDivElement): void {
     });
     const form = target.querySelector<HTMLFormElement>("[data-label-form]");
     form?.addEventListener("change", (event) => {
+      if (state.labelSubmitPending) return;
       const input = event.target as HTMLInputElement | HTMLSelectElement;
       const fieldId = input.dataset.labelField;
       if (!fieldId || !state.template) return;
@@ -1779,6 +1971,7 @@ function startApp(target: HTMLDivElement): void {
     });
     form?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (state.labelSubmitPending) return;
       const currentCase = selectedCase(state);
       const asset = selectedAsset(state);
       const draft = state.labelDraft;
@@ -1791,17 +1984,20 @@ function startApp(target: HTMLDivElement): void {
         !templateAllowsNewAnnotations(template) ||
         !labelsMeetRequiredFields(template.fields, state.labelValues)
       ) return;
+      const replaceRegionId = state.replaceRegionId;
+      const request: SaveRegionRequest = {
+        region_id: randomRegionId(),
+        asset_id: asset.asset_id,
+        polygon_norm: structuredClone(draft.points),
+        template_id: template.template_id,
+        template_version: template.version,
+        labels: structuredClone(state.labelValues),
+      };
+      state.labelSubmitPending = true;
+      render();
       try {
-        const request: SaveRegionRequest = {
-          region_id: randomRegionId(),
-          asset_id: asset.asset_id,
-          polygon_norm: draft.points,
-          template_id: template.template_id,
-          template_version: template.version,
-          labels: state.labelValues,
-        };
-        if (state.replaceRegionId) {
-          await api.replaceRegion({ case_id: currentCase.case_id, old_region_id: state.replaceRegionId, replacement: request });
+        if (replaceRegionId) {
+          await api.replaceRegion({ case_id: currentCase.case_id, old_region_id: replaceRegionId, replacement: request });
         } else {
           await api.saveConfirmedRegion(request);
         }
@@ -1813,11 +2009,14 @@ function startApp(target: HTMLDivElement): void {
         message("区域与标签已保存。", "success");
       } catch (error) {
         message(formatError(error), "error");
+      } finally {
+        state.labelSubmitPending = false;
+        render();
       }
-      render();
     });
     const editForm = target.querySelector<HTMLFormElement>("[data-edit-label-form]");
     editForm?.addEventListener("change", (event) => {
+      if (state.editLabelSubmitPending) return;
       const input = event.target as HTMLInputElement | HTMLSelectElement;
       const fieldId = input.dataset.labelField;
       const edit = state.editLabels;
@@ -1828,42 +2027,49 @@ function startApp(target: HTMLDivElement): void {
       edit.values[fieldId] = field.control === "multi_select"
         ? Array.from(editForm.querySelectorAll<HTMLInputElement>(`input[data-label-field="${CSS.escape(fieldId)}"]:checked`), (option) => option.value)
         : input.value;
-      render();
+      const submit = editForm.querySelector<HTMLButtonElement>('button[type="submit"]');
+      if (submit) submit.disabled = !labelsMeetRequiredFields(template.fields, edit.values);
     });
     editForm?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (state.editLabelSubmitPending) return;
       const currentCase = selectedCase(state);
       const asset = selectedAsset(state);
       const edit = state.editLabels;
       const template = edit?.template;
       if (!currentCase || !asset || !edit || !template || !labelsMeetRequiredFields(template.fields, edit.values)) return;
+      const request: UpdateRegionLabelsRequest = {
+        case_id: currentCase.case_id,
+        asset_id: asset.asset_id,
+        region_id: edit.regionId,
+        template_id: template.template_id,
+        template_version: template.version,
+        labels: structuredClone(edit.values),
+      };
+      state.editLabelSubmitPending = true;
+      render();
       try {
-        await api.updateRegionLabels({ case_id: currentCase.case_id, asset_id: asset.asset_id, region_id: edit.regionId, template_id: template.template_id, template_version: template.version, labels: edit.values });
+        await api.updateRegionLabels(request);
         state.editLabels = null;
         await refreshRegions();
         message("区域标签已修改。", "success");
       } catch (error) {
         message(formatError(error), "error");
+      } finally {
+        state.editLabelSubmitPending = false;
+        render();
       }
-      render();
     });
     target.querySelectorAll<HTMLElement>('[data-action="cancel-edit"]').forEach((element) => {
-      element.addEventListener("click", () => {
-        state.editLabels = null;
-        render();
+      element.addEventListener("click", (event) => {
+        if (element.classList.contains("modal-backdrop") && event.target !== element) return;
+        if (cancelLabelEdit()) render();
       });
     });
     target.querySelectorAll<HTMLElement>('[data-action="cancel-draft"]').forEach((element) => {
       element.addEventListener("click", (event) => {
-        if (event.target === element || element.closest(".label-dialog")) {
-          state.labelDraft = null;
-          state.labelValues = {};
-          state.drawing = null;
-          state.replaceRegionId = null;
-          state.crosshair.pointerInCanvas = false;
-          message("已丢弃未保存的圈选。", "info");
-          render();
-        }
+        if (element.classList.contains("modal-backdrop") && event.target !== element) return;
+        if (discardUnsavedAnnotation()) render();
       });
     });
     const video = target.querySelector<HTMLVideoElement>("[data-video-player]");
@@ -1942,6 +2148,8 @@ function startApp(target: HTMLDivElement): void {
     if (canvas) bindCanvas(canvas);
     if (state.labelDraft) {
       target.querySelector<HTMLElement>("[data-label-dialog]")?.focus();
+    } else if (state.editLabels) {
+      target.querySelector<HTMLElement>("[data-edit-dialog]")?.focus();
     }
   };
 
@@ -1958,27 +2166,17 @@ function startApp(target: HTMLDivElement): void {
       render();
       return;
     }
-    if (event.key === "Escape" && state.drawing) {
-      state.drawing = null;
-      state.labelValues = {};
-      state.replaceRegionId = null;
-      state.crosshair.pointerInCanvas = false;
-      message("已丢弃未完成的圈选。", "info");
+    if (event.key === "Escape" && state.editLabels) {
+      cancelLabelEdit();
       render();
       return;
     }
-    if (event.key === "Escape" && state.labelDraft) {
-      state.labelDraft = null;
-      state.labelValues = {};
-      state.drawing = null;
-      state.replaceRegionId = null;
-      state.crosshair.pointerInCanvas = false;
-      message("已丢弃未保存的圈选。", "info");
+    if (event.key === "Escape" && discardUnsavedAnnotation()) {
       render();
       return;
     }
     if (!shouldHandleMediaNavigation(event)) return;
-    if (state.refinement || state.drawing) return;
+    if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
     const currentCase = selectedCase(state);
     if (!currentCase) return;
     if (event.key === "ArrowLeft" && state.assetIndex > 0) {
@@ -1995,34 +2193,18 @@ function startApp(target: HTMLDivElement): void {
 
   render();
   void (async () => {
+    const epoch = projectLoadEpoch;
     try {
       const restored = await api.restoreProjectSession();
-      if (restored.scan) {
-        state.template = restored.template?.template ?? null;
-        await applyScan(restored.scan, restored.current_case_id, restored.current_asset_id);
-      }
-      const restoredRegionSummary = selectedAsset(state)?.media_kind === "image"
-        ? `当前图片已加载 ${state.regions.length} 个已保存区域。`
-        : "";
-      const restoreMessages: Record<RestoreStatus, { text: string; kind: State["messageKind"] }> = {
-        no_session: { text: "请选择本地数据根目录。", kind: "info" },
-        restored: { text: `已恢复上次的数据目录、模板与浏览位置。${restoredRegionSummary}`, kind: "success" },
-        saved_root_unavailable: { text: "上次的数据目录不可用，请连接磁盘后重新选择。", kind: "error" },
-        fixed_template_missing: { text: `已恢复数据目录。${restoredRegionSummary}当前模板不可用；请重新导入对应的 TOML 模板。`, kind: "error" },
-        fixed_template_checksum_mismatch: { text: `当前模板校验失败。${restoredRegionSummary}请联系项目管理员后重新导入。`, kind: "error" },
-        last_media_unavailable: { text: `已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。${restoredRegionSummary}`, kind: "info" },
-      };
-      const restoreMessage = restoreMessages[restored.status];
-      message(
-        templateHasEncodingDamage(state.template)
-          ? LEGACY_TEMPLATE_ENCODING_WARNING
-          : restoreMessage.text,
-        templateHasEncodingDamage(state.template) ? "error" : restoreMessage.kind,
-      );
+      if (!isCurrentProjectLoad(epoch)) return;
+      const applied = restored.scan ? await applyRestoredProject(restored, null, epoch) : false;
+      if (!isCurrentProjectLoad(epoch)) return;
+      announceProjectRestore(restored, "startup", applied);
     } catch (error) {
-      message(formatError(error), "error");
+      if (isCurrentProjectLoad(epoch)) message(formatError(error), "error");
+    } finally {
+      finishProjectLoad(epoch);
     }
-    render();
   })();
 }
 

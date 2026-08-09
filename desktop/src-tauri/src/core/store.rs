@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +32,11 @@ const ACTIVE_TEMPLATE_STORAGE_MARKER_FILE: &str = "templates/active-template-sto
 const TEMPLATE_ARCHIVE_DIRECTORY: &str = "templates/immutable";
 const ACTIVE_TEMPLATE_STORAGE_MARKER: &[u8] = b"gwp-active-template-storage-v1\n";
 const PROJECT_SESSION_FILE: &str = "session/project-session.json";
-const BACKUP_FORMAT: &str = "gwp-case-backup";
+const BACKUP_FORMAT: &str = "gwp-current-backup";
+const BACKUP_VERSION: u32 = 2;
+const BACKUP_DIRECTORY: &str = "backups";
+const BACKUP_STAGING_DIRECTORY: &str = "backups/.current-staging";
+const BACKUP_PREVIOUS_DIRECTORY: &str = "backups/.current-previous";
 const INSTALLATION_STORAGE_PARENT_DIRECTORY: &str = "GWP Annotator Data";
 const INSTALLATION_WORK_ROOT_DIRECTORY: &str = "PROJECT-LOCAL";
 const SCHEMA_VERSION: i64 = 4;
@@ -46,6 +50,9 @@ pub(crate) struct Store {
     work_root: PathBuf,
     database_paths: DatabasePaths,
     connection: Mutex<Connection>,
+    /// Completion snapshots use one fixed staging/current/previous set. Serialize publication so
+    /// two UI actions cannot move the same directory concurrently.
+    backup_publish: Mutex<()>,
 }
 
 /// SQLite uses three sibling paths for this database. Keeping the complete set together makes
@@ -171,11 +178,17 @@ pub struct BackupResult {
     pub capture_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupFault {
+    None,
+    BeforeCurrentPromotion,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct BackupManifest {
     format: String,
     version: u32,
-    case_id: String,
+    completed_case_id: String,
     completed_at: i64,
     template_content_sha256: String,
     capture_asset_ids: Vec<String>,
@@ -227,11 +240,18 @@ impl Store {
         // SQLite may remove an unused rollback journal while switching to WAL. Re-reserve any
         // missing sibling with create_new and validate every final component again afterwards.
         prepare_database_artifacts(&database_paths)?;
-        Ok(Self {
+        let store = Self {
             work_root,
             database_paths,
             connection: Mutex::new(connection),
-        })
+            backup_publish: Mutex::new(()),
+        };
+        // A crash between same-parent renames can leave backup publication state behind. Try to
+        // recover that app-owned pointer on project open, but never let an invalid or inaccessible
+        // backup prevent doctors from opening the live SQLite archive. Explicit backup creation
+        // retries the same recovery and reports any remaining problem to the caller.
+        let _ = store.recover_interrupted_backup_publish();
+        Ok(store)
     }
 
     pub(crate) fn write_project_session(&self, state: &ProjectSessionState) -> CoreResult<()> {
@@ -907,73 +927,575 @@ impl Store {
         )))
     }
 
-    pub(crate) fn complete_case_backup(&self, case_id: &str) -> CoreResult<BackupResult> {
+    pub(crate) fn complete_case_backup_with_fault(
+        &self,
+        case_id: &str,
+        fault: BackupFault,
+    ) -> CoreResult<BackupResult> {
         if !is_opaque_id(case_id, "CASE-") {
             return Err(CoreError::InvalidOpaqueId);
         }
+        let _publication = self
+            .backup_publish
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+
+        // A backup is a recoverable convenience copy. The live project database remains the
+        // only startup and instant-save archive, so this function never reads a backup back into
+        // the primary database.
+        self.recover_interrupted_backup_publish()?;
         let (fixed_template, template_bytes) = self
             .fixed_template_with_contents()?
             .ok_or(CoreError::FixedTemplateMissing)?;
-        let captures = self.captured_frames_for_case(case_id)?;
         let completed_at = now_millis();
-        let backup_name = format!(
-            "backup-{}-{}",
-            completed_at,
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let base = PathBuf::from(format!("backups/{case_id}/{backup_name}"));
-        let database_relative = base.join("annotations.sqlite3");
-        let database_path = self.reserve_relative_file(&database_relative)?;
+        let staging = Path::new(BACKUP_STAGING_DIRECTORY);
+        self.create_empty_backup_staging_directory()?;
 
-        let backup_result = (|| -> CoreResult<()> {
-            self.verify_database_artifacts_safe()?;
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| CoreError::StateUnavailable)?;
-            let mut destination = Connection::open_with_flags(
-                &database_path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?;
-            let backup = Backup::new(&connection, &mut destination)?;
-            backup.run_to_completion(64, Duration::from_millis(5), None)?;
-            drop(backup);
-            destination.close().map_err(|_| CoreError::Database)?;
-            Ok(())
+        let publish_result = (|| -> CoreResult<BackupResult> {
+            let database_relative = staging.join(DATABASE_FILE);
+            let captures = self.create_online_backup_snapshot(&database_relative)?;
+
+            self.atomic_write_relative(&staging.join("label-template-v1.toml"), &template_bytes)?;
+            for capture in &captures {
+                if !is_opaque_id(&capture.case_id, "CASE-")
+                    || !is_opaque_id(&capture.asset_id, "ASSET-")
+                {
+                    return Err(CoreError::Database);
+                }
+                let capture_relative = PathBuf::from(format!(
+                    "captures/{}/FRAME-{}.png",
+                    capture.case_id, capture.asset_id
+                ));
+                let bytes = self.read_relative_required(&capture_relative)?;
+                self.atomic_write_relative(&staging.join(&capture_relative), &bytes)?;
+            }
+            let manifest = BackupManifest {
+                format: BACKUP_FORMAT.to_owned(),
+                version: BACKUP_VERSION,
+                completed_case_id: case_id.to_owned(),
+                completed_at,
+                template_content_sha256: fixed_template.content_sha256,
+                capture_asset_ids: captures
+                    .iter()
+                    .map(|capture| capture.asset_id.clone())
+                    .collect(),
+            };
+            let manifest_bytes =
+                serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
+            // The manifest is written only after every file has been made durable in staging.
+            self.atomic_write_relative(&staging.join("manifest.json"), &manifest_bytes)?;
+            self.publish_current_backup(fault)?;
+            Ok(BackupResult {
+                case_id: case_id.to_owned(),
+                completed_at,
+                capture_count: captures.len(),
+            })
         })();
-        if let Err(error) = backup_result {
-            let _ = self.remove_relative_if_exists(&database_relative);
+
+        if publish_result.is_err() {
+            // A failed staging write cannot affect `backups/current`. Cleanup is best effort: an
+            // unsafe path is intentionally left in place rather than followed or removed.
+            let _ = self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY));
+        }
+        publish_result
+    }
+
+    /// Builds the backup database with SQLite's online backup API while the application's single
+    /// connection is locked. The returned capture list and the copied database therefore describe
+    /// the same committed SQLite state; capture files are immutable after their row is committed.
+    fn create_online_backup_snapshot(
+        &self,
+        database_relative: &Path,
+    ) -> CoreResult<Vec<CapturedFrame>> {
+        let staging_parent = self.safe_output_parent(database_relative)?;
+        let snapshot_paths = DatabasePaths::in_work_root(&staging_parent);
+        prepare_database_artifacts(&snapshot_paths)?;
+        self.verify_database_artifacts_safe()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let captures = captured_frames_from_connection(&connection)?;
+        let mut destination = open_database_no_follow(&snapshot_paths.main)?;
+        let backup = Backup::new(&connection, &mut destination)?;
+        backup.run_to_completion(64, Duration::from_millis(5), None)?;
+        drop(backup);
+        destination.close().map_err(|_| CoreError::Database)?;
+        drop(connection);
+
+        // SQLite has closed its writer before this explicit file flush. The directory flush at
+        // publication time then makes both the database entry and its contents durable.
+        OpenOptions::new()
+            .read(true)
+            .open(&snapshot_paths.main)?
+            .sync_all()?;
+
+        // A completed online backup is self-contained in the main database file. Reserve the
+        // sibling paths while SQLite opens the destination, then remove those empty sidecars so
+        // the published snapshot is unambiguous and cannot inherit a stale WAL.
+        for sidecar in [DATABASE_JOURNAL_FILE, DATABASE_WAL_FILE, DATABASE_SHM_FILE] {
+            self.remove_relative_if_exists(&database_relative.with_file_name(sidecar))?;
+        }
+        Ok(captures)
+    }
+
+    /// Creates one fixed, application-owned staging directory. It never enumerates or removes
+    /// legacy `backup-*` directories created by earlier releases.
+    fn create_empty_backup_staging_directory(&self) -> CoreResult<()> {
+        let backup_parent = self.backup_parent()?;
+        let staging = backup_parent.join(".current-staging");
+        self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY))?;
+        match fs::create_dir(&staging) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(CoreError::UnsafeDerivedPath)
+            }
+            Err(_) => return Err(CoreError::Filesystem),
+        }
+        self.validate_backup_directory(&staging, &backup_parent)?;
+        self.sync_backup_parent(&backup_parent)
+    }
+
+    /// Restores a prior `current` directory if a process stopped after moving it aside but before
+    /// promoting staging. A directory name alone is never treated as authority: the manifest,
+    /// fixed template, SQLite snapshot, and capture set must form a complete self-contained
+    /// snapshot before stale publication state can be removed.
+    fn recover_interrupted_backup_publish(&self) -> CoreResult<()> {
+        let backup_parent = self.backup_parent()?;
+        let current = backup_parent.join("current");
+        let previous = backup_parent.join(".current-previous");
+        let staging = backup_parent.join(".current-staging");
+        let current_exists = self.backup_directory_exists(&current, &backup_parent)?;
+        let previous_exists = self.backup_directory_exists(&previous, &backup_parent)?;
+        let staging_exists = self.backup_directory_exists(&staging, &backup_parent)?;
+
+        let current_valid =
+            current_exists.then(|| self.validate_backup_snapshot(&current, &backup_parent));
+        let previous_valid =
+            previous_exists.then(|| self.validate_backup_snapshot(&previous, &backup_parent));
+
+        match (current_valid, previous_valid) {
+            (Some(Ok(())), _) => {
+                if previous_exists {
+                    self.remove_backup_directory_if_exists(Path::new(BACKUP_PREVIOUS_DIRECTORY))?;
+                }
+                if staging_exists {
+                    self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY))?;
+                }
+                Ok(())
+            }
+            // `current` is application-owned and invalid while the previous snapshot has
+            // independently passed the full manifest/database/capture validation. Remove only
+            // that invalid app-owned directory, then advance the validated previous snapshot
+            // back to `current`. This never reads backup contents into the live SQLite store.
+            (Some(Err(_)), Some(Ok(()))) => {
+                self.remove_backup_directory_if_exists(Path::new("backups/current"))?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)?;
+                if staging_exists {
+                    self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY))?;
+                }
+                Ok(())
+            }
+            // Backup snapshots are never part of the live project-open path. If no validated
+            // predecessor exists, preserve the invalid application-owned directories for a
+            // later explicit repair, but keep the primary SQLite archive available to doctors.
+            // A future backup attempt will validate `current` before publication and surface the
+            // backup problem without ever reading it into the live store.
+            (Some(Err(_)), _) | (None, Some(Err(_))) => Ok(()),
+            (None, Some(Ok(()))) => {
+                self.sync_backup_parent(&backup_parent)?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)?;
+                self.sync_backup_parent(&backup_parent)?;
+                if staging_exists {
+                    self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY))?;
+                }
+                Ok(())
+            }
+            (None, None) => {
+                if staging_exists {
+                    self.remove_backup_directory_if_exists(Path::new(BACKUP_STAGING_DIRECTORY))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Promotes fully written staging only after its manifest exists. The old snapshot is moved
+    /// aside first and restored if promotion fails, so a failed publish cannot silently destroy a
+    /// previously valid `backups/current` snapshot.
+    fn publish_current_backup(&self, fault: BackupFault) -> CoreResult<()> {
+        let backup_parent = self.backup_parent()?;
+        let current = backup_parent.join("current");
+        let previous = backup_parent.join(".current-previous");
+        let staging = backup_parent.join(".current-staging");
+        if !self.backup_directory_exists(&staging, &backup_parent)? {
+            return Err(CoreError::Filesystem);
+        }
+        // All files are individually synced while they are created. Flush the directory tree
+        // after the manifest is written, before changing the public `current` pointer.
+        self.validate_backup_snapshot(&staging, &backup_parent)?;
+        self.sync_backup_tree(&staging, &backup_parent)?;
+        if self.backup_directory_exists(&previous, &backup_parent)? {
+            return Err(CoreError::StateUnavailable);
+        }
+
+        let moved_current = self.backup_directory_exists(&current, &backup_parent)?;
+        if moved_current {
+            self.validate_backup_snapshot(&current, &backup_parent)?;
+            self.sync_backup_parent(&backup_parent)?;
+            self.rename_backup_directory(&current, &previous, &backup_parent)?;
+            // A failed directory flush is an explicit failed publication. Leave the previous
+            // snapshot and staging directory in place rather than risking an unflushed rollback.
+            self.sync_backup_parent(&backup_parent)?;
+        }
+        if fault == BackupFault::BeforeCurrentPromotion {
+            if moved_current {
+                self.sync_backup_parent(&backup_parent)?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)?;
+                self.sync_backup_parent(&backup_parent)?;
+            }
+            return Err(CoreError::FaultInjected);
+        }
+
+        self.sync_backup_parent(&backup_parent)?;
+        if let Err(error) = self.rename_backup_directory(&staging, &current, &backup_parent) {
+            if moved_current {
+                // Preserve the old completed snapshot when staging cannot be promoted. A failed
+                // rollback is surfaced rather than pretending that either snapshot is current.
+                self.sync_backup_parent(&backup_parent)?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)?;
+                self.sync_backup_parent(&backup_parent)?;
+            }
             return Err(error);
         }
 
-        self.atomic_write_relative(&base.join("label-template-v1.toml"), &template_bytes)?;
-        for capture in &captures {
-            let bytes = self.read_captured_frame(case_id, &capture.asset_id)?;
-            self.atomic_write_relative(
-                &base.join(format!("captures/FRAME-{}.png", capture.asset_id)),
-                &bytes,
-            )?;
+        // Keep `.current-previous` until the promoted directory entry itself is durable. If
+        // this fails, both snapshots remain available for the safe recovery decision above.
+        self.sync_backup_parent(&backup_parent)?;
+
+        if moved_current {
+            self.remove_backup_directory_if_exists(Path::new(BACKUP_PREVIOUS_DIRECTORY))?;
         }
-        let manifest = BackupManifest {
-            format: BACKUP_FORMAT.to_owned(),
-            version: 1,
-            case_id: case_id.to_owned(),
-            completed_at,
-            template_content_sha256: fixed_template.content_sha256,
-            capture_asset_ids: captures
-                .iter()
-                .map(|capture| capture.asset_id.clone())
-                .collect(),
-        };
+        Ok(())
+    }
+
+    fn backup_parent(&self) -> CoreResult<PathBuf> {
+        let mut current = self.work_root.clone();
+        self.ensure_safe_directory(&current)?;
+        for component in Path::new(BACKUP_DIRECTORY).components() {
+            let Component::Normal(name) = component else {
+                return Err(CoreError::InvalidWorkPath);
+            };
+            current.push(name);
+            self.ensure_safe_directory(&current)?;
+        }
+        self.resolved_parent_within_work_root(&current)
+    }
+
+    fn backup_directory_exists(&self, path: &Path, backup_parent: &Path) -> CoreResult<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                self.validate_backup_directory(path, backup_parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(CoreError::Filesystem),
+        }
+    }
+
+    fn validate_backup_directory(&self, path: &Path, backup_parent: &Path) -> CoreResult<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(CoreError::UnsafeDerivedPath);
+        }
+        let resolved = fs::canonicalize(path)?;
+        if !resolved.starts_with(backup_parent) {
+            return Err(CoreError::UnsafeDerivedPath);
+        }
+        Ok(())
+    }
+
+    fn validate_backup_snapshot(&self, backup_root: &Path, backup_parent: &Path) -> CoreResult<()> {
+        self.validate_backup_directory(backup_root, backup_parent)?;
         let manifest_bytes =
-            serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
-        // The manifest is deliberately written last. Incomplete backups lack it and are ignored.
-        self.atomic_write_relative(&base.join("manifest.json"), &manifest_bytes)?;
-        Ok(BackupResult {
-            case_id: case_id.to_owned(),
-            completed_at,
-            capture_count: captures.len(),
-        })
+            self.read_backup_regular_file(&backup_root.join("manifest.json"), backup_root)?;
+        let manifest: BackupManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| CoreError::StateUnavailable)?;
+        self.validate_backup_manifest(&manifest)?;
+
+        let template_bytes = self
+            .read_backup_regular_file(&backup_root.join("label-template-v1.toml"), backup_root)?;
+        if sha256_hex(&template_bytes) != manifest.template_content_sha256
+            || std::str::from_utf8(&template_bytes)
+                .ok()
+                .and_then(|input| LabelTemplate::parse_toml_for_import(input).ok())
+                .is_none()
+        {
+            return Err(CoreError::StateUnavailable);
+        }
+
+        self.validate_backup_database_sidecars_safe(backup_root)?;
+        let database_path = backup_root.join(DATABASE_FILE);
+        self.validate_backup_regular_file(&database_path, backup_root)?;
+        let connection = open_backup_database_read_only(&database_path)
+            .map_err(|_| CoreError::StateUnavailable)?;
+        self.validate_backup_database(&connection, backup_root, backup_parent, &manifest)?;
+        drop(connection);
+        self.validate_backup_database_sidecars_safe(backup_root)?;
+        Ok(())
+    }
+
+    fn validate_backup_manifest(&self, manifest: &BackupManifest) -> CoreResult<()> {
+        let capture_ids = manifest.capture_asset_ids.iter().collect::<BTreeSet<_>>();
+        if manifest.format != BACKUP_FORMAT
+            || manifest.version != BACKUP_VERSION
+            || !is_opaque_id(&manifest.completed_case_id, "CASE-")
+            || manifest.completed_at < 0
+            || !is_sha256_hex(&manifest.template_content_sha256)
+            || capture_ids.len() != manifest.capture_asset_ids.len()
+            || manifest
+                .capture_asset_ids
+                .iter()
+                .any(|asset_id| !is_opaque_id(asset_id, "ASSET-"))
+        {
+            return Err(CoreError::StateUnavailable);
+        }
+        Ok(())
+    }
+
+    fn validate_backup_database_sidecars_safe(&self, backup_root: &Path) -> CoreResult<()> {
+        for sidecar in [DATABASE_JOURNAL_FILE, DATABASE_WAL_FILE, DATABASE_SHM_FILE] {
+            let path = backup_root.join(sidecar);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(metadata) if is_link_or_reparse(&metadata) => {
+                    return Err(CoreError::UnsafeDerivedPath)
+                }
+                // Old releases may leave an inert regular sidecar after an external inspection.
+                // The immutable URI below ignores it and never creates or follows it.
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => return Err(CoreError::StateUnavailable),
+                Err(_) => return Err(CoreError::Filesystem),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_backup_database(
+        &self,
+        connection: &Connection,
+        backup_root: &Path,
+        backup_parent: &Path,
+        manifest: &BackupManifest,
+    ) -> CoreResult<()> {
+        let completed_case_exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM cases WHERE case_id = ?1",
+                params![manifest.completed_case_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        if completed_case_exists.is_none() {
+            return Err(CoreError::StateUnavailable);
+        }
+
+        let captures =
+            captured_frames_from_connection(connection).map_err(|_| CoreError::StateUnavailable)?;
+        let manifest_capture_ids = manifest
+            .capture_asset_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let database_capture_ids = captures
+            .iter()
+            .map(|capture| capture.asset_id.clone())
+            .collect::<BTreeSet<_>>();
+        if database_capture_ids.len() != captures.len()
+            || database_capture_ids != manifest_capture_ids
+        {
+            return Err(CoreError::StateUnavailable);
+        }
+
+        for capture in &captures {
+            if !is_opaque_id(&capture.case_id, "CASE-")
+                || !is_opaque_id(&capture.asset_id, "ASSET-")
+                || !is_opaque_id(&capture.parent_video_asset_id, "ASSET-")
+                || capture.width == 0
+                || capture.height == 0
+                || capture.capture_time_millis < 0
+            {
+                return Err(CoreError::StateUnavailable);
+            }
+            let captures_root = backup_root.join("captures");
+            self.validate_backup_directory(&captures_root, backup_parent)?;
+            let case_root = captures_root.join(&capture.case_id);
+            self.validate_backup_directory(&case_root, backup_parent)?;
+            let capture_path = case_root.join(format!("FRAME-{}.png", capture.asset_id));
+            let bytes = self.read_backup_regular_file(&capture_path, &case_root)?;
+            if bytes.len() as u64 != capture.size_bytes
+                || validate_capture_png(&bytes, capture.width, capture.height).is_err()
+            {
+                return Err(CoreError::StateUnavailable);
+            }
+        }
+
+        let mut integrity_statement = connection
+            .prepare("PRAGMA integrity_check")
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let integrity_rows = integrity_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| CoreError::StateUnavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoreError::StateUnavailable)?;
+        if integrity_rows.len() != 1 || integrity_rows.first().map(String::as_str) != Some("ok") {
+            return Err(CoreError::StateUnavailable);
+        }
+        let mut foreign_key_statement = connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut foreign_key_rows = foreign_key_statement
+            .query([])
+            .map_err(|_| CoreError::StateUnavailable)?;
+        if foreign_key_rows
+            .next()
+            .map_err(|_| CoreError::StateUnavailable)?
+            .is_some()
+        {
+            return Err(CoreError::StateUnavailable);
+        }
+        Ok(())
+    }
+
+    fn read_backup_regular_file(&self, path: &Path, parent: &Path) -> CoreResult<Vec<u8>> {
+        self.validate_backup_regular_file(path, parent)?;
+        fs::read(path).map_err(Into::into)
+    }
+
+    fn validate_backup_regular_file(&self, path: &Path, parent: &Path) -> CoreResult<()> {
+        self.validate_backup_directory(parent, parent)?;
+        let metadata = fs::symlink_metadata(path)?;
+        if is_link_or_reparse(&metadata) {
+            return Err(CoreError::UnsafeDerivedPath);
+        }
+        if !metadata.file_type().is_file() {
+            return Err(CoreError::StateUnavailable);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn sync_backup_tree(&self, path: &Path, backup_parent: &Path) -> CoreResult<()> {
+        self.validate_backup_directory(path, backup_parent)?;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let child = entry.path();
+            let metadata = fs::symlink_metadata(&child)?;
+            if is_link_or_reparse(&metadata) {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+            if metadata.file_type().is_dir() {
+                self.sync_backup_tree(&child, backup_parent)?;
+            } else if !metadata.file_type().is_file() {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+        }
+        sync_directory(path)
+    }
+
+    #[cfg(windows)]
+    fn sync_backup_tree(&self, _: &Path, _: &Path) -> CoreResult<()> {
+        // FlushFileBuffers does not provide a reliable writable directory handle on Windows.
+        // Snapshot files are synced individually; MoveFileExW(...WRITE_THROUGH) durably
+        // publishes the completed directory name below.
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn sync_backup_parent(&self, backup_parent: &Path) -> CoreResult<()> {
+        self.validate_backup_directory(backup_parent, backup_parent)?;
+        sync_directory(backup_parent)
+    }
+
+    #[cfg(windows)]
+    fn sync_backup_parent(&self, _: &Path) -> CoreResult<()> {
+        // See sync_backup_tree: Windows publication uses MoveFileExW WRITE_THROUGH instead of
+        // flushing directory handles, which can fail with access denied on normal installations.
+        Ok(())
+    }
+
+    fn rename_backup_directory(
+        &self,
+        source: &Path,
+        destination: &Path,
+        backup_parent: &Path,
+    ) -> CoreResult<()> {
+        self.validate_backup_directory(source, backup_parent)?;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => return Err(CoreError::UnsafeDerivedPath),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(CoreError::Filesystem),
+        }
+        #[cfg(unix)]
+        {
+            fs::rename(source, destination)?;
+            self.sync_backup_parent(backup_parent)?;
+        }
+        #[cfg(windows)]
+        move_backup_directory_windows(source, destination)?;
+        #[cfg(not(any(unix, windows)))]
+        fs::rename(source, destination)?;
+        self.validate_backup_directory(destination, backup_parent)
+    }
+
+    fn remove_backup_directory_if_exists(&self, relative: &Path) -> CoreResult<()> {
+        let backup_parent = self.backup_parent()?;
+        let path = self.backup_directory_path(relative, &backup_parent)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                self.remove_owned_backup_tree(&path, &backup_parent)?;
+                self.sync_backup_parent(&backup_parent)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(CoreError::Filesystem),
+        }
+    }
+
+    fn backup_directory_path(&self, relative: &Path, backup_parent: &Path) -> CoreResult<PathBuf> {
+        let expected_parent = Path::new(BACKUP_DIRECTORY);
+        let file_name = relative
+            .strip_prefix(expected_parent)
+            .ok()
+            .and_then(|suffix| {
+                let mut components = suffix.components();
+                let Component::Normal(name) = components.next()? else {
+                    return None;
+                };
+                components.next().is_none().then_some(name)
+            })
+            .ok_or(CoreError::InvalidWorkPath)?;
+        Ok(backup_parent.join(file_name))
+    }
+
+    fn remove_owned_backup_tree(&self, path: &Path, backup_parent: &Path) -> CoreResult<()> {
+        self.validate_backup_directory(path, backup_parent)?;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let child = entry.path();
+            let metadata = fs::symlink_metadata(&child)?;
+            if is_link_or_reparse(&metadata) {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+            if metadata.file_type().is_dir() {
+                self.remove_owned_backup_tree(&child, backup_parent)?;
+            } else if metadata.file_type().is_file() {
+                fs::remove_file(child)?;
+            } else {
+                return Err(CoreError::UnsafeDerivedPath);
+            }
+        }
+        fs::remove_dir(path)?;
+        Ok(())
     }
 
     pub(crate) fn write_recovery_state(&self, state: &RecoveryState) -> CoreResult<PathBuf> {
@@ -1490,27 +2012,6 @@ impl Store {
             Err(_) => Err(CoreError::Filesystem),
         }
     }
-
-    fn reserve_relative_file(&self, relative: &Path) -> CoreResult<PathBuf> {
-        if !is_safe_relative_path(relative) {
-            return Err(CoreError::InvalidWorkPath);
-        }
-        let file_name = relative
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(CoreError::InvalidWorkPath)?;
-        let parent = self.safe_output_parent(relative)?;
-        let parent = self.resolved_parent_within_work_root(&parent)?;
-        let destination = parent.join(file_name);
-        self.ensure_safe_output_target(&destination)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&destination)?;
-        file.sync_all()?;
-        Ok(destination)
-    }
 }
 
 fn installation_storage_parent(work_root: &Path) -> Option<&Path> {
@@ -1966,6 +2467,28 @@ fn load_template_snapshot_from_connection(
     Ok(Some(template))
 }
 
+fn captured_frames_from_connection(connection: &Connection) -> CoreResult<Vec<CapturedFrame>> {
+    let mut statement = connection.prepare(
+        "SELECT captures.captured_asset_id, captures.case_id, captures.parent_video_asset_id,
+                captures.capture_time_millis, assets.width, assets.height, captures.size_bytes
+         FROM capture_sources AS captures
+         INNER JOIN assets ON assets.asset_id = captures.captured_asset_id
+         ORDER BY captures.case_id ASC, captures.capture_time_millis ASC, captures.captured_asset_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(CapturedFrame {
+            asset_id: row.get(0)?,
+            case_id: row.get(1)?,
+            parent_video_asset_id: row.get(2)?,
+            capture_time_millis: row.get(3)?,
+            width: row.get(4)?,
+            height: row.get(5)?,
+            size_bytes: row.get(6)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn read_region_labels(
     connection: &Connection,
     region_id: &str,
@@ -2103,6 +2626,87 @@ fn open_database_no_follow(database_path: &Path) -> CoreResult<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(Into::into)
+}
+
+/// Snapshot verification must never create a journal, WAL, or a new database. The primary
+/// database uses read/write mode above; completed backups are intentionally opened read-only.
+fn open_backup_database_read_only(database_path: &Path) -> CoreResult<Connection> {
+    let database_uri = immutable_database_uri(database_path)?;
+    Connection::open_with_flags(
+        database_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(Into::into)
+}
+
+fn immutable_database_uri(database_path: &Path) -> CoreResult<String> {
+    let raw_path = database_path
+        .to_str()
+        .ok_or(CoreError::StateUnavailable)?
+        .replace('\\', "/");
+    #[cfg(windows)]
+    let path = {
+        let mut path = raw_path;
+        if !path.starts_with('/') {
+            path.insert(0, '/');
+        }
+        path
+    };
+    #[cfg(not(windows))]
+    let path = raw_path;
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Ok(format!("file:{encoded}?immutable=1"))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> CoreResult<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_: &Path) -> CoreResult<()> {
+    // There is no portable directory-flush primitive outside the supported desktop targets.
+    Err(CoreError::Filesystem)
+}
+
+#[cfg(windows)]
+fn move_backup_directory_windows(source: &Path, destination: &Path) -> CoreResult<()> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(CoreError::Filesystem);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

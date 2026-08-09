@@ -1,0 +1,69 @@
+format = "gwa-label-template"
+version = 1
+template_id = "gastric-serosa-white-plaque-v1"
+
+[[fields]]
+id = "serosal_classification"
+label = "浆膜分型"
+control = "single_select"
+required = true
+
+[[fields.options]]
+id = "normal"
+label = "正常型"
+
+[[fields.options]]
+id = "reactive"
+label = "反应型"
+
+[[fields.options]]
+id = "protruding_nodular"
+label = "突出结节型"
+
+[[fields.options]]
+id = "flat_nodular"
+label = "扁平结节型"
+
+[[fields.options]]
+id = "tendon_like"
+label = "腱状型"
+
+[[fields.options]]
+id = "multicolored_diffuse"
+label = "多彩弥漫型"
+
+[[fields]]
+id = "serosal_white_plaque_classification"
+label = "浆膜白斑分型"
+control = "single_select"
+required = true
+
+[[fields.options]]
+id = "protruding"
+label = "突出型"
+
+[[fields.options]]
+id = "flat"
+label = "扁平型"
+
+[[fields.options]]
+id = "depressed"
+label = "凹陷型"
+
+[[fields]]
+id = "serosal_white_plaque_confidence"
+label = "浆膜白斑置信度"
+control = "single_select"
+required = true
+
+[[fields.options]]
+id = "confidence_50"
+label = "50%"
+
+[[fields.options]]
+id = "confidence_80"
+label = "80%"
+
+[[fields.options]]
+id = "confidence_100"
+label = "100%"

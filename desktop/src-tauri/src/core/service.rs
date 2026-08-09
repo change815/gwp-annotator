@@ -14,8 +14,8 @@ use crate::core::scan::{
     PublicScan, ScanSession, StoredAssetKind,
 };
 use crate::core::store::{
-    BackupResult, CapturedFrame, PointNorm, PreparedFixedTemplate, ProjectSessionState,
-    RecoveryState, RegionDraft, SaveFault, SavedRegion, Store,
+    BackupFault, BackupResult, CapturedFrame, PointNorm, PreparedFixedTemplate,
+    ProjectSessionState, RecoveryState, RegionDraft, SaveFault, SavedRegion, Store,
 };
 use crate::core::template::{parse_label_txt, LabelTemplate, LabelValue};
 
@@ -143,8 +143,31 @@ impl ProjectService {
     }
 
     pub fn scan_selected_root(&self, selected_root: &Path) -> CoreResult<PublicScan> {
+        let previous_session = Store::read_project_session(&self.work_root)?;
         let scan = self.activate_root(selected_root)?;
-        self.write_session_for_active(None, None, None)?;
+        let selected_resolved = fs::canonicalize(selected_root)?;
+        let restored_position = previous_session.and_then(|saved| {
+            if fs::canonicalize(&saved.source_root).ok().as_ref() == Some(&selected_resolved) {
+                saved
+                    .current_case_id
+                    .zip(saved.current_asset_id)
+                    .and_then(|(case_id, asset_id)| {
+                        scan_contains_position(&scan, &case_id, &asset_id)
+                            .then_some((case_id, asset_id))
+                    })
+            } else {
+                None
+            }
+        });
+        self.write_session_for_active(
+            restored_position
+                .as_ref()
+                .map(|(case_id, _)| case_id.as_str()),
+            restored_position
+                .as_ref()
+                .map(|(_, asset_id)| asset_id.as_str()),
+            None,
+        )?;
         Ok(scan)
     }
 
@@ -519,6 +542,20 @@ impl ProjectService {
     }
 
     pub fn complete_case_and_backup(&self, case_id: &str) -> CoreResult<BackupResult> {
+        self.complete_case_and_backup_with_fault(case_id, BackupFault::None)
+    }
+
+    /// This test seam deliberately has no command binding. It lets the storage integration tests
+    /// prove that a failed directory promotion restores the previously completed snapshot.
+    pub fn complete_case_and_backup_with_fault(
+        &self,
+        case_id: &str,
+        fault: BackupFault,
+    ) -> CoreResult<BackupResult> {
+        let _template_activation = self
+            .template_activation
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?;
         self.ensure_active_roots_separate()?;
         {
             let active = self.active()?;
@@ -536,7 +573,7 @@ impl ProjectService {
         store
             .as_ref()
             .ok_or(CoreError::NoActiveSession)?
-            .complete_case_backup(case_id)
+            .complete_case_backup_with_fault(case_id, fault)
     }
 
     pub fn video_asset_bytes(&self, case_id: &str, asset_id: &str) -> CoreResult<Vec<u8>> {
@@ -1144,6 +1181,14 @@ impl ProjectService {
         templates.insert(key, template);
         Ok(descriptor)
     }
+}
+
+fn scan_contains_position(scan: &PublicScan, case_id: &str, asset_id: &str) -> bool {
+    scan.campuses
+        .iter()
+        .flat_map(|campus| campus.cases.iter())
+        .find(|case| case.case_id == case_id)
+        .is_some_and(|case| case.assets.iter().any(|asset| asset.asset_id == asset_id))
 }
 
 fn roots_overlap(left: &Path, right: &Path) -> bool {

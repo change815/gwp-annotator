@@ -474,6 +474,61 @@ label = "选项丁"
     }
 
     #[test]
+    fn committed_study_template_matches_the_doctor_approved_radio_labels() {
+        let template = LabelTemplate::parse_toml_for_import(include_str!(
+            "../../../templates/label-template-v1.toml"
+        ))
+        .expect("committed study template");
+
+        assert_eq!(template.template_id, "gastric-serosa-white-plaque-v1");
+        assert_eq!(template.version, 1);
+        assert_eq!(template.fields.len(), 3);
+        assert!(template
+            .fields
+            .iter()
+            .all(|field| field.required && field.control == FieldControl::SingleSelect));
+        assert_eq!(
+            template
+                .fields
+                .iter()
+                .map(|field| field.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["浆膜分型", "浆膜白斑分型", "浆膜白斑置信度"]
+        );
+        assert_eq!(
+            template.fields[0]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "正常型",
+                "反应型",
+                "突出结节型",
+                "扁平结节型",
+                "腱状型",
+                "多彩弥漫型",
+            ]
+        );
+        assert_eq!(
+            template.fields[1]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["突出型", "扁平型", "凹陷型"]
+        );
+        assert_eq!(
+            template.fields[2]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["50%", "80%", "100%"]
+        );
+    }
+
+    #[test]
     fn toml_template_rejects_invalid_syntax_and_invalid_template_data() {
         assert!(LabelTemplate::parse_toml("format = [").is_err());
         assert!(LabelTemplate::parse_toml(
