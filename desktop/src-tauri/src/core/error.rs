@@ -136,6 +136,7 @@ impl CoreError {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn filesystem_with_os_error(error: std::io::Error) -> Self {
         error
             .raw_os_error()
