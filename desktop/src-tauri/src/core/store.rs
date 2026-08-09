@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::core::error::{CoreError, CoreResult};
+use crate::core::error::{BackupStage, CoreError, CoreResult};
 use crate::core::ids::is_opaque_id;
 use crate::core::scan::{PersistedAsset, PersistedCase};
 use crate::core::template::{LabelTemplate, LabelValue};
@@ -938,36 +938,46 @@ impl Store {
         let _publication = self
             .backup_publish
             .lock()
-            .map_err(|_| CoreError::StateUnavailable)?;
+            .map_err(|_| CoreError::StateUnavailable.at_backup_stage(BackupStage::RecoverState))?;
 
         // A backup is a recoverable convenience copy. The live project database remains the
         // only startup and instant-save archive, so this function never reads a backup back into
         // the primary database.
-        self.recover_interrupted_backup_publish()?;
+        self.recover_interrupted_backup_publish()
+            .map_err(|error| error.at_backup_stage(BackupStage::RecoverState))?;
         let (fixed_template, template_bytes) = self
-            .fixed_template_with_contents()?
-            .ok_or(CoreError::FixedTemplateMissing)?;
+            .fixed_template_with_contents()
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyTemplate))?
+            .ok_or(CoreError::FixedTemplateMissing)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyTemplate))?;
         let completed_at = now_millis();
         let staging = Path::new(BACKUP_STAGING_DIRECTORY);
-        self.create_empty_backup_staging_directory()?;
+        self.create_empty_backup_staging_directory()
+            .map_err(|error| error.at_backup_stage(BackupStage::PrepareStaging))?;
 
         let publish_result = (|| -> CoreResult<BackupResult> {
             let database_relative = staging.join(DATABASE_FILE);
-            let captures = self.create_online_backup_snapshot(&database_relative)?;
+            let captures = self
+                .create_online_backup_snapshot(&database_relative)
+                .map_err(|error| error.at_backup_stage(BackupStage::SnapshotDatabase))?;
 
-            self.atomic_write_relative(&staging.join("label-template-v1.toml"), &template_bytes)?;
+            self.atomic_write_relative(&staging.join("label-template-v1.toml"), &template_bytes)
+                .map_err(|error| error.at_backup_stage(BackupStage::WriteManifest))?;
             for capture in &captures {
                 if !is_opaque_id(&capture.case_id, "CASE-")
                     || !is_opaque_id(&capture.asset_id, "ASSET-")
                 {
-                    return Err(CoreError::Database);
+                    return Err(CoreError::Database.at_backup_stage(BackupStage::WriteManifest));
                 }
                 let capture_relative = PathBuf::from(format!(
                     "captures/{}/FRAME-{}.png",
                     capture.case_id, capture.asset_id
                 ));
-                let bytes = self.read_relative_required(&capture_relative)?;
-                self.atomic_write_relative(&staging.join(&capture_relative), &bytes)?;
+                let bytes = self
+                    .read_relative_required(&capture_relative)
+                    .map_err(|error| error.at_backup_stage(BackupStage::WriteManifest))?;
+                self.atomic_write_relative(&staging.join(&capture_relative), &bytes)
+                    .map_err(|error| error.at_backup_stage(BackupStage::WriteManifest))?;
             }
             let manifest = BackupManifest {
                 format: BACKUP_FORMAT.to_owned(),
@@ -980,10 +990,12 @@ impl Store {
                     .map(|capture| capture.asset_id.clone())
                     .collect(),
             };
-            let manifest_bytes =
-                serde_json::to_vec(&manifest).map_err(|_| CoreError::StateUnavailable)?;
+            let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::WriteManifest)
+            })?;
             // The manifest is written only after every file has been made durable in staging.
-            self.atomic_write_relative(&staging.join("manifest.json"), &manifest_bytes)?;
+            self.atomic_write_relative(&staging.join("manifest.json"), &manifest_bytes)
+                .map_err(|error| error.at_backup_stage(BackupStage::WriteManifest))?;
             self.publish_current_backup(fault)?;
             Ok(BackupResult {
                 case_id: case_id.to_owned(),
@@ -1052,7 +1064,7 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(CoreError::UnsafeDerivedPath)
             }
-            Err(_) => return Err(CoreError::Filesystem),
+            Err(error) => return Err(error.into()),
         }
         self.validate_backup_directory(&staging, &backup_parent)?;
         self.sync_backup_parent(&backup_parent)
@@ -1126,57 +1138,80 @@ impl Store {
     /// aside first and restored if promotion fails, so a failed publish cannot silently destroy a
     /// previously valid `backups/current` snapshot.
     fn publish_current_backup(&self, fault: BackupFault) -> CoreResult<()> {
-        let backup_parent = self.backup_parent()?;
+        let backup_parent = self
+            .backup_parent()
+            .map_err(|error| error.at_backup_stage(BackupStage::PrepareStaging))?;
         let current = backup_parent.join("current");
         let previous = backup_parent.join(".current-previous");
         let staging = backup_parent.join(".current-staging");
-        if !self.backup_directory_exists(&staging, &backup_parent)? {
-            return Err(CoreError::Filesystem);
+        if !self
+            .backup_directory_exists(&staging, &backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::PrepareStaging))?
+        {
+            return Err(CoreError::Filesystem.at_backup_stage(BackupStage::PrepareStaging));
         }
         // All files are individually synced while they are created. Flush the directory tree
         // after the manifest is written, before changing the public `current` pointer.
         self.validate_backup_snapshot(&staging, &backup_parent)?;
-        self.sync_backup_tree(&staging, &backup_parent)?;
-        if self.backup_directory_exists(&previous, &backup_parent)? {
-            return Err(CoreError::StateUnavailable);
+        self.sync_backup_tree(&staging, &backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::PrepareStaging))?;
+        if self
+            .backup_directory_exists(&previous, &backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::PreserveCurrent))?
+        {
+            return Err(CoreError::StateUnavailable.at_backup_stage(BackupStage::PreserveCurrent));
         }
 
-        let moved_current = self.backup_directory_exists(&current, &backup_parent)?;
+        let moved_current = self
+            .backup_directory_exists(&current, &backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::PreserveCurrent))?;
         if moved_current {
             self.validate_backup_snapshot(&current, &backup_parent)?;
-            self.sync_backup_parent(&backup_parent)?;
-            self.rename_backup_directory(&current, &previous, &backup_parent)?;
+            self.sync_backup_parent(&backup_parent)
+                .map_err(|error| error.at_backup_stage(BackupStage::PreserveCurrent))?;
+            self.rename_backup_directory(&current, &previous, &backup_parent)
+                .map_err(|error| error.at_backup_stage(BackupStage::PreserveCurrent))?;
             // A failed directory flush is an explicit failed publication. Leave the previous
             // snapshot and staging directory in place rather than risking an unflushed rollback.
-            self.sync_backup_parent(&backup_parent)?;
+            self.sync_backup_parent(&backup_parent)
+                .map_err(|error| error.at_backup_stage(BackupStage::PreserveCurrent))?;
         }
         if fault == BackupFault::BeforeCurrentPromotion {
             if moved_current {
-                self.sync_backup_parent(&backup_parent)?;
-                self.rename_backup_directory(&previous, &current, &backup_parent)?;
-                self.sync_backup_parent(&backup_parent)?;
+                self.sync_backup_parent(&backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
+                self.sync_backup_parent(&backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
             }
             return Err(CoreError::FaultInjected);
         }
 
-        self.sync_backup_parent(&backup_parent)?;
+        self.sync_backup_parent(&backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::PromoteCurrent))?;
         if let Err(error) = self.rename_backup_directory(&staging, &current, &backup_parent) {
             if moved_current {
                 // Preserve the old completed snapshot when staging cannot be promoted. A failed
                 // rollback is surfaced rather than pretending that either snapshot is current.
-                self.sync_backup_parent(&backup_parent)?;
-                self.rename_backup_directory(&previous, &current, &backup_parent)?;
-                self.sync_backup_parent(&backup_parent)?;
+                self.sync_backup_parent(&backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
+                self.rename_backup_directory(&previous, &current, &backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
+                self.sync_backup_parent(&backup_parent)
+                    .map_err(|error| error.at_backup_stage(BackupStage::RollbackCurrent))?;
             }
-            return Err(error);
+            return Err(error.at_backup_stage(BackupStage::PromoteCurrent));
         }
 
         // Keep `.current-previous` until the promoted directory entry itself is durable. If
         // this fails, both snapshots remain available for the safe recovery decision above.
-        self.sync_backup_parent(&backup_parent)?;
+        self.sync_backup_parent(&backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::FinalizeCurrent))?;
 
         if moved_current {
-            self.remove_backup_directory_if_exists(Path::new(BACKUP_PREVIOUS_DIRECTORY))?;
+            self.remove_backup_directory_if_exists(Path::new(BACKUP_PREVIOUS_DIRECTORY))
+                .map_err(|error| error.at_backup_stage(BackupStage::FinalizeCurrent))?;
         }
         Ok(())
     }
@@ -1201,7 +1236,7 @@ impl Store {
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err(CoreError::Filesystem),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1218,32 +1253,41 @@ impl Store {
     }
 
     fn validate_backup_snapshot(&self, backup_root: &Path, backup_parent: &Path) -> CoreResult<()> {
-        self.validate_backup_directory(backup_root, backup_parent)?;
-        let manifest_bytes =
-            self.read_backup_regular_file(&backup_root.join("manifest.json"), backup_root)?;
-        let manifest: BackupManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|_| CoreError::StateUnavailable)?;
-        self.validate_backup_manifest(&manifest)?;
+        self.validate_backup_directory(backup_root, backup_parent)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyManifest))?;
+        let manifest_bytes = self
+            .read_backup_regular_file(&backup_root.join("manifest.json"), backup_root)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyManifest))?;
+        let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes).map_err(|_| {
+            CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyManifest)
+        })?;
+        self.validate_backup_manifest(&manifest)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyManifest))?;
 
         let template_bytes = self
-            .read_backup_regular_file(&backup_root.join("label-template-v1.toml"), backup_root)?;
+            .read_backup_regular_file(&backup_root.join("label-template-v1.toml"), backup_root)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyTemplate))?;
         if sha256_hex(&template_bytes) != manifest.template_content_sha256
             || std::str::from_utf8(&template_bytes)
                 .ok()
                 .and_then(|input| LabelTemplate::parse_toml_for_import(input).ok())
                 .is_none()
         {
-            return Err(CoreError::StateUnavailable);
+            return Err(CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyTemplate));
         }
 
-        self.validate_backup_database_sidecars_safe(backup_root)?;
+        self.validate_backup_database_sidecars_safe(backup_root)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseOpen))?;
         let database_path = backup_root.join(DATABASE_FILE);
-        self.validate_backup_regular_file(&database_path, backup_root)?;
-        let connection = open_backup_database_read_only(&database_path)
-            .map_err(|_| CoreError::StateUnavailable)?;
+        self.validate_backup_regular_file(&database_path, backup_root)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseOpen))?;
+        let connection = open_backup_database_read_only(&database_path).map_err(|_| {
+            CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseOpen)
+        })?;
         self.validate_backup_database(&connection, backup_root, backup_parent, &manifest)?;
         drop(connection);
-        self.validate_backup_database_sidecars_safe(backup_root)?;
+        self.validate_backup_database_sidecars_safe(backup_root)
+            .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseOpen))?;
         Ok(())
     }
 
@@ -1277,7 +1321,7 @@ impl Store {
                 // The immutable URI below ignores it and never creates or follows it.
                 Ok(metadata) if metadata.file_type().is_file() => {}
                 Ok(_) => return Err(CoreError::StateUnavailable),
-                Err(_) => return Err(CoreError::Filesystem),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
@@ -1297,13 +1341,18 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| CoreError::StateUnavailable)?;
+            .map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+            })?;
         if completed_case_exists.is_none() {
-            return Err(CoreError::StateUnavailable);
+            return Err(
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+            );
         }
 
-        let captures =
-            captured_frames_from_connection(connection).map_err(|_| CoreError::StateUnavailable)?;
+        let captures = captured_frames_from_connection(connection).map_err(|_| {
+            CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+        })?;
         let manifest_capture_ids = manifest
             .capture_asset_ids
             .iter()
@@ -1316,7 +1365,9 @@ impl Store {
         if database_capture_ids.len() != captures.len()
             || database_capture_ids != manifest_capture_ids
         {
-            return Err(CoreError::StateUnavailable);
+            return Err(
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+            );
         }
 
         for capture in &captures {
@@ -1327,44 +1378,67 @@ impl Store {
                 || capture.height == 0
                 || capture.capture_time_millis < 0
             {
-                return Err(CoreError::StateUnavailable);
+                return Err(
+                    CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+                );
             }
             let captures_root = backup_root.join("captures");
-            self.validate_backup_directory(&captures_root, backup_parent)?;
+            self.validate_backup_directory(&captures_root, backup_parent)
+                .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseCase))?;
             let case_root = captures_root.join(&capture.case_id);
-            self.validate_backup_directory(&case_root, backup_parent)?;
+            self.validate_backup_directory(&case_root, backup_parent)
+                .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseCase))?;
             let capture_path = case_root.join(format!("FRAME-{}.png", capture.asset_id));
-            let bytes = self.read_backup_regular_file(&capture_path, &case_root)?;
+            let bytes = self
+                .read_backup_regular_file(&capture_path, &case_root)
+                .map_err(|error| error.at_backup_stage(BackupStage::VerifyDatabaseCase))?;
             if bytes.len() as u64 != capture.size_bytes
                 || validate_capture_png(&bytes, capture.width, capture.height).is_err()
             {
-                return Err(CoreError::StateUnavailable);
+                return Err(
+                    CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseCase)
+                );
             }
         }
 
-        let mut integrity_statement = connection
-            .prepare("PRAGMA integrity_check")
-            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut integrity_statement =
+            connection.prepare("PRAGMA integrity_check").map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            })?;
         let integrity_rows = integrity_statement
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|_| CoreError::StateUnavailable)?
+            .map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            })?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| CoreError::StateUnavailable)?;
+            .map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            })?;
         if integrity_rows.len() != 1 || integrity_rows.first().map(String::as_str) != Some("ok") {
-            return Err(CoreError::StateUnavailable);
+            return Err(
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            );
         }
-        let mut foreign_key_statement = connection
-            .prepare("PRAGMA foreign_key_check")
-            .map_err(|_| CoreError::StateUnavailable)?;
-        let mut foreign_key_rows = foreign_key_statement
-            .query([])
-            .map_err(|_| CoreError::StateUnavailable)?;
+        let mut foreign_key_statement =
+            connection
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(|_| {
+                    CoreError::StateUnavailable
+                        .at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+                })?;
+        let mut foreign_key_rows = foreign_key_statement.query([]).map_err(|_| {
+            CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+        })?;
         if foreign_key_rows
             .next()
-            .map_err(|_| CoreError::StateUnavailable)?
+            .map_err(|_| {
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            })?
             .is_some()
         {
-            return Err(CoreError::StateUnavailable);
+            return Err(
+                CoreError::StateUnavailable.at_backup_stage(BackupStage::VerifyDatabaseIntegrity)
+            );
         }
         Ok(())
     }
@@ -1436,7 +1510,7 @@ impl Store {
         match fs::symlink_metadata(destination) {
             Ok(_) => return Err(CoreError::UnsafeDerivedPath),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(CoreError::Filesystem),
+            Err(error) => return Err(error.into()),
         }
         #[cfg(unix)]
         {
@@ -1459,7 +1533,7 @@ impl Store {
                 self.sync_backup_parent(&backup_parent)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(CoreError::Filesystem),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -2644,20 +2718,29 @@ fn open_backup_database_read_only(database_path: &Path) -> CoreResult<Connection
 }
 
 fn immutable_database_uri(database_path: &Path) -> CoreResult<String> {
-    let raw_path = database_path
-        .to_str()
-        .ok_or(CoreError::StateUnavailable)?
-        .replace('\\', "/");
+    let raw_path = database_path.to_str().ok_or(CoreError::StateUnavailable)?;
     #[cfg(windows)]
     let path = {
-        let mut path = raw_path;
-        if !path.starts_with('/') {
-            path.insert(0, '/');
+        let path = raw_path.strip_prefix(r"\\?\").unwrap_or(raw_path);
+        if path.starts_with(r"UNC\") || path.starts_with(r"\\") {
+            return Err(CoreError::InvalidWorkPath);
         }
-        path
+        let path = path
+            .strip_prefix('/')
+            .or_else(|| path.strip_prefix('\\'))
+            .unwrap_or(path);
+        let bytes = path.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'/' | b'\\')
+        {
+            return Err(CoreError::InvalidWorkPath);
+        }
+        path.replace('\\', "/")
     };
     #[cfg(not(windows))]
-    let path = raw_path;
+    let path = raw_path.replace('\\', "/");
     let mut encoded = String::with_capacity(path.len());
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
@@ -2666,6 +2749,9 @@ fn immutable_database_uri(database_path: &Path) -> CoreResult<String> {
             encoded.push_str(&format!("%{byte:02X}"));
         }
     }
+    #[cfg(windows)]
+    return Ok(format!("file:///{encoded}?immutable=1"));
+    #[cfg(not(windows))]
     Ok(format!("file:{encoded}?immutable=1"))
 }
 
@@ -2706,7 +2792,9 @@ fn move_backup_directory_windows(source: &Path, destination: &Path) -> CoreResul
         )
     };
     if moved == 0 {
-        return Err(CoreError::Filesystem);
+        return Err(CoreError::filesystem_with_os_error(
+            std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
@@ -2727,7 +2815,7 @@ fn replace_temp_file_windows(temporary: &Path, destination: &Path) -> CoreResult
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => return Err(CoreError::Filesystem),
+        Err(error) => return Err(error.into()),
     };
     if !destination_exists {
         fs::rename(temporary, destination)?;
@@ -2755,7 +2843,9 @@ fn replace_temp_file_windows(temporary: &Path, destination: &Path) -> CoreResult
         )
     };
     if replaced == 0 {
-        return Err(CoreError::Filesystem);
+        return Err(CoreError::filesystem_with_os_error(
+            std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
@@ -3205,13 +3295,15 @@ fn now_millis() -> i64 {
 mod tests {
     use std::fs;
 
-    use rusqlite::params;
+    use rusqlite::{params, OptionalExtension};
 
     use crate::core::template::LabelTemplate;
 
+    #[cfg(windows)]
+    use super::immutable_database_uri;
     use super::{
-        load_template_snapshot_from_connection, prepare_work_root_after_overlap_check,
-        validate_polygon, CoreError, PointNorm, Store,
+        load_template_snapshot_from_connection, open_backup_database_read_only,
+        prepare_work_root_after_overlap_check, validate_polygon, CoreError, PointNorm, Store,
     };
 
     const LEGACY_DAMAGED_TOML: &str = r#"
@@ -3291,6 +3383,68 @@ label = "选项甲"
                 .is_none(),
             "write probe must be removed before database creation"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immutable_database_uri_normalizes_windows_verbatim_drive_paths() {
+        let uri = immutable_database_uri(std::path::Path::new(
+            r"\\?\D:\Synthetic Fixture\annotations.sqlite3",
+        ))
+        .expect("normalize synthetic verbatim path");
+        assert_eq!(
+            uri,
+            "file:///D:/Synthetic%20Fixture/annotations.sqlite3?immutable=1"
+        );
+        assert!(immutable_database_uri(std::path::Path::new(
+            r"\\?\UNC\synthetic-host\share\annotations.sqlite3"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn backup_database_opens_read_only_from_a_path_with_spaces() {
+        let temporary = tempfile::tempdir().expect("synthetic temporary directory");
+        let database_directory = temporary.path().join("Synthetic Backup With Spaces");
+        fs::create_dir_all(&database_directory).expect("create synthetic database directory");
+        let database_path = database_directory.join("annotations.sqlite3");
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("create synthetic backup database");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL REFERENCES parent(id)
+                 );
+                 INSERT INTO parent(id) VALUES (1);
+                 INSERT INTO child(id, parent_id) VALUES (1, 1);",
+            )
+            .expect("populate synthetic backup database");
+        connection.close().expect("close synthetic writer");
+
+        let canonical_database_path =
+            fs::canonicalize(&database_path).expect("canonical synthetic backup database path");
+        let readonly = open_backup_database_read_only(&canonical_database_path)
+            .expect("open immutable synthetic backup database");
+        assert_eq!(
+            readonly
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .expect("synthetic integrity check"),
+            "ok"
+        );
+        let foreign_key_error: Option<String> = readonly
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()
+            .expect("synthetic foreign key check");
+        assert!(foreign_key_error.is_none());
+        drop(readonly);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            assert!(!database_directory
+                .join(format!("annotations.sqlite3{suffix}"))
+                .exists());
+        }
     }
 
     #[test]

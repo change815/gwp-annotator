@@ -1,11 +1,32 @@
+use serde::Serialize;
 use thiserror::Error;
 
 pub type CoreResult<T> = Result<T, CoreError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackupStage {
+    RecoverState,
+    PrepareStaging,
+    SnapshotDatabase,
+    WriteManifest,
+    VerifyManifest,
+    VerifyTemplate,
+    VerifyDatabaseOpen,
+    VerifyDatabaseCase,
+    VerifyDatabaseIntegrity,
+    PreserveCurrent,
+    PromoteCurrent,
+    RollbackCurrent,
+    FinalizeCurrent,
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("filesystem operation failed")]
     Filesystem,
+    #[error("filesystem operation failed")]
+    FilesystemWithOsError(i32),
     #[error("database operation failed")]
     Database,
     #[error("database schema version is unsupported")]
@@ -78,6 +99,49 @@ pub enum CoreError {
     StateUnavailable,
     #[error("test fault injected")]
     FaultInjected,
+    #[error("backup operation failed at {stage:?}")]
+    Backup {
+        stage: BackupStage,
+        os_error: Option<i32>,
+        #[source]
+        source: Box<CoreError>,
+    },
+}
+
+impl CoreError {
+    pub fn at_backup_stage(self, stage: BackupStage) -> Self {
+        match self {
+            Self::Backup { .. } => self,
+            source @ Self::FilesystemWithOsError(os_error) => Self::Backup {
+                stage,
+                os_error: Some(os_error),
+                source: Box::new(source),
+            },
+            source => Self::Backup {
+                stage,
+                os_error: None,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    pub fn at_backup_stage_with_os_error(self, stage: BackupStage, os_error: Option<i32>) -> Self {
+        match self {
+            Self::Backup { .. } => self,
+            source => Self::Backup {
+                stage,
+                os_error,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    pub(crate) fn filesystem_with_os_error(error: std::io::Error) -> Self {
+        error
+            .raw_os_error()
+            .map(Self::FilesystemWithOsError)
+            .unwrap_or(Self::Filesystem)
+    }
 }
 
 impl From<std::io::Error> for CoreError {

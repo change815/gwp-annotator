@@ -26,9 +26,9 @@ fn choose_and_scan_root(
     let Some(selected) = app.dialog().file().blocking_pick_folder() else {
         return Ok(None);
     };
-    let selected = selected.into_path().map_err(|_| CommandError {
-        code: "FILESYSTEM_ERROR",
-    })?;
+    let selected = selected
+        .into_path()
+        .map_err(|_| CommandError::from_code("FILESYSTEM_ERROR"))?;
     state
         .service
         .scan_selected_root(&selected)
@@ -132,9 +132,7 @@ fn project_storage_location(state: State<'_, AppState>) -> Result<String, Comman
         .work_root()
         .to_str()
         .map(str::to_owned)
-        .ok_or(CommandError {
-            code: "STATE_UNAVAILABLE",
-        })
+        .ok_or(CommandError::from_code("STATE_UNAVAILABLE"))
 }
 
 #[tauri::command]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::State;
 
-use crate::core::error::CoreError;
+use crate::core::error::{BackupStage, CoreError};
 use crate::core::scan::{ImageAssetData, LocalDisplayScan, PublicScan};
 use crate::core::service::{
     CaptureFrameRequest, ProjectService, RefineRegionGeometryRequest, ReplaceRegionRequest,
@@ -25,12 +25,39 @@ impl AppState {
 #[derive(Debug, Serialize)]
 pub struct CommandError {
     pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_stage: Option<BackupStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<i32>,
+}
+
+impl CommandError {
+    pub fn from_code(code: &'static str) -> Self {
+        Self {
+            code,
+            backup_stage: None,
+            os_error: None,
+        }
+    }
 }
 
 impl From<CoreError> for CommandError {
     fn from(error: CoreError) -> Self {
-        Self {
-            code: error_code(&error),
+        match error {
+            CoreError::Backup {
+                stage,
+                os_error,
+                source,
+            } => Self {
+                code: error_code(&source),
+                backup_stage: Some(stage),
+                os_error,
+            },
+            error => Self {
+                code: error_code(&error),
+                backup_stage: None,
+                os_error: None,
+            },
         }
     }
 }
@@ -307,10 +334,11 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::SavedRootUnavailable => "SAVED_ROOT_UNAVAILABLE",
         CoreError::CredentialStoreUnavailable => "CREDENTIAL_STORE_UNAVAILABLE",
         CoreError::InvalidSecret => "INVALID_SECRET",
-        CoreError::Filesystem => "FILESYSTEM_ERROR",
+        CoreError::Filesystem | CoreError::FilesystemWithOsError(_) => "FILESYSTEM_ERROR",
         CoreError::Database => "DATABASE_ERROR",
         CoreError::DatabaseSchemaUnsupported => "DATABASE_SCHEMA_UNSUPPORTED",
         CoreError::StateUnavailable => "STATE_UNAVAILABLE",
         CoreError::FaultInjected => "FAULT_INJECTED",
+        CoreError::Backup { source, .. } => error_code(source),
     }
 }

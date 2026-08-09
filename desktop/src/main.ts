@@ -646,7 +646,45 @@ function errorCode(error: unknown): string {
   return "UNEXPECTED_ERROR";
 }
 
+const BACKUP_STAGES = new Set([
+  "RECOVER_STATE",
+  "PREPARE_STAGING",
+  "SNAPSHOT_DATABASE",
+  "WRITE_MANIFEST",
+  "VERIFY_MANIFEST",
+  "VERIFY_TEMPLATE",
+  "VERIFY_DATABASE_OPEN",
+  "VERIFY_DATABASE_CASE",
+  "VERIFY_DATABASE_INTEGRITY",
+  "PRESERVE_CURRENT",
+  "PROMOTE_CURRENT",
+  "ROLLBACK_CURRENT",
+  "FINALIZE_CURRENT",
+]);
+
+const BACKUP_ERROR_CODES = new Set([
+  "FILESYSTEM_ERROR",
+  "DATABASE_ERROR",
+  "STATE_UNAVAILABLE",
+  "FIXED_TEMPLATE_MISSING",
+  "FIXED_TEMPLATE_CHECKSUM_MISMATCH",
+  "INVALID_OPAQUE_ID",
+  "INVALID_WORK_PATH",
+  "UNSAFE_DERIVED_PATH",
+  "FAULT_INJECTED",
+]);
+
+function backupErrorDiagnostic(error: unknown): string | null {
+  if (typeof error !== "object" || !error || !("backup_stage" in error)) return null;
+  const stage = String((error as { backup_stage: unknown }).backup_stage);
+  const code = errorCode(error);
+  if (!BACKUP_STAGES.has(stage) || !BACKUP_ERROR_CODES.has(code)) return null;
+  return `BACKUP/${stage}/${code}`;
+}
+
 function formatError(error: unknown): string {
+  const backupDiagnostic = backupErrorDiagnostic(error);
+  if (backupDiagnostic) return backupDiagnostic;
   const code = errorCode(error);
   const messages: Record<string, string> = {
     [TEMPLATE_ENCODING_ERROR_CODE]: TEMPLATE_UTF8_IMPORT_ERROR,
@@ -1731,8 +1769,11 @@ function startApp(target: HTMLDivElement): void {
         const result = await api.completeCaseAndBackup(currentCase.case_id);
         message(`病例已完成并备份（包含 ${result.capture_count} 张截帧）。`, "success");
       } catch (error) {
+        const backupDiagnostic = backupErrorDiagnostic(error);
         message(
-          errorCode(error) === "FILESYSTEM_ERROR"
+          backupDiagnostic
+            ? backupDiagnostic
+            : errorCode(error) === "FILESYSTEM_ERROR"
             ? "备份文件写入失败。已点击 OK 保存的标注仍保留在本地数据库中；请检查“数据保存位置”的写入权限和磁盘空间后重试。"
             : formatError(error),
           "error",

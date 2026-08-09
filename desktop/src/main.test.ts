@@ -1531,6 +1531,33 @@ describe("local shell", () => {
     expect(document.body.textContent).toContain("已点击 OK 保存的标注仍保留在本地数据库中");
   });
 
+  it("shows only the allowlisted backup diagnostic without leaking rejection details", async () => {
+    const sensitiveMessage = "SENSITIVE_MESSAGE_SENTINEL";
+    const sensitivePath = "SENSITIVE_PATH_SENTINEL";
+    const sensitiveExtra = "SENSITIVE_EXTRA_SENTINEL";
+    const completeCaseAndBackup = vi.fn().mockRejectedValue({
+      code: "STATE_UNAVAILABLE",
+      backup_stage: "VERIFY_DATABASE_OPEN",
+      os_error: 5,
+      message: sensitiveMessage,
+      path: sensitivePath,
+      extra: sensitiveExtra,
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ completeCaseAndBackup }));
+
+    document.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[role="status"]')?.textContent).toBe(
+        "BACKUP/VERIFY_DATABASE_OPEN/STATE_UNAVAILABLE",
+      );
+    });
+    expect(document.body.textContent).not.toContain(sensitiveMessage);
+    expect(document.body.textContent).not.toContain(sensitivePath);
+    expect(document.body.textContent).not.toContain(sensitiveExtra);
+  });
+
   it("cancels an unfinished replacement lasso with a right click without leaking its target", async () => {
     const saveConfirmedRegion = vi.fn().mockResolvedValue(undefined);
     const replaceRegion = vi.fn().mockResolvedValue(undefined);

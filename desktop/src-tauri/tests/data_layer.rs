@@ -8,7 +8,7 @@ use base64::Engine;
 use data_encoding::HEXLOWER;
 use filetime::FileTime;
 use gwp_annotator_core::core::commands::CommandError;
-use gwp_annotator_core::core::error::CoreError;
+use gwp_annotator_core::core::error::{BackupStage, CoreError};
 use gwp_annotator_core::core::scan::{MediaKind, PublicAsset, PublicCase, PublicScan};
 use gwp_annotator_core::core::service::{
     CaptureFrameRequest, RefineRegionGeometryRequest, ReplaceRegionRequest, RestoreStatus,
@@ -875,7 +875,15 @@ fn privacy_leak_scan() {
             .get(session_path)
             .expect("local-only project session"),
     );
-    assert!(session_text.contains(fixture.source_root.to_string_lossy().as_ref()));
+    let session_json: serde_json::Value =
+        serde_json::from_str(&session_text).expect("parse local-only project session");
+    let expected_source_root = fixture.source_root.to_string_lossy();
+    assert_eq!(
+        session_json
+            .get("source_root")
+            .and_then(|value| value.as_str()),
+        Some(expected_source_root.as_ref())
+    );
     assert!(!session_text.contains(&case.case_id));
     assert!(!session_text.contains("20240101_CASE-ALPHA"));
     assert!(!session_text.contains("ASSET-01.JPG"));
@@ -2517,7 +2525,12 @@ fn decoded_image_dimensions_are_validated_and_preserved_across_representative_re
 
 #[test]
 fn completed_case_backup_replaces_one_current_snapshot_and_includes_global_captures() {
-    let fixture = fixture(1);
+    let mut fixture = fixture(1);
+    fixture.work_root = fixture
+        ._temporary
+        .path()
+        .join("GWP Annotator Data With Spaces")
+        .join("PROJECT-LOCAL");
     let alpha_case_directory = fixture
         .source_root
         .join("CAMPUS-ALPHA")
@@ -2813,8 +2826,47 @@ fn failed_current_backup_promotion_restores_the_prior_snapshot() {
             .expect("prior snapshot region count"),
         1
     );
+    drop(connection);
+    let reopened = service(&fixture);
+    reopened
+        .restore_project_session()
+        .expect("reopen live database after failed backup publication");
+    assert_eq!(
+        reopened
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .expect("live regions survive failed backup publication")
+            .len(),
+        2
+    );
     assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
     assert!(!case.case_id.is_empty());
+}
+
+#[test]
+fn command_error_backup_diagnostic_serialization_is_privacy_safe() {
+    let with_os_error = CommandError::from(
+        CoreError::StateUnavailable
+            .at_backup_stage_with_os_error(BackupStage::VerifyDatabaseOpen, Some(5)),
+    );
+    assert_eq!(
+        serde_json::to_value(with_os_error).expect("serialize backup diagnostic"),
+        serde_json::json!({
+            "code": "STATE_UNAVAILABLE",
+            "backup_stage": "VERIFY_DATABASE_OPEN",
+            "os_error": 5
+        })
+    );
+
+    let without_os_error =
+        CommandError::from(CoreError::Filesystem.at_backup_stage(BackupStage::PrepareStaging));
+    assert_eq!(
+        serde_json::to_value(without_os_error)
+            .expect("serialize backup diagnostic without OS code"),
+        serde_json::json!({
+            "code": "FILESYSTEM_ERROR",
+            "backup_stage": "PREPARE_STAGING"
+        })
+    );
 }
 
 #[test]
