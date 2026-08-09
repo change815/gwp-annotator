@@ -911,7 +911,7 @@ function mountMarkup(state: State): string {
                 const toggle = item.media_kind === "image"
                   ? `<button type="button" class="representative-button" data-action="representative" data-asset-id="${escapeHtml(item.asset_id)}" ${interactionLocked} ${representative && state.regions.some((region) => region.asset_id === item.asset_id) ? "title=\"已有保存区域，不能取消\"" : ""}>${representative ? "取消代表" : "设为代表"}</button>`
                   : `<span class="deferred-badge">可播放与截帧</span>`;
-                return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"} ${interactionLocked}>${assetLabel(item, index)}</button>${toggle}</article>`;
+                return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"}" ${interactionLocked}>${assetLabel(item, index)}</button>${toggle}</article>`;
               })
               .join("")}
           </div>

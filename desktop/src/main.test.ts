@@ -862,6 +862,35 @@ describe("local shell", () => {
     });
   });
 
+  it("renders and activates a separate representative-image button", async () => {
+    const selectRepresentative = vi.fn().mockResolvedValue({
+      case_id: "CASE-SYNTHETIC",
+      asset_id: "ASSET-SYNTHETIC",
+      representative_count: 1,
+    });
+    installSyntheticMediaDom();
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({
+      representativeAssetIds: vi.fn().mockResolvedValue([]),
+      savedRegionsForAsset: vi.fn().mockResolvedValue([]),
+      selectRepresentative,
+    }) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLButtonElement>('[data-action="asset"]')?.textContent).toContain("图片 01");
+      expect(document.querySelector<HTMLButtonElement>('[data-action="asset"]')?.getAttribute("aria-current")).toBe("true");
+      expect(document.querySelector<HTMLButtonElement>('[data-action="representative"]')?.textContent).toBe("设为代表");
+    });
+    document.querySelector<HTMLButtonElement>('[data-action="representative"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(selectRepresentative).toHaveBeenCalledWith("CASE-SYNTHETIC", "ASSET-SYNTHETIC");
+      expect(document.querySelector<HTMLButtonElement>('[data-action="representative"]')?.textContent).toBe("取消代表");
+      expect(document.querySelector(".annotation-state")?.textContent).toContain("可圈选");
+      expect(document.querySelector(".notice")?.textContent).toContain("已选择为代表图");
+    });
+  });
+
   it("continues a free lasso after mouse release and opens labels when it returns to its start", async () => {
     await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ savedRegionsForAsset: vi.fn().mockResolvedValue([]) }));
 
