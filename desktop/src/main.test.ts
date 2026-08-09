@@ -617,6 +617,39 @@ describe("local shell", () => {
     });
   });
 
+  it("keeps the Stage 4 three-region, selection, disabled, dialog, and canvas-size contracts", async () => {
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi());
+
+    const layout = document.querySelector<HTMLElement>('[data-workspace-layout="three-region"]');
+    expect(document.querySelector(".workbench")?.getAttribute("data-visual-density")).toBe("compact-clinical");
+    expect(layout).not.toBeNull();
+    expect(layout?.querySelectorAll(":scope > [data-workspace-zone]")).toHaveLength(3);
+    expect(layout?.querySelector('[data-workspace-zone="case-navigation"]')).not.toBeNull();
+    expect(layout?.querySelector('[data-workspace-zone="media-canvas"]')).not.toBeNull();
+    expect(layout?.querySelector('[data-workspace-zone="annotation-inspector"]')).not.toBeNull();
+
+    const mediaPanel = layout?.querySelector<HTMLElement>('[data-workspace-zone="media-canvas"]');
+    const canvasFrame = mediaPanel?.querySelector<HTMLElement>("[data-canvas-frame]");
+    expect(mediaPanel?.children).toHaveLength(3);
+    expect(mediaPanel?.children[0]?.classList.contains("media-toolbar")).toBe(true);
+    expect(mediaPanel?.children[1]).toBe(canvasFrame);
+    expect(mediaPanel?.children[2]?.classList.contains("media-strip")).toBe(true);
+
+    expect(document.querySelector('.case-item.selected')?.getAttribute("aria-selected")).toBe("true");
+    expect(document.querySelector('.media-item.current')?.getAttribute("data-selected")).toBe("true");
+    expect(document.querySelector('.media-item.current [data-action="asset"]')?.getAttribute("aria-current")).toBe("true");
+    expect(document.querySelector('.region-item.selected')?.getAttribute("data-selected")).toBe("true");
+    expect(document.querySelector('.region-item.selected [data-region-id]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector<HTMLButtonElement>('[data-action="previous"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="next"]')?.disabled).toBe(true);
+    expect(document.querySelector('[data-canvas-frame]')?.getAttribute("data-canvas-size-contract")).toBe("contained");
+
+    document.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.click();
+    await vi.waitFor(() => expect(document.querySelector('[data-dialog-layer="modal"]')).not.toBeNull());
+    expect(document.querySelector('[data-edit-dialog]')?.getAttribute("data-dialog-kind")).toBe("edit-region");
+    expect(document.querySelector('[data-edit-dialog]')?.getAttribute("aria-modal")).toBe("true");
+  });
+
   it("shows the selected-region refinement entry and source-pixel brush controls", async () => {
     await openSyntheticRefinement(loadedRefinementApi());
 

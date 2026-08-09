@@ -899,10 +899,10 @@ function mountMarkup(state: State): string {
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
   return `
-    <main class="workbench" aria-labelledby="app-title">
-      <header class="app-header">
-        <div><h1 id="app-title">GWP Annotator</h1><p>本地医生标注工作台</p></div>
-        <div class="header-actions">
+    <main class="workbench" aria-labelledby="app-title" data-stage="4" data-visual-density="compact-clinical">
+      <header class="app-header" data-workspace-zone="project-toolbar">
+        <div class="app-identity"><h1 id="app-title">GWP Annotator</h1><p>本地医生标注工作台</p></div>
+        <div class="header-actions" role="toolbar" aria-label="项目操作">
           <button type="button" data-action="choose-root" ${chooseRootLocked ? "disabled" : ""}>${state.projectLoadPending === "selection" ? "正在选择数据目录…" : "更换数据目录"}</button>
           <button type="button" data-action="reload-project" ${interactionLocked}>${state.projectLoadPending === "reload" ? "正在重新加载…" : state.projectLoadPending === "startup" ? "正在恢复项目…" : "重新加载项目数据"}</button>
           <button type="button" data-action="forget-position" ${interactionLocked}>忘记上次位置</button>
@@ -910,15 +910,15 @@ function mountMarkup(state: State): string {
           <span class="offline-status" data-testid="offline-status">本地离线</span>
         </div>
       </header>
-      <p class="notice ${state.messageKind}" role="status" aria-live="polite">${escapeHtml(state.message)}</p>
+      <p class="notice ${state.messageKind}" role="status" aria-live="polite" data-status-kind="${state.messageKind}">${escapeHtml(state.message)}</p>
       ${state.storageLocationVisible ? `<section class="storage-location" aria-label="数据保存位置"><strong>数据保存位置</strong><output>${escapeHtml(state.storageLocation ?? "正在读取…")}</output><span>Windows 中该目录位于软件安装目录旁边；安装在 D 盘时，标注数据也保存在 D 盘。</span></section>` : ""}
-      <section class="template-strip" aria-label="标签模板">
+      <section class="template-strip" aria-label="标签模板" data-workspace-zone="template-toolbar">
         <strong>标签模板</strong>
         <span>${state.template ? `当前模板：${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。请选择 label-template-v1.toml。"}</span>
         <label class="file-button ${templateInputDisabled ? "disabled" : ""}">${state.templateInstallPending ? "正在验证…" : state.template ? "更换模板" : "导入模板"}<input data-action="template-file" type="file" accept="${state.template ? ".toml,text/plain" : ".toml,.txt,text/plain"}" aria-label="${state.template ? "更换标签模板" : "导入标签模板"}" ${templateInputDisabled ? "disabled" : ""}></label>
       </section>
-      <div class="workspace-grid">
-        <aside class="case-sidebar" aria-label="院区与病例">
+      <div class="workspace-grid" data-workspace-layout="three-region">
+        <aside class="case-sidebar" aria-label="院区与病例" data-workspace-zone="case-navigation">
           <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>
             ${state.campuses
               .map(
@@ -936,10 +936,10 @@ function mountMarkup(state: State): string {
               .join("") || `<p class="empty-copy">选择根目录后显示院区和病例。</p>`}
           </div>
         </aside>
-        <section class="media-panel" aria-label="媒体工作区">
+        <section class="media-panel" aria-label="媒体工作区" data-workspace-zone="media-canvas">
           <div class="media-toolbar">
-            <div><strong>${currentCase ? escapeHtml(currentCase.displayLabel) : "未选择病例"}</strong><span>${asset ? `${currentIndex} / ${media.length}` : ""}</span></div>
-            <div class="media-actions">
+            <div class="media-context"><strong>${currentCase ? escapeHtml(currentCase.displayLabel) : "未选择病例"}</strong><span>${asset ? `${currentIndex} / ${media.length}` : ""}</span></div>
+            <div class="media-actions" role="toolbar" aria-label="媒体操作">
               <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>上一张</button>
               <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || annotationOperationLocked || projectLoadPending ? "disabled" : ""}>下一张</button>
               <button type="button" data-action="fit" ${isImage && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>适配</button>
@@ -955,7 +955,7 @@ function mountMarkup(state: State): string {
               <button type="button" data-action="refinement-cancel" ${state.refinement.saving ? "disabled" : ""}>取消</button>
             </div>` : ""}
           </div>
-          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""} ${refining ? "refinement-mode" : ""}" data-canvas-frame>
+          <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""} ${refining ? "refinement-mode" : ""}" data-canvas-frame data-canvas-size-contract="contained" aria-busy="${state.imageLoading}">
             ${!asset ? `<p class="empty-copy">从左侧选择病例。</p>` : ""}
             ${asset?.media_kind === "video" && currentCase ? `<div class="video-player"><video data-video-player preload="metadata" src="gwp-media://localhost/video/${encodeURIComponent(currentCase.case_id)}/${encodeURIComponent(asset.asset_id)}"></video><div class="video-controls"><button type="button" data-action="video-play">${state.videoPlaying ? "暂停" : "播放"}</button><input data-action="video-seek" type="range" min="0" max="${Math.max(state.videoDuration, 0)}" value="${Math.min(state.videoTime, state.videoDuration || 0)}" step="0.01" aria-label="视频进度"><output data-video-time>${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}</output><button type="button" data-action="capture-frame" ${state.capturePending ? "disabled" : ""}>${state.capturePending ? "正在截帧…" : "截取当前帧"}</button></div><p>截帧仅保存到本应用工作目录，并归属于当前病例；原始病例目录保持只读。</p></div>` : ""}
             ${isImage ? `<canvas data-drawing-canvas aria-label="图片标注画布" tabindex="0"></canvas>` : ""}
@@ -975,19 +975,19 @@ function mountMarkup(state: State): string {
                 const toggle = item.media_kind === "image"
                   ? `<button type="button" class="representative-button" data-action="representative" data-asset-id="${escapeHtml(item.asset_id)}" ${interactionLocked} ${representative && state.regions.some((region) => region.asset_id === item.asset_id) ? "title=\"已有保存区域，不能取消\"" : ""}>${representative ? "取消代表" : "设为代表"}</button>`
                   : `<span class="deferred-badge">可播放与截帧</span>`;
-                return `<article class="media-item ${isCurrent ? "current" : ""}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"}" ${interactionLocked}>${assetLabel(item, index)}</button>${toggle}</article>`;
+                return `<article class="media-item ${isCurrent ? "current" : ""}" data-selected="${isCurrent}"><button type="button" data-action="asset" data-index="${index}" aria-current="${isCurrent ? "true" : "false"}" ${interactionLocked}>${assetLabel(item, index)}</button>${toggle}</article>`;
               })
               .join("")}
           </div>
         </section>
-        <aside class="region-sidebar" aria-label="区域列表">
+        <aside class="region-sidebar" aria-label="区域列表" data-workspace-zone="annotation-inspector">
           <div class="region-sidebar-header"><h2>已保存区域</h2><button type="button" data-action="reload-regions" ${isImage && imageReady && !annotationOperationLocked && !projectLoadPending ? "" : "disabled"}>重新加载当前图片</button></div>
           <p>${asset && isImage ? `${state.regions.length} 个区域` : "选择图片后查看"}</p>
           <div class="region-list">
             ${state.regions
               .map(
                 (region, index) =>
-                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="refine-region" data-region-id="${escapeHtml(region.region_id)}" ${canStartRefinement(selectedRegion, imageReady, isRepresentative) && !geometryDraftActive ? "" : "disabled"}>精修边界</button><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady && !geometryDraftActive ? "" : "disabled"}>重画并替换</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>删除</button></div>` : ""}</article>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}" data-selected="${region.region_id === state.selectedRegionId}"><button type="button" data-region-id="${escapeHtml(region.region_id)}" aria-pressed="${region.region_id === state.selectedRegionId}" ${interactionLocked}>区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="refine-region" data-region-id="${escapeHtml(region.region_id)}" ${canStartRefinement(selectedRegion, imageReady, isRepresentative) && !geometryDraftActive ? "" : "disabled"}>精修边界</button><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady && !geometryDraftActive ? "" : "disabled"}>重画并替换</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
@@ -995,8 +995,8 @@ function mountMarkup(state: State): string {
         </aside>
       </div>
       ${state.labelDraft && state.template ? `
-        <div class="modal-backdrop" data-action="cancel-draft">
-          <section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="label-dialog-title" data-label-dialog tabindex="-1">
+        <div class="modal-backdrop" data-action="cancel-draft" data-dialog-layer="modal">
+          <section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="label-dialog-title" data-label-dialog data-dialog-kind="create-region" tabindex="-1">
             <header><h2 id="label-dialog-title">填写区域标签</h2><button type="button" data-action="cancel-draft" aria-label="取消" ${state.labelSubmitPending ? "disabled" : ""}>取消</button></header>
             <p>${state.replaceRegionId ? "将替换已保存区域；确认后旧区域保留操作记录但不再用于训练。" : "区域尚未保存。完成必填项后才可确认。"}</p>
             <form data-label-form>
@@ -1005,7 +1005,7 @@ function mountMarkup(state: State): string {
             </form>
           </section>
         </div>` : ""}
-      ${state.editLabels ? `<div class="modal-backdrop" data-action="cancel-edit"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button></header><p>使用该区域原来的 ${escapeHtml(state.editLabels.template.template_id)} v${state.editLabels.template.version} 模板；确认后保留修正记录。</p><form data-edit-label-form>${state.editLabels.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id], state.editLabelSubmitPending)).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button><button type="submit" ${state.editLabelSubmitPending || !labelsMeetRequiredFields(state.editLabels.template.fields, state.editLabels.values) ? "disabled" : ""}>${state.editLabelSubmitPending ? "正在保存…" : "确认修改"}</button></div></form></section></div>` : ""}
+      ${state.editLabels ? `<div class="modal-backdrop" data-action="cancel-edit" data-dialog-layer="modal"><section class="label-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-label-title" tabindex="-1" data-edit-dialog data-dialog-kind="edit-region"><header><h2 id="edit-label-title">修改区域标签</h2><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button></header><p>使用该区域原来的 ${escapeHtml(state.editLabels.template.template_id)} v${state.editLabels.template.version} 模板；确认后保留修正记录。</p><form data-edit-label-form>${state.editLabels.template.fields.map((field) => controlMarkup(field, state.editLabels?.values[field.id], state.editLabelSubmitPending)).join("")}<div class="dialog-actions"><button type="button" data-action="cancel-edit" ${state.editLabelSubmitPending ? "disabled" : ""}>取消</button><button type="submit" ${state.editLabelSubmitPending || !labelsMeetRequiredFields(state.editLabels.template.fields, state.editLabels.values) ? "disabled" : ""}>${state.editLabelSubmitPending ? "正在保存…" : "确认修改"}</button></div></form></section></div>` : ""}
     </main>`;
 }
 
