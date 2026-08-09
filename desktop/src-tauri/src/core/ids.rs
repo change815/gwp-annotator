@@ -67,8 +67,21 @@ enum CredentialStoreError {
 
 struct KeyringCredentialStore;
 
+fn ensure_persistent_keyring_backend() -> Result<(), CredentialStoreError> {
+    #[cfg(target_os = "windows")]
+    if !matches!(
+        keyring::default::default_credential_builder().persistence(),
+        keyring::credential::CredentialPersistence::UntilDelete
+    ) {
+        return Err(CredentialStoreError::Unavailable);
+    }
+
+    Ok(())
+}
+
 impl CredentialStore for KeyringCredentialStore {
     fn read(&self, project_id: &str) -> Result<String, CredentialStoreError> {
+        ensure_persistent_keyring_backend()?;
         let entry = keyring::Entry::new("com.local.gwpannotator.project-secret", project_id)
             .map_err(|_| CredentialStoreError::Unavailable)?;
         match entry.get_password() {
@@ -79,6 +92,7 @@ impl CredentialStore for KeyringCredentialStore {
     }
 
     fn write(&self, project_id: &str, encoded_secret: &str) -> Result<(), CredentialStoreError> {
+        ensure_persistent_keyring_backend()?;
         let entry = keyring::Entry::new("com.local.gwpannotator.project-secret", project_id)
             .map_err(|_| CredentialStoreError::Unavailable)?;
         entry
@@ -207,8 +221,9 @@ fn decode_secret(encoded: &str) -> CoreResult<ProjectSecret> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         asset_id, case_id, is_opaque_id, CredentialStore, CredentialStoreError,
@@ -221,6 +236,12 @@ mod tests {
         failure: CredentialStoreError,
     }
 
+    #[derive(Default)]
+    struct PersistentCredentialStore {
+        values: Mutex<HashMap<String, String>>,
+        writes: AtomicUsize,
+    }
+
     impl CredentialStore for FailingCredentialStore {
         fn read(&self, _: &str) -> Result<String, CredentialStoreError> {
             Err(self.failure)
@@ -230,6 +251,36 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    impl CredentialStore for PersistentCredentialStore {
+        fn read(&self, project_id: &str) -> Result<String, CredentialStoreError> {
+            self.values
+                .lock()
+                .map_err(|_| CredentialStoreError::Unavailable)?
+                .get(project_id)
+                .cloned()
+                .ok_or(CredentialStoreError::NoEntry)
+        }
+
+        fn write(
+            &self,
+            project_id: &str,
+            encoded_secret: &str,
+        ) -> Result<(), CredentialStoreError> {
+            self.values
+                .lock()
+                .map_err(|_| CredentialStoreError::Unavailable)?
+                .insert(project_id.to_owned(), encoded_secret.to_owned());
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn production_windows_keyring_is_persistent() {
+        assert!(super::ensure_persistent_keyring_backend().is_ok());
     }
 
     #[test]
@@ -272,5 +323,29 @@ mod tests {
 
         assert!(provider.secret_for("PROJECT-LOCAL").is_ok());
         assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reconstructed_provider_reuses_the_persisted_secret() {
+        let backing = Arc::new(PersistentCredentialStore::default());
+        let first_store: Arc<dyn CredentialStore> = backing.clone();
+        let first = SystemCredentialSecretProvider { store: first_store };
+        let first_secret = first
+            .secret_for("PROJECT-SYNTHETIC")
+            .expect("create synthetic project secret");
+        let first_case = case_id(&first_secret, "CAMPUS-SYNTHETIC", "CASE-SYNTHETIC");
+        drop(first);
+
+        let second_store: Arc<dyn CredentialStore> = backing.clone();
+        let second = SystemCredentialSecretProvider {
+            store: second_store,
+        };
+        let second_secret = second
+            .secret_for("PROJECT-SYNTHETIC")
+            .expect("reload synthetic project secret");
+        let second_case = case_id(&second_secret, "CAMPUS-SYNTHETIC", "CASE-SYNTHETIC");
+
+        assert_eq!(second_case, first_case);
+        assert_eq!(backing.writes.load(Ordering::SeqCst), 1);
     }
 }
