@@ -116,7 +116,13 @@ function chooseTemplateFile(fileName: string, contents: string | Uint8Array = "v
   input?.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function installSyntheticMediaDom(): void {
+function installSyntheticMediaDom(): {
+  strokeStyles: string[];
+  fillStyles: string[];
+  drawImage: ReturnType<typeof vi.fn>;
+} {
+  const strokeStyles: string[] = [];
+  const fillStyles: string[] = [];
   const context = {
     setTransform: vi.fn(),
     clearRect: vi.fn(),
@@ -129,6 +135,18 @@ function installSyntheticMediaDom(): void {
     fill: vi.fn(),
     arc: vi.fn(),
   };
+  Object.defineProperties(context, {
+    strokeStyle: {
+      set(value: string) {
+        strokeStyles.push(value);
+      },
+    },
+    fillStyle: {
+      set(value: string) {
+        fillStyles.push(value);
+      },
+    },
+  });
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as never);
   vi.spyOn(HTMLCanvasElement.prototype, "clientWidth", "get").mockReturnValue(100);
   vi.spyOn(HTMLCanvasElement.prototype, "clientHeight", "get").mockReturnValue(100);
@@ -158,9 +176,13 @@ function installSyntheticMediaDom(): void {
       queueMicrotask(() => this.onload?.(new Event("load")));
     }
   });
+  return { strokeStyles, fillStyles, drawImage: context.drawImage };
 }
 
-function loadedRefinementApi(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function loadedSyntheticAnnotationApi(
+  overrides: Record<string, unknown> = {},
+  assets = [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image" as const, size_bytes: 1024 }],
+): Record<string, unknown> {
   const scan = {
     campuses: [
       {
@@ -170,7 +192,7 @@ function loadedRefinementApi(overrides: Record<string, unknown> = {}): Record<st
           {
             case_id: "CASE-SYNTHETIC",
             date: "2026-08-09",
-            assets: [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image", size_bytes: 1024 }],
+            assets,
           },
         ],
       },
@@ -206,21 +228,26 @@ function loadedRefinementApi(overrides: Record<string, unknown> = {}): Record<st
   });
 }
 
+function loadedRefinementApi(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return loadedSyntheticAnnotationApi(overrides);
+}
+
 function dispatchPointer(
   canvas: HTMLCanvasElement,
-  type: "pointerdown" | "pointerup" | "pointercancel" | "lostpointercapture",
+  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel" | "lostpointercapture",
   x: number,
   y: number,
+  options: { buttons?: number; pointerId?: number; button?: number } = {},
 ): void {
   const event = new MouseEvent(type, {
     bubbles: true,
-    button: 0,
-    buttons: type === "pointerdown" ? 1 : 0,
+    button: options.button ?? 0,
+    buttons: options.buttons ?? (type === "pointerdown" ? 1 : 0),
     clientX: x,
     clientY: y,
   });
   Object.defineProperties(event, {
-    pointerId: { value: 1 },
+    pointerId: { value: options.pointerId ?? 1 },
     pointerType: { value: "mouse" },
   });
   canvas.dispatchEvent(event);
@@ -245,6 +272,16 @@ async function openSyntheticRefinement(api: Record<string, unknown>): Promise<vo
   document.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.click();
   await vi.waitFor(() => {
     expect(document.querySelector('[aria-label="边界精修"]')).not.toBeNull();
+  });
+}
+
+async function openSyntheticAnnotation(api: Record<string, unknown>): Promise<void> {
+  installSyntheticMediaDom();
+  window.__GWP_API__ = api as never;
+  boot();
+  await vi.waitFor(() => {
+    expect(document.querySelector('[data-drawing-canvas]')).not.toBeNull();
+    expect(document.querySelector('.annotation-state')?.textContent).toContain("可圈选");
   });
 }
 
@@ -580,6 +617,24 @@ describe("local shell", () => {
     expect(refineRegionGeometry.mock.calls[0][0].polygon_norm).toEqual(expected.polygon);
   });
 
+  it("does not discard a completed refinement stroke when re-entry is triggered programmatically", async () => {
+    await openSyntheticRefinement(loadedRefinementApi());
+
+    const canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(canvas);
+    dispatchPointer(canvas, "pointerdown", 22, 50);
+    dispatchPointer(canvas, "pointerup", 5, 50);
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+    });
+
+    document.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.dispatchEvent(
+      new MouseEvent("click", { bubbles: true }),
+    );
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-save"]')?.disabled).toBe(false);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="refinement-undo"]')?.disabled).toBe(false);
+  });
+
   it("keeps completed draft edits across pointer termination and a save conflict", async () => {
     const refineRegionGeometry = vi.fn().mockRejectedValue({ code: "REGION_GEOMETRY_CONFLICT" });
     vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -804,6 +859,148 @@ describe("local shell", () => {
       expect(document.querySelector(".storage-location output")?.textContent).toBe(
         "D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL",
       );
+    });
+  });
+
+  it("continues a free lasso after mouse release and opens labels when it returns to its start", async () => {
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ savedRegionsForAsset: vi.fn().mockResolvedValue([]) }));
+
+    const startCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    installPointerCaptureMocks(startCanvas);
+    dispatchPointer(startCanvas, "pointerdown", 20, 20);
+    dispatchPointer(startCanvas, "pointerup", 20, 20);
+
+    const drawingCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(drawingCanvas, "pointermove", 80, 20, { buttons: 0 });
+    dispatchPointer(drawingCanvas, "pointermove", 80, 80, { buttons: 0 });
+    dispatchPointer(drawingCanvas, "pointermove", 20, 20, { buttons: 0 });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-label-dialog]')).not.toBeNull();
+      expect(document.body.textContent).toContain("填写区域标签");
+    });
+  });
+
+  it("ignores a second left click while a free lasso is active instead of resetting its start", async () => {
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ savedRegionsForAsset: vi.fn().mockResolvedValue([]) }));
+
+    const startCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(startCanvas, "pointerdown", 20, 20);
+
+    const drawingCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(drawingCanvas, "pointerdown", 70, 70);
+    dispatchPointer(drawingCanvas, "pointermove", 80, 20, { buttons: 0 });
+    dispatchPointer(drawingCanvas, "pointermove", 80, 80, { buttons: 0 });
+    dispatchPointer(drawingCanvas, "pointermove", 20, 20, { buttons: 0 });
+
+    await vi.waitFor(() => expect(document.querySelector('[data-label-dialog]')).not.toBeNull());
+  });
+
+  it("discards an unfinished free lasso with Escape without saving", async () => {
+    const saveConfirmedRegion = vi.fn().mockResolvedValue(undefined);
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ saveConfirmedRegion, savedRegionsForAsset: vi.fn().mockResolvedValue([]) }));
+
+    const canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(canvas, "pointerdown", 20, 20);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-label-dialog]')).toBeNull();
+      expect(document.body.textContent).toContain("已丢弃未完成的圈选。");
+    });
+    expect(saveConfirmedRegion).not.toHaveBeenCalled();
+    expect(document.querySelector<HTMLButtonElement>('[data-action="fit"]')?.disabled).toBe(false);
+  });
+
+  it("locks replacement during drawing and clears its target when Escape cancels the lasso", async () => {
+    const saveConfirmedRegion = vi.fn().mockResolvedValue(undefined);
+    const replaceRegion = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await openSyntheticAnnotation(loadedSyntheticAnnotationApi({ saveConfirmedRegion, replaceRegion }));
+
+    document.querySelector<HTMLButtonElement>('[data-action="replace-region"]')?.click();
+    let canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(canvas, "pointerdown", 20, 20);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="replace-region"]')?.disabled).toBe(true);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+
+    canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(canvas, "pointerdown", 20, 20);
+    canvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(canvas, "pointermove", 80, 20, { buttons: 0 });
+    dispatchPointer(canvas, "pointermove", 80, 80, { buttons: 0 });
+    dispatchPointer(canvas, "pointermove", 20, 20, { buttons: 0 });
+
+    await vi.waitFor(() => expect(document.querySelector('[data-label-dialog]')).not.toBeNull());
+    document.querySelector<HTMLFormElement>("[data-label-form]")?.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() => expect(saveConfirmedRegion).toHaveBeenCalledOnce());
+    expect(replaceRegion).not.toHaveBeenCalled();
+  });
+
+  it("locks navigation, backup, and wheel zoom while a free lasso is in progress", async () => {
+    const completeCaseAndBackup = vi.fn().mockResolvedValue({
+      case_id: "CASE-SYNTHETIC",
+      completed_at: 0,
+      capture_count: 0,
+    });
+    const canvasContext = installSyntheticMediaDom();
+    window.__GWP_API__ = loadedSyntheticAnnotationApi(
+      { completeCaseAndBackup, savedRegionsForAsset: vi.fn().mockResolvedValue([]) },
+      [
+        { asset_id: "ASSET-SYNTHETIC", media_kind: "image", size_bytes: 1024 },
+        { asset_id: "ASSET-SECOND", media_kind: "image", size_bytes: 1024 },
+      ],
+    ) as never;
+    boot();
+    await vi.waitFor(() => expect(document.querySelector('[data-drawing-canvas]')).not.toBeNull());
+
+    const startCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    dispatchPointer(startCanvas, "pointerdown", 20, 20);
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("正在圈选");
+      expect(document.querySelector<HTMLButtonElement>('[data-action="next"]')?.disabled).toBe(true);
+      expect(document.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.disabled).toBe(true);
+      expect(document.querySelector<HTMLButtonElement>('[data-action="fit"]')?.disabled).toBe(true);
+    });
+    const drawCallsBeforeWheel = canvasContext.drawImage.mock.calls.length;
+    const drawingCanvas = document.querySelector<HTMLCanvasElement>("[data-drawing-canvas]") as HTMLCanvasElement;
+    const wheel = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -120, clientX: 50, clientY: 50 });
+    drawingCanvas.dispatchEvent(wheel);
+    document.querySelector<HTMLButtonElement>('[data-action="next"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    document.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(canvasContext.drawImage).toHaveBeenCalledTimes(drawCallsBeforeWheel);
+    expect(completeCaseAndBackup).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("1 / 2");
+  });
+
+  it("restores saved regions on cold startup, exposes reload, and renders blue contours", async () => {
+    const savedRegionsForAsset = vi.fn().mockResolvedValue([syntheticRegion]);
+    const canvasContext = installSyntheticMediaDom();
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({ savedRegionsForAsset }) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(savedRegionsForAsset).toHaveBeenCalledWith("CASE-SYNTHETIC", "ASSET-SYNTHETIC");
+      expect(document.body.textContent).toContain("1 个区域");
+      expect(document.querySelector(".notice")?.textContent).toContain("当前图片已加载 1 个已保存区域。");
+      expect(canvasContext.strokeStyles).toContain("#2563eb");
+      expect(canvasContext.fillStyles).toContain("rgba(59, 130, 246, 0.12)");
+    });
+    expect(canvasContext.strokeStyles).not.toEqual(expect.arrayContaining(["#b45309", "#0e7490", "#c2410c"]));
+    expect(canvasContext.fillStyles).not.toEqual(expect.arrayContaining(["rgba(249, 115, 22, 0.12)"]));
+
+    savedRegionsForAsset.mockClear();
+    document.querySelector<HTMLButtonElement>('[data-action="reload-regions"]')?.click();
+    await vi.waitFor(() => {
+      expect(savedRegionsForAsset).toHaveBeenCalledOnce();
+      expect(savedRegionsForAsset).toHaveBeenCalledWith("CASE-SYNTHETIC", "ASSET-SYNTHETIC");
+      expect(document.querySelector(".notice")?.textContent).toContain("已从本地数据库重新加载 1 个已保存区域。");
     });
   });
 });

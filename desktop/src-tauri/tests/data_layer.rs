@@ -1459,6 +1459,76 @@ fn fixed_toml_template_validates_labels_and_reloads_with_the_saved_session() {
 }
 
 #[test]
+fn original_image_regions_reload_after_case_backup_and_service_recreation() {
+    let fixture = fixture(1);
+    let source_before = source_tree_snapshot(&fixture.source_root);
+    let (case, asset, expected_region_id, expected_labels, expected_polygon) = {
+        let service = service(&fixture);
+        let scan = service
+            .scan_selected_root(&fixture.source_root)
+            .expect("scan synthetic fixture");
+        let (case, asset) = first_image(&scan);
+        service
+            .install_fixed_toml_template(V02_TOML_TEMPLATE)
+            .expect("install fixed TOML template");
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .expect("select original image representative");
+
+        let expected_region_id = "REGION-REOPENAA".to_owned();
+        let expected_labels = v02_labels("dropdown_b");
+        let request = v02_region_request(
+            &expected_region_id,
+            asset.asset_id.clone(),
+            expected_labels.clone(),
+        );
+        let expected_polygon = request.polygon_norm.clone();
+        service
+            .save_confirmed_region(request)
+            .expect("save original image region");
+        service
+            .save_last_position(&case.case_id, &asset.asset_id)
+            .expect("save original image position");
+        service
+            .complete_case_and_backup(&case.case_id)
+            .expect("complete synthetic case and back up");
+
+        (
+            case,
+            asset,
+            expected_region_id,
+            expected_labels,
+            expected_polygon,
+        )
+    };
+
+    let reopened = service(&fixture);
+    let restored = reopened
+        .restore_project_session()
+        .expect("restore saved synthetic project session");
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        restored.current_case_id.as_deref(),
+        Some(case.case_id.as_str())
+    );
+    assert_eq!(
+        restored.current_asset_id.as_deref(),
+        Some(asset.asset_id.as_str())
+    );
+
+    let regions = reopened
+        .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+        .expect("reload original image regions");
+    assert_eq!(regions.len(), 1);
+    let region = &regions[0];
+    assert_eq!(region.region_id, expected_region_id);
+    assert_eq!(region.asset_id, asset.asset_id);
+    assert_eq!(region.labels, expected_labels);
+    assert_eq!(region.polygon_norm, expected_polygon);
+    assert_eq!(source_tree_snapshot(&fixture.source_root), source_before);
+}
+
+#[test]
 fn controlled_template_replacement_preserves_historical_regions_and_snapshots() {
     let fixture = fixture(1);
     let (case, asset) = {

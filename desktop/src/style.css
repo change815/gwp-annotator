@@ -612,6 +612,19 @@ canvas:focus-visible {
   font-size: 0.76rem;
 }
 
+.region-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.region-sidebar-header button {
+  min-height: 28px;
+  padding: 0.18rem 0.4rem;
+  font-size: 0.76rem;
+}
+
 .region-sidebar h2 {
   margin: 0;
   font-size: 1rem;

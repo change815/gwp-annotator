@@ -269,8 +269,12 @@ interface ViewState {
   panY: number;
 }
 
-interface DraftRegion {
+interface RegionDraft {
   points: PointNorm[];
+}
+
+interface DrawingDraft extends RegionDraft {
+  pointerId: number;
 }
 
 interface EditLabelsDraft {
@@ -314,8 +318,8 @@ interface State {
   imageLoading: boolean;
   view: ViewState;
   panMode: boolean;
-  drawing: DraftRegion | null;
-  labelDraft: DraftRegion | null;
+  drawing: DrawingDraft | null;
+  labelDraft: RegionDraft | null;
   labelValues: Record<string, LabelValue>;
   replaceRegionId: string | null;
   editLabels: EditLabelsDraft | null;
@@ -625,6 +629,8 @@ function getApi(): AppApi {
   return window.__GWP_API__ ?? tauriApi;
 }
 
+let activeAppKeydownHandler: ((event: KeyboardEvent) => void) | null = null;
+
 function errorCode(error: unknown): string {
   if (typeof error === "object" && error && "code" in error) {
     return String((error as { code: string }).code);
@@ -813,7 +819,9 @@ function mountMarkup(state: State): string {
   const imageReady = Boolean(state.image && state.imageAssetId === asset?.asset_id);
   const selectedRegion = state.regions.find((region) => region.region_id === state.selectedRegionId) ?? null;
   const refining = Boolean(state.refinement);
-  const interactionLocked = refining ? "disabled" : "";
+  const drawing = Boolean(state.drawing);
+  const geometryDraftActive = refining || drawing;
+  const interactionLocked = geometryDraftActive ? "disabled" : "";
   const crosshairVisible = shouldShowCustomCrosshair(
     isRepresentative,
     templateReady,
@@ -823,7 +831,7 @@ function mountMarkup(state: State): string {
     Boolean(state.labelDraft),
   );
   const crosshairReady = annotationReady && !state.panMode && imageReady && !state.labelDraft && !refining;
-  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || refining;
+  const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || geometryDraftActive;
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
 
@@ -847,7 +855,7 @@ function mountMarkup(state: State): string {
       </section>
       <div class="workspace-grid">
         <aside class="case-sidebar" aria-label="院区与病例">
-          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || refining ? "disabled" : ""}>
+          <label>院区<select data-action="campus" aria-label="切换院区" ${state.campuses.length === 0 || geometryDraftActive ? "disabled" : ""}>
             ${state.campuses
               .map(
                 (item) =>
@@ -868,11 +876,11 @@ function mountMarkup(state: State): string {
           <div class="media-toolbar">
             <div><strong>${currentCase ? escapeHtml(currentCase.displayLabel) : "未选择病例"}</strong><span>${asset ? `${currentIndex} / ${media.length}` : ""}</span></div>
             <div class="media-actions">
-              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || refining ? "disabled" : ""}>上一张</button>
-              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || refining ? "disabled" : ""}>下一张</button>
-              <button type="button" data-action="fit" ${isImage && !refining ? "" : "disabled"}>适配</button>
-              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage && !refining ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
-              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending && !refining ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
+              <button type="button" data-action="previous" aria-label="上一张" title="上一张" ${state.assetIndex <= 0 || geometryDraftActive ? "disabled" : ""}>上一张</button>
+              <button type="button" data-action="next" aria-label="下一张" title="下一张" ${state.assetIndex >= media.length - 1 || geometryDraftActive ? "disabled" : ""}>下一张</button>
+              <button type="button" data-action="fit" ${isImage && !geometryDraftActive ? "" : "disabled"}>适配</button>
+              <button type="button" data-action="pan" aria-pressed="${state.panMode}" title="启用后左键拖动可平移图片" class="${state.panMode ? "active" : ""}" ${isImage && !geometryDraftActive ? "" : "disabled"}>${state.panMode ? "平移中" : "拖动平移"}</button>
+              <button type="button" data-action="complete-backup" ${currentCase && !state.backupPending && !geometryDraftActive ? "" : "disabled"}>${state.backupPending ? "正在备份…" : "完成本病例并备份"}</button>
             </div>
             ${state.refinement ? `<div class="refinement-toolbar" role="toolbar" aria-label="边界精修">
               <strong>边界精修</strong>
@@ -891,7 +899,8 @@ function mountMarkup(state: State): string {
             ${state.imageLoading ? `<div class="loading-cover">正在读取图片…</div>` : ""}
             ${isImage && !isRepresentative ? `<div class="canvas-hint">请先将当前图片选择为代表图，才可圈选。</div>` : ""}
             ${isImage && isRepresentative && !state.template ? `<div class="canvas-hint">请先加载标签模板，才可保存圈选。</div>` : ""}
-            ${isImage && annotationReady && !refining ? `<div class="canvas-hint ready">左键开始自由圈选，回到起点附近自动闭合。</div>` : ""}
+            ${isImage && annotationReady && !geometryDraftActive ? `<div class="canvas-hint ready">单击左键开始圈选。</div>` : ""}
+            ${isImage && state.drawing ? `<div class="canvas-hint ready">移动鼠标勾画，回到起点附近自动闭合；Esc 取消。</div>` : ""}
             ${isImage && state.refinement ? `<div class="canvas-hint refinement-hint">起点在区域内为内擦，区域外为外扩；一笔内模式锁定。</div>` : ""}
           </div>
           <div class="media-strip" aria-label="当前病例媒体序列">
@@ -908,17 +917,17 @@ function mountMarkup(state: State): string {
           </div>
         </section>
         <aside class="region-sidebar" aria-label="区域列表">
-          <h2>已保存区域</h2>
+          <div class="region-sidebar-header"><h2>已保存区域</h2><button type="button" data-action="reload-regions" ${isImage && imageReady && !geometryDraftActive ? "" : "disabled"}>重新加载勾画</button></div>
           <p>${asset && isImage ? `${state.regions.length} 个区域` : "选择图片后查看"}</p>
           <div class="region-list">
             ${state.regions
               .map(
                 (region, index) =>
-                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="refine-region" data-region-id="${escapeHtml(region.region_id)}" ${canStartRefinement(selectedRegion, imageReady, isRepresentative) && !refining ? "" : "disabled"}>精修边界</button><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady && !refining ? "" : "disabled"}>重画并替换</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>删除</button></div>` : ""}</article>`,
+                  `<article class="region-item ${region.region_id === state.selectedRegionId ? "selected" : ""}"><button type="button" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>区域 ${String(index + 1).padStart(2, "0")}${state.template && (region.template_id !== state.template.template_id || region.template_version !== state.template.version) ? `<small>旧模板 v${region.template_version}</small>` : ""}</button>${region.region_id === state.selectedRegionId ? `<div class="region-actions"><button type="button" data-action="refine-region" data-region-id="${escapeHtml(region.region_id)}" ${canStartRefinement(selectedRegion, imageReady, isRepresentative) && !geometryDraftActive ? "" : "disabled"}>精修边界</button><button type="button" data-action="edit-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>修改标签</button><button type="button" data-action="replace-region" data-region-id="${escapeHtml(region.region_id)}" ${templateReady && !geometryDraftActive ? "" : "disabled"}>重画并替换</button><button type="button" data-action="delete-region" data-region-id="${escapeHtml(region.region_id)}" ${interactionLocked}>删除</button></div>` : ""}</article>`,
               )
               .join("") || `<p class="empty-copy">尚未保存区域。</p>`}
           </div>
-          <div class="annotation-state ${annotationReady ? "ready" : ""}">${isImage ? annotationReady ? "可圈选" : isRepresentative ? state.template && !templateReady ? "请更换模板" : "等待模板" : "等待代表图" : "图片标注不可用"}</div>
+          <div class="annotation-state ${annotationReady ? "ready" : ""}">${isImage ? state.drawing ? "正在圈选" : annotationReady ? "可圈选" : isRepresentative ? state.template && !templateReady ? "请更换模板" : "等待模板" : "等待代表图" : "图片标注不可用"}</div>
         </aside>
       </div>
       ${state.labelDraft && state.template ? `
@@ -979,7 +988,7 @@ function drawPolygon(
   if (!active && points.length >= 3) context.closePath();
   context.lineWidth = active ? 2.5 : 2;
   context.strokeStyle = color;
-  context.fillStyle = active ? "rgba(249, 115, 22, 0.12)" : "rgba(14, 116, 144, 0.12)";
+  context.fillStyle = active ? "rgba(37, 99, 235, 0.14)" : "rgba(59, 130, 246, 0.12)";
   context.stroke();
   if (!active && points.length >= 3) context.fill();
 }
@@ -1022,6 +1031,10 @@ function drawRefinementOverlay(
 }
 
 function startApp(target: HTMLDivElement): void {
+  if (activeAppKeydownHandler) {
+    window.removeEventListener("keydown", activeAppKeydownHandler);
+    activeAppKeydownHandler = null;
+  }
   const state = initialState();
   const api = getApi();
   let panOrigin: PointNorm | null = null;
@@ -1046,17 +1059,25 @@ function startApp(target: HTMLDivElement): void {
     }
   };
 
-  const refreshRegions = async (): Promise<void> => {
+  const refreshRegions = async (): Promise<number> => {
     const currentCase = selectedCase(state);
     const asset = selectedAsset(state);
     if (!currentCase || !asset || asset.media_kind !== "image") {
       state.regions = [];
-      return;
+      state.selectedRegionId = null;
+      return 0;
     }
-    state.regions = await api.savedRegionsForAsset(currentCase.case_id, asset.asset_id);
+    const requestedCaseId = currentCase.case_id;
+    const requestedAssetId = asset.asset_id;
+    const regions = await api.savedRegionsForAsset(requestedCaseId, requestedAssetId);
+    if (selectedCase(state)?.case_id !== requestedCaseId || selectedAsset(state)?.asset_id !== requestedAssetId) {
+      return state.regions.length;
+    }
+    state.regions = regions;
     if (!state.regions.some((region) => region.region_id === state.selectedRegionId)) {
       state.selectedRegionId = state.regions[0]?.region_id ?? null;
     }
+    return state.regions.length;
   };
 
   const loadImage = async (): Promise<void> => {
@@ -1099,6 +1120,7 @@ function startApp(target: HTMLDivElement): void {
   };
 
   const selectCase = async (caseId: string): Promise<void> => {
+    if (state.drawing || state.refinement) return;
     const previousCase = selectedCase(state);
     const previousAsset = selectedAsset(state);
     if (previousCase && previousAsset) saveViewport(previousCase.case_id, previousAsset.asset_id, state.view);
@@ -1123,6 +1145,7 @@ function startApp(target: HTMLDivElement): void {
   };
 
   const selectAsset = async (index: number): Promise<void> => {
+    if (state.drawing || state.refinement) return;
     const currentCase = selectedCase(state);
     if (!currentCase || index < 0 || index >= currentCase.assets.length) return;
     const previousAsset = selectedAsset(state);
@@ -1194,12 +1217,12 @@ function startApp(target: HTMLDivElement): void {
         polygon,
         transform,
         image,
-        region.region_id === state.selectedRegionId ? "#b45309" : "#0e7490",
+        region.region_id === state.selectedRegionId ? "#2563eb" : "#3b82f6",
         false,
       );
     }
     if (state.drawing) {
-      drawPolygon(context, state.drawing.points, transform, image, "#c2410c", true);
+      drawPolygon(context, state.drawing.points, transform, image, "#2563eb", true);
     }
     if (state.refinement) {
       drawRefinementOverlay(context, state.refinement, transform, image, state.crosshair);
@@ -1269,12 +1292,13 @@ function startApp(target: HTMLDivElement): void {
         draw(canvas);
         return;
       }
+      if (state.drawing) return;
       if (event.button === 1 || event.button === 2 || state.panMode) {
         panOrigin = canvasPoint(event, canvas);
         canvas.setPointerCapture(event.pointerId);
         return;
       }
-      if (event.button !== 0) return;
+      if (event.pointerType !== "mouse" || event.button !== 0) return;
       const templateReady = templateAllowsNewAnnotations(state.template);
       if (!canAnnotate(state.representativeIds.has(asset.asset_id), templateReady)) {
         message(
@@ -1294,9 +1318,9 @@ function startApp(target: HTMLDivElement): void {
         render();
         return;
       }
-      state.drawing = { points: [point] };
-      canvas.setPointerCapture(event.pointerId);
-      draw(canvas);
+      state.drawing = { points: [point], pointerId: event.pointerId };
+      message("已开始圈选；移动鼠标并回到起点附近自动闭合。", "info");
+      render();
     });
     canvas.addEventListener("pointermove", (event) => {
       recordMousePosition(event);
@@ -1327,13 +1351,7 @@ function startApp(target: HTMLDivElement): void {
         return;
       }
       if (!state.drawing) return;
-      if (!primaryDrawingButtonIsPressed(event.buttons)) {
-        state.drawing = null;
-        state.labelValues = {};
-        message("未完成的圈选已丢弃，请重新绘制闭合区域。", "info");
-        render();
-        return;
-      }
+      if (event.pointerType !== "mouse" || event.pointerId !== state.drawing.pointerId) return;
       const transform = fitTransform(canvas, image, state.view);
       const point = normalizedFromPointer(pointer, transform, image);
       if (!point) return;
@@ -1371,16 +1389,10 @@ function startApp(target: HTMLDivElement): void {
       draw(canvas);
       return true;
     };
-    const stopPointer = (event: PointerEvent) => {
+    const stopCapturedPointer = (event: PointerEvent) => {
       panOrigin = null;
       state.crosshair = clearCrosshairPointerState(state.crosshair);
       updateCrosshair();
-      if (state.drawing) {
-        state.drawing = null;
-        state.labelValues = {};
-        message("未完成的圈选已丢弃，请重新绘制闭合区域。", "info");
-        render();
-      }
       if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     };
     canvas.addEventListener("pointerup", (event) => {
@@ -1388,7 +1400,7 @@ function startApp(target: HTMLDivElement): void {
       const stroke = refinement?.stroke;
       const image = state.image;
       if (!refinement || !stroke || stroke.pointerId !== event.pointerId || !image) {
-        stopPointer(event);
+        if (panOrigin || canvas.hasPointerCapture(event.pointerId)) stopCapturedPointer(event);
         return;
       }
       const finalPoint = normalizedFromPointer(
@@ -1420,16 +1432,18 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     canvas.addEventListener("pointercancel", (event) => {
-      if (!cancelRefinementStroke(event)) stopPointer(event);
+      if (!cancelRefinementStroke(event) && (panOrigin || canvas.hasPointerCapture(event.pointerId))) {
+        stopCapturedPointer(event);
+      }
     });
     canvas.addEventListener("lostpointercapture", (event) => {
-      if (!cancelRefinementStroke(event)) stopPointer(event);
+      if (!cancelRefinementStroke(event) && panOrigin) stopCapturedPointer(event);
     });
     canvas.addEventListener("wheel", (event) => {
       const image = state.image;
       if (!image) return;
       event.preventDefault();
-      if (state.refinement) return;
+      if (state.refinement || state.drawing) return;
       const pointer = canvasPoint(event, canvas);
       const before = normalizedFromPointer(pointer, fitTransform(canvas, image, state.view), image);
       if (!before) return;
@@ -1443,6 +1457,7 @@ function startApp(target: HTMLDivElement): void {
 
   const bindEvents = (): void => {
     target.querySelector<HTMLButtonElement>('[data-action="choose-root"]')?.addEventListener("click", async () => {
+      if (state.drawing || state.refinement) return;
       try {
         const scan = await api.chooseAndScanRoot();
         if (!scan) {
@@ -1518,7 +1533,7 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelector<HTMLButtonElement>('[data-action="complete-backup"]')?.addEventListener("click", async () => {
       const currentCase = selectedCase(state);
-      if (!currentCase || !window.confirm("确认完成本病例并创建可恢复备份？")) return;
+      if (state.drawing || state.refinement || !currentCase || !window.confirm("确认完成本病例并创建可恢复备份？")) return;
       state.backupPending = true;
       render();
       try {
@@ -1530,8 +1545,19 @@ function startApp(target: HTMLDivElement): void {
       state.backupPending = false;
       render();
     });
+    target.querySelector<HTMLButtonElement>('[data-action="reload-regions"]')?.addEventListener("click", async () => {
+      if (state.drawing || state.refinement) return;
+      try {
+        const count = await refreshRegions();
+        message(`已从本地数据库重新加载 ${count} 个已保存区域。`, "success");
+      } catch (error) {
+        message(`重新加载勾画失败：${formatError(error)}`, "error");
+      }
+      render();
+    });
     target.querySelectorAll<HTMLButtonElement>('[data-action="representative"]').forEach((button) => {
       button.addEventListener("click", async () => {
+        if (state.drawing || state.refinement) return;
         const currentCase = selectedCase(state);
         const assetId = button.dataset.assetId;
         if (!currentCase || !assetId) return;
@@ -1555,12 +1581,13 @@ function startApp(target: HTMLDivElement): void {
     });
     target.querySelectorAll<HTMLButtonElement>("[data-region-id]").forEach((button) => {
       button.addEventListener("click", () => {
-        if (state.refinement) return;
+        if (state.refinement || state.drawing) return;
         state.selectedRegionId = button.dataset.regionId ?? null;
         render();
       });
     });
     target.querySelector<HTMLButtonElement>('[data-action="refine-region"]')?.addEventListener("click", (event) => {
+      if (state.drawing || state.refinement) return;
       const currentCase = selectedCase(state);
       const asset = selectedAsset(state);
       const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
@@ -1642,6 +1669,7 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.addEventListener("click", () => {
+      if (state.drawing || state.refinement) return;
       const regionId = target.querySelector<HTMLButtonElement>('[data-action="edit-region"]')?.dataset.regionId;
       const region = state.regions.find((item) => item.region_id === regionId);
       if (!region) return;
@@ -1653,6 +1681,7 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="delete-region"]')?.addEventListener("click", async (event) => {
+      if (state.drawing || state.refinement) return;
       const regionId = (event.currentTarget as HTMLButtonElement).dataset.regionId;
       const currentCase = selectedCase(state);
       const asset = selectedAsset(state);
@@ -1667,6 +1696,7 @@ function startApp(target: HTMLDivElement): void {
       render();
     });
     target.querySelector<HTMLButtonElement>('[data-action="replace-region"]')?.addEventListener("click", (event) => {
+      if (state.drawing || state.refinement) return;
       if (!templateAllowsNewAnnotations(state.template)) {
         message(state.template ? LEGACY_TEMPLATE_ENCODING_WARNING : "请先加载标签模板。", "error");
         render();
@@ -1920,11 +1950,20 @@ function startApp(target: HTMLDivElement): void {
     bindEvents();
   };
 
-  window.addEventListener("keydown", (event) => {
+  const handleKeydown = (event: KeyboardEvent) => {
     if (event.key === "Escape" && state.refinement && !state.refinement.saving) {
       state.refinement = null;
       state.crosshair.pointerInCanvas = false;
       message("已丢弃全部未保存的边界修正。", "info");
+      render();
+      return;
+    }
+    if (event.key === "Escape" && state.drawing) {
+      state.drawing = null;
+      state.labelValues = {};
+      state.replaceRegionId = null;
+      state.crosshair.pointerInCanvas = false;
+      message("已丢弃未完成的圈选。", "info");
       render();
       return;
     }
@@ -1939,7 +1978,7 @@ function startApp(target: HTMLDivElement): void {
       return;
     }
     if (!shouldHandleMediaNavigation(event)) return;
-    if (state.refinement) return;
+    if (state.refinement || state.drawing) return;
     const currentCase = selectedCase(state);
     if (!currentCase) return;
     if (event.key === "ArrowLeft" && state.assetIndex > 0) {
@@ -1950,7 +1989,9 @@ function startApp(target: HTMLDivElement): void {
       event.preventDefault();
       void selectAsset(state.assetIndex + 1);
     }
-  });
+  };
+  activeAppKeydownHandler = handleKeydown;
+  window.addEventListener("keydown", handleKeydown);
 
   render();
   void (async () => {
@@ -1960,13 +2001,16 @@ function startApp(target: HTMLDivElement): void {
         state.template = restored.template?.template ?? null;
         await applyScan(restored.scan, restored.current_case_id, restored.current_asset_id);
       }
+      const restoredRegionSummary = selectedAsset(state)?.media_kind === "image"
+        ? `当前图片已加载 ${state.regions.length} 个已保存区域。`
+        : "";
       const restoreMessages: Record<RestoreStatus, { text: string; kind: State["messageKind"] }> = {
         no_session: { text: "请选择本地数据根目录。", kind: "info" },
-        restored: { text: "已恢复上次的数据目录、模板与浏览位置。", kind: "success" },
+        restored: { text: `已恢复上次的数据目录、模板与浏览位置。${restoredRegionSummary}`, kind: "success" },
         saved_root_unavailable: { text: "上次的数据目录不可用，请连接磁盘后重新选择。", kind: "error" },
-        fixed_template_missing: { text: "已恢复数据目录，但当前模板不可用；请重新导入对应的 TOML 模板。", kind: "error" },
-        fixed_template_checksum_mismatch: { text: "当前模板校验失败；请联系项目管理员后重新导入。", kind: "error" },
-        last_media_unavailable: { text: "已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。", kind: "info" },
+        fixed_template_missing: { text: `已恢复数据目录。${restoredRegionSummary}当前模板不可用；请重新导入对应的 TOML 模板。`, kind: "error" },
+        fixed_template_checksum_mismatch: { text: `当前模板校验失败。${restoredRegionSummary}请联系项目管理员后重新导入。`, kind: "error" },
+        last_media_unavailable: { text: `已恢复数据目录和模板，但上次媒体不存在，已打开该病例的首个媒体。${restoredRegionSummary}`, kind: "info" },
       };
       const restoreMessage = restoreMessages[restored.status];
       message(

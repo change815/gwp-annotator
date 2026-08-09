@@ -36,7 +36,7 @@ UI 自动化应使用合成夹具根目录，并把网络出口拦截为失败�
 | AC-07 | 原始媒体只读 | 打开、浏览、圈选、截帧和导出前后，合成源 JPG/MP4 的内容散列、大小、修改时间和目录清单完全不变。 | `source_media_immutable` 集成测试。 |
 | AC-08 | 代表图选择与标注门槛 | 医生可在一个病例内按需选择代表图，至少可连续选择 3 张；未选代表图不能标注或导出；已有已保存区域的代表图不能取消选择。 | 集成测试 `representative_selection_has_no_limit_and_keeps_annotation_gate` 与 `saved_regions_block_representative_deselection`。 |
 | AC-09 | 图片显示坐标 | 在 100%、放大、平移及高 DPI 下，同一归一化多边形覆盖同一源图位置，导出像素坐标在误差 1 像素内。 | 渲染截图比较和 `normalized_geometry_roundtrip`。 |
-| AC-10 | 自动闭合自由圈选 | 左键起点后移动记录轨迹；满足至少 3 点、有效面积且回到定义阈值内时自动闭合并弹出标签窗口。 | Pointer Events E2E `lasso_auto_close`。 |
+| AC-10 | 自动闭合自由圈选 | 左键单击一次起点后即可松开；后续 `buttons=0` 的鼠标移动仍记录轨迹。满足至少 3 点、有效面积且回到定义阈值内时自动闭合并弹出标签窗口；圈选中的额外单击不重置草稿，`Esc` 丢弃且不保存。 | Pointer Events 前端测试与合成 E2E `lasso_auto_close`。 |
 | AC-11 | 无效轨迹 | 面积过小、点数不足或无法修复的自相交轨迹不得写入数据库，界面要求重画。 | `reject_invalid_polygon` 单元/集成测试。 |
 | AC-12 | 严格 UTF-8 TOML 与模板控件 | 严格 UTF-8 TOML 分别驱动下拉、单选、多选及必填校验；必填项未完成时 `OK` 不可用。含实际中文显示名的合法 UTF-8 模板正常加载；故意非 UTF-8 字节、`U+FFFD` 或明显乱码模板被拒绝并提示另存为 UTF-8，不猜测或转换 GBK。校验和一致的历史乱码模板可恢复并更换，但不能创建新区域或“删除后重画”。 | 前端 `template UTF-8 import` 测试、Rust `toml_template_controls_and_required_values_are_validated`、`template_parsers_reject_encoding_damage`、`historical_damaged_templates_can_be_verified_recovered_and_replaced` 与 Windows PowerShell 合成复测。 |
 | AC-13 | 简化模板导入 | `label.txt` 的注释、必填星号和竖线选项可正确导入为下拉字段；重复字段/选项和空必填选项被拒绝。 | `label_txt_import_validation` 单元测试。 |
@@ -56,7 +56,7 @@ UI 自动化应使用合成夹具根目录，并把网络出口拦截为失败�
 | AC-22 | 不持久化显示名/路径 | SQLite、备份、GWA-JSON、COCO、CSV、缩略图文件名、恢复文件和日志均不含合成源院区/病例显示名、原始路径或路径分隔符字段；fixture 和运行产物不会被加入 Git。 | `privacy_leak_scan` 对运行产物执行字符串和 JSON 模式检查，并检查 `git status --short`。 |
 | AC-23 | 本机显示边界 | 原始院区和病例目录显示名只在本机 UI 会话中可见；重新扫描后由源目录重建，SQLite、备份、日志、Git 和导出不保存该字段。 | 内存/数据库模式审查与 E2E。 |
 | AC-24 | 截帧与缓存位置 | 截帧、缩略图、恢复文件、SQLite 和导出都在项目工作目录；源数据根目录中没有新增文件。Windows 安装在 D 盘时，工作目录位于安装目录旁的 `GWP Annotator Data` 且同样在 D 盘。 | `derived_files_outside_source_root`、工作目录计算单测及 Windows 合成安装复测。 |
-| AC-25 | 崩溃恢复已保存数据 | 在 `OK` 提交后强制终止进程，重启后区域和标签仍存在且完整。 | `crash_after_commit_recovery` 故障注入测试。 |
+| AC-25 | 崩溃恢复已保存数据 | 在 `OK` 提交或完成病例备份后关闭进程，重启后自动回到当前图片并加载区域和标签；界面报告加载数量并提供手工重新加载入口。 | `crash_after_commit_recovery`、`original_image_regions_reload_after_case_backup_and_service_recreation` 与前端冷启动回读测试。 |
 | AC-26 | 草稿不误提交 | 在标签窗口中、未点 `OK` 时强制终止进程；重启可恢复草稿视图，但数据库和导出均无该区域，需再次确认才保存。 | `draft_requires_reconfirmation` E2E。 |
 | AC-27 | 备份失败可见 | 模拟备份目标不可写时，已提交标注仍可读取，界面显示备份失败，不删除数据库或源媒体。 | `backup_failure_is_non_destructive` 测试。 |
 | AC-28 | 模板版本可解释 | 当前 TOML 可在确认后更换；历史标注保存模板 ID、版本、校验和与快照，仍可按旧模板修改和解释。同一已使用 ID/version 的不同内容必须拒绝。 | `template_snapshot_roundtrip` 与 `controlled_template_replacement_preserves_historical_regions_and_snapshots` 测试。 |
