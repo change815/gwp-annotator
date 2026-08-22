@@ -185,7 +185,6 @@ async function pendingFiles(plan) {
 }
 
 async function writeMapping(mappingPath, mapping) {
-  await mkdir(path.dirname(mappingPath), { recursive: true });
   const temporary = `${mappingPath}.partial`;
   await writeFile(temporary, `${JSON.stringify(mapping, null, 2)}\n`, "utf8");
   await rename(temporary, mappingPath);
