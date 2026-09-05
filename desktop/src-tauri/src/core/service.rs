@@ -142,6 +142,32 @@ impl ProjectService {
         })
     }
 
+    pub(crate) fn open_storage_location(
+        &self,
+        location: &Path,
+    ) -> CoreResult<(Self, StartupRestore)> {
+        if !location.is_absolute() || !location.is_dir() {
+            return Err(CoreError::WorkRootUnavailable);
+        }
+        let next = Self::new(
+            location,
+            self.project_id.clone(),
+            self.secret_provider.clone(),
+        )?;
+        if let Some(active) = self
+            .active_session
+            .lock()
+            .map_err(|_| CoreError::StateUnavailable)?
+            .as_ref()
+        {
+            next.ensure_roots_separate(&active.source_root)?;
+        }
+        let restored = next.restore_project_session()?;
+        // Probe the selected output, but keep SQLite unopened until a source passes overlap checks.
+        crate::core::store::prepare_work_root_after_overlap_check(location)?;
+        Ok((next, restored))
+    }
+
     pub fn scan_selected_root(&self, selected_root: &Path) -> CoreResult<PublicScan> {
         let previous_session = Store::read_project_session(&self.work_root)?;
         let scan = self.activate_root(selected_root)?;

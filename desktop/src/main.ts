@@ -151,6 +151,7 @@ interface AppApi {
   replaceFixedTomlTemplate(input: string): Promise<TemplateDescriptor>;
   installFixedLabelTxt(input: string): Promise<TemplateDescriptor>;
   projectStorageLocation(): Promise<string>;
+  chooseStorageLocation(): Promise<{ location: string; restored: StartupRestore } | null>;
   updateRegionLabels(request: UpdateRegionLabelsRequest): Promise<void>;
   deleteRegion(caseId: string, assetId: string, regionId: string): Promise<void>;
   replaceRegion(request: ReplaceRegionRequest): Promise<void>;
@@ -233,6 +234,7 @@ const tauriApi: AppApi = {
   installFixedLabelTxt: (text) =>
     invoke<TemplateDescriptor>("install_fixed_label_txt", { text }),
   projectStorageLocation: () => invoke<string>("project_storage_location"),
+  chooseStorageLocation: () => invoke("choose_storage_location"),
   updateRegionLabels: async (request) => invoke("update_region_labels", { request }),
   deleteRegion: async (caseId, assetId, regionId) => invoke("delete_region", { caseId, assetId, regionId }),
   replaceRegion: async (request) => invoke("replace_region", { request }),
@@ -299,7 +301,7 @@ interface RefinementDraft {
   saving: boolean;
 }
 
-type ProjectLoadSource = "startup" | "selection" | "reload";
+type ProjectLoadSource = "startup" | "selection" | "reload" | "storage";
 
 export interface CrosshairState {
   pointerInCanvas: boolean;
@@ -335,6 +337,7 @@ interface State {
   videoTime: number;
   videoDuration: number;
   videoPlaying: boolean;
+  videoErrorAssetId: string | null;
   capturePending: boolean;
   backupPending: boolean;
   projectLoadPending: ProjectLoadSource | null;
@@ -372,6 +375,7 @@ const initialState = (): State => ({
   videoTime: 0,
   videoDuration: 0,
   videoPlaying: false,
+  videoErrorAssetId: null,
   capturePending: false,
   backupPending: false,
   projectLoadPending: null,
@@ -701,7 +705,7 @@ function formatError(error: unknown): string {
     TEMPLATE_REPLACEMENT_IDENTITY_CONFLICT: "该模板 ID 和 version 已用于标注。请在 TOML 中增加 version，或更换 template_id。",
     TEMPLATE_NOT_ACTIVE: "当前标注仍引用旧模板，请刷新后使用当前模板重试。",
     TEMPLATE_SNAPSHOT_CONFLICT: "该模板版本已经用于标注。请在 TOML 中增加 version，或更换 template_id 后再导入。",
-    WORK_ROOT_UNAVAILABLE: "无法使用软件安装目录旁的数据保存位置。请打开“数据保存位置”核对目录、当前用户权限和磁盘空间；软件不会回退到 C 盘或 %LOCALAPPDATA%。",
+    WORK_ROOT_UNAVAILABLE: "无法使用当前数据保存位置。请检查磁盘连接、写入权限和剩余空间，或在“数据保存位置”中选择其他目录。",
     UNSAFE_DERIVED_PATH: "数据保存路径包含不安全的链接、联接点或非普通文件，已拒绝操作。请检查“数据保存位置”后重试。",
     SAVED_ROOT_UNAVAILABLE: "上次的数据目录不可用，请连接磁盘后重新选择。",
     NOT_VIDEO_ASSET: "当前媒体不是 MP4 视频。",
@@ -757,6 +761,38 @@ function assetLabel(asset: PublicAsset, index: number): string {
 export function formatVideoTime(value: number): string {
   const seconds = Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+export type MediaProtocolEnvironment = "windows" | "standard";
+
+function detectMediaProtocolEnvironment(): MediaProtocolEnvironment {
+  const host = typeof window !== "undefined" ? window.location.hostname : "";
+  const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  return host === "tauri.localhost" || /Windows/i.test(userAgent) ? "windows" : "standard";
+}
+
+export function mediaSourceUrl(
+  caseId: string,
+  assetId: string,
+  environment: MediaProtocolEnvironment = detectMediaProtocolEnvironment(),
+): string {
+  const path = `/video/${encodeURIComponent(caseId)}/${encodeURIComponent(assetId)}`;
+  return environment === "windows"
+    ? `http://gwp-media.localhost${path}`
+    : `gwp-media://localhost${path}`;
+}
+
+function videoFailureMessage(video: HTMLVideoElement): string {
+  switch (video.error?.code) {
+    case 2:
+      return "本地视频读取失败，无法播放或截帧。";
+    case 3:
+      return "本机无法解码此视频，无法播放或截帧。";
+    case 4:
+      return "本机不支持此 MP4 编码，无法播放或截帧。";
+    default:
+      return "本机无法播放此 MP4 编码，无法截帧。";
+  }
 }
 
 function videoFrameToBase64(video: HTMLVideoElement): { pngBase64: string; width: number; height: number } | null {
@@ -885,6 +921,8 @@ function mountMarkup(state: State): string {
   const interactionLocked = annotationOperationLocked || projectLoadPending ? "disabled" : "";
   const chooseRootLocked = annotationOperationLocked
     || (projectLoadPending && state.projectLoadPending !== "startup");
+  const storageLocked = annotationOperationLocked || projectLoadPending
+    || state.templateInstallPending || state.capturePending || state.backupPending || state.imageLoading;
   const crosshairVisible = shouldShowCustomCrosshair(
     isRepresentative,
     templateReady,
@@ -897,6 +935,8 @@ function mountMarkup(state: State): string {
   const templateInputDisabled = state.templateInstallPending || Boolean(state.labelDraft) || Boolean(state.editLabels) || geometryDraftActive || projectLoadPending;
   const media = currentCase?.assets ?? [];
   const currentIndex = asset ? state.assetIndex + 1 : 0;
+  const videoUnavailable = Boolean(asset?.media_kind === "video" && state.videoErrorAssetId === asset.asset_id);
+  const videoControlDisabled = videoUnavailable ? "disabled" : "";
 
   return `
     <main class="workbench" aria-labelledby="app-title" data-stage="4" data-visual-density="compact-clinical">
@@ -911,7 +951,7 @@ function mountMarkup(state: State): string {
         </div>
       </header>
       <p class="notice ${state.messageKind}" role="status" aria-live="polite" data-status-kind="${state.messageKind}">${escapeHtml(state.message)}</p>
-      ${state.storageLocationVisible ? `<section class="storage-location" aria-label="数据保存位置"><strong>数据保存位置</strong><output>${escapeHtml(state.storageLocation ?? "正在读取…")}</output><span>Windows 中该目录位于软件安装目录旁边；安装在 D 盘时，标注数据也保存在 D 盘。</span></section>` : ""}
+      ${state.storageLocationVisible ? `<section class="storage-location" aria-label="数据保存位置"><strong>数据保存位置</strong><output>${escapeHtml(state.storageLocation ?? "正在读取…")}</output><button type="button" data-action="choose-storage" ${storageLocked ? "disabled" : ""}>${state.projectLoadPending === "storage" ? "正在切换…" : "更换保存位置"}</button></section>` : ""}
       <section class="template-strip" aria-label="标签模板" data-workspace-zone="template-toolbar">
         <strong>标签模板</strong>
         <span>${state.template ? `当前模板：${escapeHtml(state.template.template_id)} v${state.template.version}` : "未加载。请选择 label-template-v1.toml。"}</span>
@@ -957,7 +997,7 @@ function mountMarkup(state: State): string {
           </div>
           <div class="canvas-frame ${state.panMode ? "pan-mode" : ""} ${crosshairReady ? "crosshair-ready" : ""} ${refining ? "refinement-mode" : ""}" data-canvas-frame data-canvas-size-contract="contained" aria-busy="${state.imageLoading}">
             ${!asset ? `<p class="empty-copy">从左侧选择病例。</p>` : ""}
-            ${asset?.media_kind === "video" && currentCase ? `<div class="video-player"><video data-video-player preload="metadata" src="gwp-media://localhost/video/${encodeURIComponent(currentCase.case_id)}/${encodeURIComponent(asset.asset_id)}"></video><div class="video-controls"><button type="button" data-action="video-play">${state.videoPlaying ? "暂停" : "播放"}</button><input data-action="video-seek" type="range" min="0" max="${Math.max(state.videoDuration, 0)}" value="${Math.min(state.videoTime, state.videoDuration || 0)}" step="0.01" aria-label="视频进度"><output data-video-time>${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}</output><button type="button" data-action="capture-frame" ${state.capturePending ? "disabled" : ""}>${state.capturePending ? "正在截帧…" : "截取当前帧"}</button></div><p>截帧仅保存到本应用工作目录，并归属于当前病例；原始病例目录保持只读。</p></div>` : ""}
+            ${asset?.media_kind === "video" && currentCase ? `<div class="video-player"><video data-video-player preload="metadata" crossorigin="anonymous" src="${mediaSourceUrl(currentCase.case_id, asset.asset_id)}"></video><div class="video-controls"><button type="button" data-action="video-play" ${videoControlDisabled}>${state.videoPlaying ? "暂停" : "播放"}</button><input data-action="video-seek" type="range" min="0" max="${Math.max(state.videoDuration, 0)}" value="${Math.min(state.videoTime, state.videoDuration || 0)}" step="0.01" aria-label="视频进度" ${videoControlDisabled}><output data-video-time>${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}</output><button type="button" data-action="capture-frame" ${state.capturePending || videoUnavailable ? "disabled" : ""}>${state.capturePending ? "正在截帧…" : "截取当前帧"}</button></div><p>截帧仅保存到本应用工作目录，并归属于当前病例；原始病例目录保持只读。</p></div>` : ""}
             ${isImage ? `<canvas data-drawing-canvas aria-label="图片标注画布" tabindex="0"></canvas>` : ""}
             ${isImage && !refining ? customCrosshairMarkup(crosshairVisible, state.crosshair.x, state.crosshair.y) : ""}
             ${state.imageLoading ? `<div class="loading-cover">正在读取图片…</div>` : ""}
@@ -1127,6 +1167,43 @@ function startApp(target: HTMLDivElement): void {
     state.messageKind = kind;
   };
 
+  const updateNotice = (): void => {
+    const notice = target.querySelector<HTMLElement>(".notice");
+    if (!notice) return;
+    notice.textContent = state.message;
+    notice.className = `notice ${state.messageKind}`;
+    notice.dataset.statusKind = state.messageKind;
+  };
+
+  const markVideoUnavailable = (assetId: string, text: string): void => {
+    if (state.videoErrorAssetId === assetId) return;
+    state.videoErrorAssetId = assetId;
+    message(text, "error");
+    updateNotice();
+    target.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.setAttribute("disabled", "disabled");
+    target.querySelector<HTMLInputElement>('[data-action="video-seek"]')?.setAttribute("disabled", "disabled");
+    target.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.setAttribute("disabled", "disabled");
+  };
+
+  const clearVideoUnavailable = (assetId: string): void => {
+    if (state.videoErrorAssetId !== assetId) return;
+    state.videoErrorAssetId = null;
+    if (state.messageKind === "error" && state.message.includes("MP4")) {
+      message("视频已加载，可播放和截帧。", "success");
+    }
+    updateNotice();
+    target.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.removeAttribute("disabled");
+    target.querySelector<HTMLInputElement>('[data-action="video-seek"]')?.removeAttribute("disabled");
+    target.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.removeAttribute("disabled");
+  };
+
+  const resetVideoState = (): void => {
+    state.videoTime = 0;
+    state.videoDuration = 0;
+    state.videoPlaying = false;
+    state.videoErrorAssetId = null;
+  };
+
   const discardUnsavedAnnotation = (): boolean => {
     if (state.labelSubmitPending) return false;
     if (!state.drawing && !state.labelDraft && !state.replaceRegionId) return false;
@@ -1162,7 +1239,7 @@ function startApp(target: HTMLDivElement): void {
     }
   };
 
-  const refreshRegions = async (expectedProjectLoadEpoch?: number): Promise<number> => {
+  const refreshRegions = async (expectedProjectLoadEpoch = projectLoadEpoch): Promise<number> => {
     if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return state.regions.length;
     const currentCase = selectedCase(state);
     const asset = selectedAsset(state);
@@ -1185,7 +1262,7 @@ function startApp(target: HTMLDivElement): void {
     return state.regions.length;
   };
 
-  const loadImage = async (expectedProjectLoadEpoch?: number): Promise<void> => {
+  const loadImage = async (expectedProjectLoadEpoch = projectLoadEpoch): Promise<void> => {
     if (!isCurrentProjectLoad(expectedProjectLoadEpoch)) return;
     const currentCase = selectedCase(state);
     const asset = selectedAsset(state);
@@ -1232,6 +1309,7 @@ function startApp(target: HTMLDivElement): void {
 
   const selectCase = async (caseId: string): Promise<void> => {
     if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
+    const epoch = projectLoadEpoch;
     const previousCase = selectedCase(state);
     const previousAsset = selectedAsset(state);
     if (previousCase && previousAsset) saveViewport(previousCase.case_id, previousAsset.asset_id, state.view);
@@ -1240,7 +1318,10 @@ function startApp(target: HTMLDivElement): void {
     if (!nextCase) return;
     state.caseId = nextCase.case_id;
     state.assetIndex = 0;
-    state.representativeIds = new Set(await api.representativeAssetIds(nextCase.case_id));
+    resetVideoState();
+    const representativeIds = await api.representativeAssetIds(nextCase.case_id);
+    if (!isCurrentProjectLoad(epoch)) return;
+    state.representativeIds = new Set(representativeIds);
     state.regions = [];
     state.selectedRegionId = null;
     state.view = loadSavedViewport(nextCase.case_id, nextCase.assets[0]?.asset_id ?? "") ?? { zoom: 1, panX: 0, panY: 0 };
@@ -1249,27 +1330,33 @@ function startApp(target: HTMLDivElement): void {
     state.editLabels = null;
     state.replaceRegionId = null;
     state.crosshair.pointerInCanvas = false;
-    await refreshRegions();
-    await loadImage();
+    await refreshRegions(epoch);
+    if (!isCurrentProjectLoad(epoch)) return;
+    await loadImage(epoch);
+    if (!isCurrentProjectLoad(epoch)) return;
     const asset = selectedAsset(state);
     if (asset) await api.saveLastPosition(nextCase.case_id, asset.asset_id);
   };
 
   const selectAsset = async (index: number): Promise<void> => {
     if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
+    const epoch = projectLoadEpoch;
     const currentCase = selectedCase(state);
     if (!currentCase || index < 0 || index >= currentCase.assets.length) return;
     const previousAsset = selectedAsset(state);
     if (previousAsset) saveViewport(currentCase.case_id, previousAsset.asset_id, state.view);
     state.assetIndex = index;
+    resetVideoState();
     state.view = loadSavedViewport(currentCase.case_id, currentCase.assets[index].asset_id) ?? { zoom: 1, panX: 0, panY: 0 };
     state.drawing = null;
     state.labelDraft = null;
     state.editLabels = null;
     state.replaceRegionId = null;
     state.crosshair.pointerInCanvas = false;
-    await refreshRegions();
-    await loadImage();
+    await refreshRegions(epoch);
+    if (!isCurrentProjectLoad(epoch)) return;
+    await loadImage(epoch);
+    if (!isCurrentProjectLoad(epoch)) return;
     await api.saveLastPosition(currentCase.case_id, currentCase.assets[index].asset_id);
   };
 
@@ -1295,6 +1382,7 @@ function startApp(target: HTMLDivElement): void {
     if (!activeCase) {
       state.caseId = null;
       state.assetIndex = 0;
+      resetVideoState();
       state.representativeIds = new Set();
       state.regions = [];
       state.selectedRegionId = null;
@@ -1306,6 +1394,7 @@ function startApp(target: HTMLDivElement): void {
     }
     state.caseId = activeCase.case_id;
     state.assetIndex = Math.max(0, activeCase.assets.findIndex((asset) => asset.asset_id === preferredAssetId));
+    resetVideoState();
     const restoredAsset = activeCase.assets[state.assetIndex];
     state.view = restoredAsset ? loadSavedViewport(activeCase.case_id, restoredAsset.asset_id) ?? { zoom: 1, panX: 0, panY: 0 } : { zoom: 1, panX: 0, panY: 0 };
     state.representativeIds = new Set(representativeIds);
@@ -1723,13 +1812,39 @@ function startApp(target: HTMLDivElement): void {
       state.storageLocationVisible = !state.storageLocationVisible;
       render();
       if (!state.storageLocationVisible || state.storageLocation) return;
+      const epoch = projectLoadEpoch;
       try {
-        state.storageLocation = await api.projectStorageLocation();
+        const location = await api.projectStorageLocation();
+        if (!isCurrentProjectLoad(epoch)) return;
+        state.storageLocation = location;
       } catch (error) {
+        if (!isCurrentProjectLoad(epoch)) return;
         state.storageLocationVisible = false;
         message(formatError(error), "error");
       }
       render();
+    });
+    target.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.addEventListener("click", async () => {
+      if (annotationOperationIsLocked(state) || state.projectLoadPending || state.templateInstallPending
+        || state.capturePending || state.backupPending || state.imageLoading) return;
+      const epoch = beginProjectLoad("storage");
+      try {
+        const selection = await api.chooseStorageLocation();
+        if (!selection || !isCurrentProjectLoad(epoch)) return;
+        Object.assign(state, initialState(), {
+          storageLocation: selection.location,
+          storageLocationVisible: true,
+          projectLoadPending: "storage",
+        });
+        const applied = await applyRestoredProject(selection.restored, null, epoch);
+        if (!isCurrentProjectLoad(epoch)) return;
+        announceProjectRestore(selection.restored, "reload", applied);
+        message(`已切换数据保存位置，原目录数据保留。${state.message}`, state.messageKind);
+      } catch (error) {
+        if (isCurrentProjectLoad(epoch)) message(`更换保存位置失败：${formatError(error)}`, "error");
+      } finally {
+        finishProjectLoad(epoch);
+      }
     });
     target.querySelector<HTMLSelectElement>('[data-action="campus"]')?.addEventListener("change", async (event) => {
       if (annotationOperationIsLocked(state) || state.projectLoadPending) return;
@@ -1798,13 +1913,16 @@ function startApp(target: HTMLDivElement): void {
         const currentCase = selectedCase(state);
         const assetId = button.dataset.assetId;
         if (!currentCase || !assetId) return;
+        const epoch = projectLoadEpoch;
         try {
           if (state.representativeIds.has(assetId)) {
             await api.deselectRepresentative(currentCase.case_id, assetId);
+            if (!isCurrentProjectLoad(epoch)) return;
             state.representativeIds.delete(assetId);
             message("已取消代表图。", "success");
           } else {
             await api.selectRepresentative(currentCase.case_id, assetId);
+            if (!isCurrentProjectLoad(epoch)) return;
             state.representativeIds.add(assetId);
             message("已选择为代表图。", "success");
           }
@@ -2120,26 +2238,47 @@ function startApp(target: HTMLDivElement): void {
     });
     const video = target.querySelector<HTMLVideoElement>("[data-video-player]");
     if (video) {
+      const videoAssetId = selectedAsset(state)?.asset_id;
       const syncVideoState = () => {
         state.videoTime = video.currentTime;
         state.videoDuration = Number.isFinite(video.duration) ? video.duration : 0;
         state.videoPlaying = !video.paused && !video.ended;
+        if (videoAssetId && video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          clearVideoUnavailable(videoAssetId);
+        }
         const output = target.querySelector<HTMLOutputElement>("[data-video-time]");
         const seek = target.querySelector<HTMLInputElement>('[data-action="video-seek"]');
+        const playButton = target.querySelector<HTMLButtonElement>('[data-action="video-play"]');
         if (output) output.value = `${formatVideoTime(state.videoTime)} / ${formatVideoTime(state.videoDuration)}`;
         if (seek) {
           seek.max = String(state.videoDuration || 0);
           seek.value = String(Math.min(state.videoTime, state.videoDuration || 0));
         }
+        if (playButton) playButton.textContent = state.videoPlaying ? "暂停" : "播放";
       };
       video.addEventListener("loadedmetadata", syncVideoState);
+      video.addEventListener("loadeddata", syncVideoState);
+      video.addEventListener("canplay", syncVideoState);
       video.addEventListener("timeupdate", syncVideoState);
       video.addEventListener("play", syncVideoState);
+      video.addEventListener("playing", syncVideoState);
       video.addEventListener("pause", syncVideoState);
       video.addEventListener("error", () => {
-        message("本机无法播放此 MP4 编码，无法截帧。请使用本机支持的编码。", "error");
-        render();
+        if (!videoAssetId || selectedAsset(state)?.asset_id !== videoAssetId) return;
+        if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          clearVideoUnavailable(videoAssetId);
+          return;
+        }
+        markVideoUnavailable(videoAssetId, videoFailureMessage(video));
       });
+      if (
+        video.error
+        && video.readyState < HTMLMediaElement.HAVE_METADATA
+        && videoAssetId
+        && selectedAsset(state)?.asset_id === videoAssetId
+      ) {
+        markVideoUnavailable(videoAssetId, videoFailureMessage(video));
+      }
       target.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.addEventListener("click", async (event) => {
         try {
           if (video.paused) await video.play();
@@ -2147,8 +2286,9 @@ function startApp(target: HTMLDivElement): void {
           syncVideoState();
           (event.currentTarget as HTMLButtonElement).textContent = state.videoPlaying ? "暂停" : "播放";
         } catch {
-          message("本机无法播放此 MP4 编码。", "error");
-          render();
+          if (videoAssetId && selectedAsset(state)?.asset_id === videoAssetId) {
+            markVideoUnavailable(videoAssetId, videoFailureMessage(video));
+          }
         }
       });
       target.querySelector<HTMLInputElement>('[data-action="video-seek"]')?.addEventListener("input", (event) => {
@@ -2159,10 +2299,17 @@ function startApp(target: HTMLDivElement): void {
         const currentCase = selectedCase(state);
         const asset = selectedAsset(state);
         if (!currentCase || !asset || asset.media_kind !== "video") return;
-        const frame = videoFrameToBase64(video);
+        let frame: ReturnType<typeof videoFrameToBase64>;
+        try {
+          frame = videoFrameToBase64(video);
+        } catch {
+          message("当前视频帧无法读取，请播放到有效位置后重试。", "error");
+          updateNotice();
+          return;
+        }
         if (!frame) {
           message("当前视频帧尚不可用，播放或拖动到有效位置后重试。", "error");
-          render();
+          updateNotice();
           return;
         }
         state.capturePending = true;
@@ -2200,8 +2347,21 @@ function startApp(target: HTMLDivElement): void {
   };
 
   const render = (): void => {
+    const previousCaseList = target.querySelector<HTMLElement>(".case-list");
+    const previousCampus = target.querySelector<HTMLSelectElement>('[data-action="campus"]')?.value;
+    const previousScrollTop = previousCaseList?.scrollTop ?? 0;
+    const previousScrollLeft = previousCaseList?.scrollLeft ?? 0;
     target.innerHTML = mountMarkup(state);
     bindEvents();
+    // Rendering rebuilds the sidebar DOM. Keep the current campus position so async image
+    // loads and annotation saves do not unexpectedly return a long case list to its top.
+    if (previousCaseList && previousCampus === state.campusCode) {
+      const nextCaseList = target.querySelector<HTMLElement>(".case-list");
+      if (nextCaseList) {
+        nextCaseList.scrollTop = previousScrollTop;
+        nextCaseList.scrollLeft = previousScrollLeft;
+      }
+    }
   };
 
   const handleKeydown = (event: KeyboardEvent) => {

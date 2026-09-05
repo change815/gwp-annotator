@@ -3,5 +3,6 @@ pub mod error;
 pub mod ids;
 pub mod scan;
 pub mod service;
+pub mod storage;
 pub mod store;
 pub mod template;

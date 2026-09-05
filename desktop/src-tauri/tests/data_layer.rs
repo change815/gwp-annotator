@@ -14,11 +14,12 @@ use gwp_annotator_core::core::service::{
     CaptureFrameRequest, RefineRegionGeometryRequest, ReplaceRegionRequest, RestoreStatus,
     SaveRegionRequest, UpdateRegionLabelsRequest,
 };
+use gwp_annotator_core::core::storage::load_storage_location;
 use gwp_annotator_core::core::store::{BackupFault, PointNorm, RecoveryState, SaveFault};
 use gwp_annotator_core::core::template::{
     FieldControl, LabelTemplate, LabelValue, TemplateField, TemplateOption, LABEL_TEMPLATE_FORMAT,
 };
-use gwp_annotator_core::{FixedSecretProvider, ProjectService};
+use gwp_annotator_core::{AppState, FixedSecretProvider, ProjectService};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -86,6 +87,143 @@ fn service_with_work_root(work_root: &Path) -> ProjectService {
         Arc::new(FixedSecretProvider::from_bytes([3; 32])),
     )
     .expect("service")
+}
+
+#[test]
+fn storage_selection_preserves_old_annotations_and_remembers_the_new_directory() {
+    let fixture = fixture(1);
+    let state = AppState::new(service(&fixture));
+    let config = fixture._temporary.path().join("CONFIG");
+    let chosen = fixture._temporary.path().join("WORK-SELECTED");
+    fs::create_dir(&chosen).unwrap();
+    let (case, asset) = {
+        let service = state.service().unwrap();
+        let scan = service.scan_selected_root(&fixture.source_root).unwrap();
+        let (case, asset) = first_image(&scan);
+        load_generic_template(&service);
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .unwrap();
+        service
+            .save_confirmed_region(region_request(asset.asset_id.clone()))
+            .unwrap();
+        service
+            .save_last_position(&case.case_id, &asset.asset_id)
+            .unwrap();
+        (case, asset)
+    };
+    assert_eq!(
+        state
+            .change_storage_location(&chosen, &config)
+            .unwrap()
+            .status,
+        RestoreStatus::NoSession
+    );
+    assert_eq!(state.service().unwrap().work_root(), chosen);
+    assert!(!chosen.join("annotations.sqlite3").exists());
+    assert!(fixture.work_root.join("annotations.sqlite3").is_file());
+    assert_eq!(
+        load_storage_location(&config).unwrap(),
+        Some(chosen.clone())
+    );
+    {
+        let service = state.service().unwrap();
+        service.scan_selected_root(&fixture.source_root).unwrap();
+        assert!(service
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .unwrap()
+            .is_empty());
+        load_generic_template(&service);
+        service
+            .select_representative(&case.case_id, &asset.asset_id)
+            .unwrap();
+        service
+            .save_confirmed_region(region_request(asset.asset_id.clone()))
+            .unwrap();
+        service.complete_case_and_backup(&case.case_id).unwrap();
+    }
+    assert!(chosen.join("backups/current/annotations.sqlite3").is_file());
+    state
+        .change_storage_location(&fixture.work_root, &config)
+        .unwrap();
+    assert_eq!(
+        state
+            .service()
+            .unwrap()
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        load_storage_location(&config).unwrap(),
+        Some(fixture.work_root.clone())
+    );
+    drop(state);
+    let reopened = service_with_work_root(&load_storage_location(&config).unwrap().unwrap());
+    reopened.restore_project_session().unwrap();
+    assert_eq!(
+        reopened
+            .saved_regions_for_asset(&case.case_id, &asset.asset_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn rejected_storage_selections_keep_the_current_service_and_preference() {
+    let fixture = fixture(1);
+    let state = AppState::new(service(&fixture));
+    let config = fixture._temporary.path().join("CONFIG");
+    state
+        .service()
+        .unwrap()
+        .scan_selected_root(&fixture.source_root)
+        .unwrap();
+    for location in [
+        &fixture.source_root,
+        &fixture.source_root.join("CAMPUS-ALPHA"),
+        fixture._temporary.path(),
+    ] {
+        assert!(matches!(
+            state.change_storage_location(location, &config),
+            Err(CoreError::SourceWorkOverlap)
+        ));
+    }
+    assert!(!fixture.source_root.join("annotations.sqlite3").exists());
+    assert_eq!(load_storage_location(&config).unwrap(), None);
+    let chosen = fixture._temporary.path().join("WORK-SELECTED");
+    fs::create_dir(&chosen).unwrap();
+    state.change_storage_location(&chosen, &config).unwrap();
+    let not_directory = fixture._temporary.path().join("FILE");
+    fs::write(&not_directory, b"synthetic").unwrap();
+    assert!(state
+        .change_storage_location(&not_directory, &config)
+        .is_err());
+    assert!(state
+        .change_storage_location(&fixture.work_root, &not_directory)
+        .is_err());
+    assert_eq!(state.service().unwrap().work_root(), chosen);
+    assert_eq!(load_storage_location(&config).unwrap(), Some(chosen));
+}
+
+#[test]
+fn choosing_storage_before_the_source_keeps_database_creation_lazy() {
+    let fixture = fixture(1);
+    let state = AppState::new(service(&fixture));
+    let config = fixture._temporary.path().join("CONFIG");
+    state
+        .change_storage_location(&fixture.source_root, &config)
+        .unwrap();
+    assert!(matches!(
+        state
+            .service()
+            .unwrap()
+            .scan_selected_root(&fixture.source_root),
+        Err(CoreError::SourceWorkOverlap)
+    ));
+    assert!(!fixture.source_root.join("annotations.sqlite3").exists());
 }
 
 fn first_image(scan: &PublicScan) -> (PublicCase, PublicAsset) {

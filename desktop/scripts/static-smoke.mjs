@@ -14,7 +14,8 @@ if (
   typeof csp !== "string" ||
   !csp.includes("connect-src 'none'") ||
   !csp.includes("img-src 'self' asset: data:") ||
-  !csp.includes("media-src 'self' asset:")
+  !csp.includes("media-src 'self' asset:") ||
+  !csp.includes("http://gwp-media.localhost")
 ) {
   throw new Error("Tauri CSP must allow data: only for on-demand image payloads and keep network disabled.");
 }
@@ -37,7 +38,10 @@ for (const file of await listFiles(distRoot)) {
     continue;
   }
   const contents = await readFile(file, "utf8");
-  if (/https?:\/\//i.test(contents)) {
+  // Windows WebView2 exposes registered Tauri protocols through this loopback
+  // host. It is local application media, not an external network endpoint.
+  const withoutLocalMediaHost = contents.replaceAll("http://gwp-media.localhost", "");
+  if (/https?:\/\//i.test(withoutLocalMediaHost)) {
     throw new Error(`Built frontend contains an external network URL: ${relative(distRoot, file)}`);
   }
 }

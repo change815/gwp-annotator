@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(any(target_os = "windows", test))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,9 +10,10 @@ use gwp_annotator_core::core::service::{
     RepresentativeSelection, SaveRegionRequest, StartupRestore, TemplateDescriptor,
     UpdateRegionLabelsRequest,
 };
+use gwp_annotator_core::core::storage::load_storage_location;
 use gwp_annotator_core::core::store::{BackupResult, CapturedFrame, SavedRegion};
 use gwp_annotator_core::{AppState, ProjectService, SystemCredentialSecretProvider};
-use tauri::{http, Manager, State, UriSchemeContext};
+use tauri::{http, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Opens the native folder dialog inside the Rust process so the selected source path never
@@ -30,7 +30,7 @@ fn choose_and_scan_root(
         .into_path()
         .map_err(|_| CommandError::from_code("FILESYSTEM_ERROR"))?;
     state
-        .service
+        .service()?
         .scan_selected_root(&selected)
         .map(Some)
         .map_err(Into::into)
@@ -128,11 +128,47 @@ fn current_fixed_template(
 #[tauri::command]
 fn project_storage_location(state: State<'_, AppState>) -> Result<String, CommandError> {
     state
-        .service
+        .service()?
         .work_root()
         .to_str()
         .map(str::to_owned)
         .ok_or(CommandError::from_code("STATE_UNAVAILABLE"))
+}
+
+#[derive(serde::Serialize)]
+struct StorageSelection {
+    location: String,
+    restored: StartupRestore,
+}
+
+#[tauri::command]
+async fn choose_storage_location(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<StorageSelection>, CommandError> {
+    let current = state.service()?.work_root().to_path_buf();
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_title("选择标注数据保存目录")
+        .set_directory(current)
+        .blocking_pick_folder()
+    else {
+        return Ok(None);
+    };
+    let selected = selected
+        .into_path()
+        .map_err(|_| CommandError::from_code("INVALID_WORK_PATH"))?;
+    let location = selected
+        .to_str()
+        .ok_or(CommandError::from_code("INVALID_WORK_PATH"))?
+        .to_owned();
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| CommandError::from_code("FILESYSTEM_ERROR"))?;
+    let restored = state.change_storage_location(&selected, &config_dir)?;
+    Ok(Some(StorageSelection { location, restored }))
 }
 
 #[tauri::command]
@@ -239,8 +275,13 @@ fn representative_asset_ids(
     core_commands::representative_asset_ids(case_id, state)
 }
 
+/// Keep protocol responses bounded. WebView2 commonly asks for `bytes=0-` while loading
+/// metadata; returning the entire source here would synchronously allocate and read a multi-GB
+/// surgical video on the UI thread.
+const MAX_MEDIA_RANGE_BYTES: usize = 4 * 1024 * 1024;
+
 fn media_protocol_response(
-    context: UriSchemeContext<'_, tauri::Wry>,
+    app_handle: &tauri::AppHandle<tauri::Wry>,
     request: http::Request<Vec<u8>>,
 ) -> http::Response<Vec<u8>> {
     let mut segments = request
@@ -256,8 +297,12 @@ fn media_protocol_response(
     ) else {
         return media_error_response(http::StatusCode::BAD_REQUEST);
     };
-    let app_state = context.app_handle().state::<AppState>();
-    let length = match app_state.service.video_asset_size(case_id, asset_id) {
+    let app_state = app_handle.state::<AppState>();
+    let service = match app_state.service() {
+        Ok(service) => service,
+        Err(_) => return media_error_response(http::StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let length = match service.video_asset_size(case_id, asset_id) {
         Ok(length) => length,
         Err(_) => return media_error_response(http::StatusCode::NOT_FOUND),
     };
@@ -265,38 +310,39 @@ fn media_protocol_response(
         .headers()
         .get(http::header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_byte_range(value, length));
+        .and_then(|value| parse_byte_range(value, length))
+        .map(limit_media_range);
     match range {
         Some((start, end)) => {
-            let body = match app_state
-                .service
-                .video_asset_range_bytes(case_id, asset_id, start, end)
-            {
+            let body = match service.video_asset_range_bytes(case_id, asset_id, start, end) {
                 Ok(bytes) => bytes,
                 Err(_) => return media_error_response(http::StatusCode::NOT_FOUND),
             };
-            http::Response::builder()
-                .status(http::StatusCode::PARTIAL_CONTENT)
-                .header(http::header::CONTENT_TYPE, "video/mp4")
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(
-                    http::header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{length}"),
-                )
-                .header(http::header::CONTENT_LENGTH, body.len())
-                .body(body)
-                .expect("valid local media response")
+            partial_media_response(body, start, end, length)
         }
         None if request.headers().contains_key(http::header::RANGE) => {
             media_error_response(http::StatusCode::RANGE_NOT_SATISFIABLE)
         }
-        None => match app_state.service.video_asset_bytes(case_id, asset_id) {
+        None if length > MAX_MEDIA_RANGE_BYTES => {
+            // A range-less request is legal for HTML media. For large sources, answer with the
+            // first bounded partial response so the browser can continue with follow-up ranges.
+            let end = MAX_MEDIA_RANGE_BYTES - 1;
+            match service.video_asset_range_bytes(case_id, asset_id, 0, end) {
+                Ok(bytes) => partial_media_response(bytes, 0, end, length),
+                Err(_) => media_error_response(http::StatusCode::NOT_FOUND),
+            }
+        }
+        None => match service.video_asset_bytes(case_id, asset_id) {
             Ok(bytes) => http::Response::builder()
                 .status(http::StatusCode::OK)
                 .header(http::header::CONTENT_TYPE, "video/mp4")
                 .header(http::header::ACCEPT_RANGES, "bytes")
                 .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(
+                    http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    "Accept-Ranges, Content-Length, Content-Range, Content-Type",
+                )
+                .header(http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Range")
                 .header(http::header::CONTENT_LENGTH, length)
                 .body(bytes)
                 .expect("valid local media response"),
@@ -305,10 +351,37 @@ fn media_protocol_response(
     }
 }
 
+fn partial_media_response(
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
+    length: usize,
+) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::PARTIAL_CONTENT)
+        .header(http::header::CONTENT_TYPE, "video/mp4")
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            "Accept-Ranges, Content-Length, Content-Range, Content-Type",
+        )
+        .header(http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Range")
+        .header(
+            http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}"),
+        )
+        .header(http::header::CONTENT_LENGTH, bytes.len())
+        .body(bytes)
+        .expect("valid local media response")
+}
+
 fn media_error_response(status: http::StatusCode) -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Range")
         .body(b"Local media unavailable".to_vec())
         .expect("valid local media error")
 }
@@ -324,7 +397,9 @@ fn parse_byte_range(value: &str, length: usize) -> Option<(usize, usize)> {
         if suffix == 0 {
             return None;
         }
-        return Some((length.saturating_sub(suffix), length - 1));
+        let start = length.saturating_sub(suffix);
+        let start = start.max(length.saturating_sub(MAX_MEDIA_RANGE_BYTES));
+        return Some((start, length - 1));
     }
     let start = start.parse::<usize>().ok()?;
     if start >= length {
@@ -336,6 +411,11 @@ fn parse_byte_range(value: &str, length: usize) -> Option<(usize, usize)> {
         end.parse::<usize>().ok()?.min(length - 1)
     };
     (end >= start).then_some((start, end))
+}
+
+fn limit_media_range((start, end): (usize, usize)) -> (usize, usize) {
+    let maximum_end = start.saturating_add(MAX_MEDIA_RANGE_BYTES - 1);
+    (start, end.min(maximum_end))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -352,7 +432,12 @@ fn work_root_beside_installation(executable: &Path) -> Option<PathBuf> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .register_uri_scheme_protocol("gwp-media", media_protocol_response)
+        .register_asynchronous_uri_scheme_protocol("gwp-media", |context, request, responder| {
+            let app_handle = context.app_handle().clone();
+            std::thread::spawn(move || {
+                responder.respond(media_protocol_response(&app_handle, request));
+            });
+        })
         .setup(|app| {
             #[cfg(target_os = "windows")]
             let work_root = {
@@ -370,6 +455,8 @@ fn main() {
                 .app_local_data_dir()?
                 .join("projects")
                 .join("PROJECT-LOCAL");
+            let work_root =
+                load_storage_location(&app.path().app_config_dir()?)?.unwrap_or(work_root);
             let service = ProjectService::new(
                 work_root,
                 "PROJECT-LOCAL",
@@ -393,6 +480,7 @@ fn main() {
             install_fixed_label_txt,
             current_fixed_template,
             project_storage_location,
+            choose_storage_location,
             save_confirmed_region,
             update_region_labels,
             refine_region_geometry,
@@ -414,7 +502,12 @@ fn main() {
 mod tests {
     use std::path::Path;
 
-    use super::{parse_byte_range, work_root_beside_installation};
+    use tauri::http;
+
+    use super::{
+        limit_media_range, media_error_response, parse_byte_range, work_root_beside_installation,
+        MAX_MEDIA_RANGE_BYTES,
+    };
 
     #[test]
     fn parses_supported_single_video_byte_ranges() {
@@ -429,11 +522,38 @@ mod tests {
     }
 
     #[test]
+    fn bounds_open_ended_media_ranges_to_a_small_chunk() {
+        let length = 8 * 1024 * 1024 * 1024usize;
+        let requested = parse_byte_range("bytes=0-", length).expect("open range");
+        assert_eq!(limit_media_range(requested), (0, MAX_MEDIA_RANGE_BYTES - 1));
+        let later = limit_media_range((MAX_MEDIA_RANGE_BYTES, length - 1));
+        assert_eq!(
+            later,
+            (MAX_MEDIA_RANGE_BYTES, 2 * MAX_MEDIA_RANGE_BYTES - 1)
+        );
+        let suffix = parse_byte_range("bytes=-100000000", length).expect("suffix range");
+        assert_eq!(suffix, (length - MAX_MEDIA_RANGE_BYTES, length - 1));
+    }
+
+    #[test]
     fn places_project_data_beside_the_installation_directory() {
         let executable = Path::new("/volume/apps/GWP Annotator/gwp-annotator-desktop.exe");
         assert_eq!(
             work_root_beside_installation(executable).as_deref(),
             Some(Path::new("/volume/apps/GWP Annotator Data/PROJECT-LOCAL"))
+        );
+    }
+
+    #[test]
+    fn media_errors_keep_cors_diagnostics_visible_to_webview() {
+        let response = media_error_response(http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
+        assert_eq!(
+            response.headers()[http::header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "Range"
         );
     }
 }

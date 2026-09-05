@@ -13,6 +13,7 @@ import {
   formatVideoTime,
   labelsMeetRequiredFields,
   LEGACY_TEMPLATE_ENCODING_WARNING,
+  mediaSourceUrl,
   polygonArea,
   primaryDrawingButtonIsPressed,
   refinementFailureMessage,
@@ -24,6 +25,7 @@ import {
   templateImportAction,
   type LabelTemplate,
   type PointNorm,
+  type PublicAsset,
   type TemplateField,
 } from "./main";
 import { refinePolygonWithStroke } from "./refinement";
@@ -182,6 +184,7 @@ function mockAppApi(overrides: Record<string, unknown> = {}): Record<string, unk
     }),
     currentLocalDisplayScan: vi.fn().mockResolvedValue({ campuses: [] }),
     projectStorageLocation: vi.fn().mockResolvedValue("D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL"),
+    chooseStorageLocation: vi.fn().mockResolvedValue(null),
     refineRegionGeometry: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
@@ -276,7 +279,7 @@ function installSyntheticMediaDom(): {
 
 function loadedSyntheticAnnotationApi(
   overrides: Record<string, unknown> = {},
-  assets = [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image" as const, size_bytes: 1024 }],
+  assets: PublicAsset[] = [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image", size_bytes: 1024 }],
   template = templateV1,
 ): Record<string, unknown> {
   const scan = {
@@ -457,6 +460,15 @@ describe("video utility", () => {
     expect(formatVideoTime(0)).toBe("00:00");
     expect(formatVideoTime(65.9)).toBe("01:05");
     expect(formatVideoTime(Number.NaN)).toBe("00:00");
+  });
+
+  it("uses the Windows localhost workaround for Tauri media requests", () => {
+    expect(mediaSourceUrl("CASE SYNTHETIC", "ASSET/VIDEO", "windows")).toBe(
+      "http://gwp-media.localhost/video/CASE%20SYNTHETIC/ASSET%2FVIDEO",
+    );
+    expect(mediaSourceUrl("CASE SYNTHETIC", "ASSET/VIDEO", "standard")).toBe(
+      "gwp-media://localhost/video/CASE%20SYNTHETIC/ASSET%2FVIDEO",
+    );
   });
 });
 
@@ -648,6 +660,114 @@ describe("local shell", () => {
     await vi.waitFor(() => expect(document.querySelector('[data-dialog-layer="modal"]')).not.toBeNull());
     expect(document.querySelector('[data-edit-dialog]')?.getAttribute("data-dialog-kind")).toBe("edit-region");
     expect(document.querySelector('[data-edit-dialog]')?.getAttribute("aria-modal")).toBe("true");
+  });
+
+  it("preserves the case-list scroll position while selecting a case", async () => {
+    const cases = Array.from({ length: 30 }, (_, index) => ({
+      case_id: `CASE-SYNTHETIC-${String(index + 1).padStart(2, "0")}`,
+      date: "2026-08-09",
+      assets: [{ asset_id: "ASSET-SYNTHETIC", media_kind: "image" as const, size_bytes: 1024 }],
+    }));
+    const scan = {
+      campuses: [{ campus_code: "CAMPUS-SYNTHETIC", case_count: cases.length, cases }],
+    };
+    const localScan = {
+      campuses: [{
+        campus_code: "CAMPUS-SYNTHETIC",
+        display_name: "合成院区",
+        cases: cases.map((item) => ({
+          case_id: item.case_id,
+          date: item.date,
+          display_label: item.case_id,
+        })),
+      }],
+    };
+    installSyntheticMediaDom();
+    window.__GWP_API__ = mockAppApi({
+      restoreProjectSession: vi.fn().mockResolvedValue({
+        status: "restored",
+        scan,
+        template: templateDescriptor(templateV1, "a".repeat(64)),
+        current_case_id: cases[0].case_id,
+        current_asset_id: "ASSET-SYNTHETIC",
+      }),
+      currentLocalDisplayScan: vi.fn().mockResolvedValue(localScan),
+      representativeAssetIds: vi.fn().mockResolvedValue([]),
+      savedRegionsForAsset: vi.fn().mockResolvedValue([]),
+      readImageAsset: vi.fn().mockResolvedValue({
+        asset_id: "ASSET-SYNTHETIC",
+        mime_type: "image/png",
+        data_base64: "synthetic",
+      }),
+      recordImageDimensions: vi.fn().mockResolvedValue(undefined),
+      saveLastPosition: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.querySelectorAll(".case-item")).toHaveLength(cases.length);
+      expect(document.querySelector('[data-case-id="CASE-SYNTHETIC-01"]')?.classList.contains("selected")).toBe(true);
+    });
+    const caseList = document.querySelector<HTMLElement>(".case-list");
+    expect(caseList).not.toBeNull();
+    if (!caseList) throw new Error("Synthetic case list is unavailable");
+    caseList.scrollTop = 480;
+
+    document.querySelector<HTMLButtonElement>('[data-case-id="CASE-SYNTHETIC-20"]')?.click();
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-case-id="CASE-SYNTHETIC-20"]')?.classList.contains("selected")).toBe(true);
+    });
+    expect(document.querySelector<HTMLElement>(".case-list")?.scrollTop).toBe(480);
+  });
+
+  it("does not rebuild the workbench repeatedly when a video codec fails", async () => {
+    installSyntheticMediaDom();
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({}, [
+      { asset_id: "ASSET-VIDEO-SYNTHETIC", media_kind: "video" as const, size_bytes: 1024 },
+    ]) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLVideoElement>("[data-video-player]")).not.toBeNull();
+    });
+    const video = document.querySelector<HTMLVideoElement>("[data-video-player]");
+    if (!video) throw new Error("Synthetic video element is unavailable");
+    expect(video.getAttribute("crossorigin")).toBe("anonymous");
+
+    video.dispatchEvent(new Event("error"));
+
+    expect(document.querySelector<HTMLVideoElement>("[data-video-player]")).toBe(video);
+    expect(document.querySelector(".notice")?.textContent).toContain("本机无法播放此 MP4 编码");
+    expect(document.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.disabled).toBe(true);
+
+    video.dispatchEvent(new Event("error"));
+    expect(document.querySelector<HTMLVideoElement>("[data-video-player]")).toBe(video);
+  });
+
+  it("re-enables controls when metadata succeeds after a transient media error", async () => {
+    installSyntheticMediaDom();
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({}, [
+      { asset_id: "ASSET-VIDEO-SYNTHETIC", media_kind: "video" as const, size_bytes: 1024 },
+    ]) as never;
+    boot();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLVideoElement>("[data-video-player]")).not.toBeNull();
+    });
+    const video = document.querySelector<HTMLVideoElement>("[data-video-player]");
+    if (!video) throw new Error("Synthetic video element is unavailable");
+    let readyState: number = HTMLMediaElement.HAVE_NOTHING;
+    Object.defineProperty(video, "readyState", { configurable: true, get: () => readyState });
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+
+    video.dispatchEvent(new Event("error"));
+    expect(document.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.disabled).toBe(true);
+    readyState = HTMLMediaElement.HAVE_METADATA;
+    video.dispatchEvent(new Event("loadedmetadata"));
+    expect(document.querySelector<HTMLButtonElement>('[data-action="capture-frame"]')?.disabled).toBe(false);
+    expect(document.querySelector(".notice")?.textContent).toContain("视频已加载");
+    expect(document.querySelector<HTMLButtonElement>('[data-action="video-play"]')?.textContent).toBe("暂停");
   });
 
   it("shows the selected-region refinement entry and source-pixel brush controls", async () => {
@@ -991,6 +1111,82 @@ describe("local shell", () => {
         "D:\\Apps\\GWP Annotator Data\\PROJECT-LOCAL",
       );
     });
+  });
+
+  it("switches storage and clears the previous project when the new directory is empty", async () => {
+    installSyntheticMediaDom();
+    const selection = deferred<unknown>();
+    const chooseStorageLocation = vi.fn().mockReturnValue(selection.promise);
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({ chooseStorageLocation }) as never;
+    boot();
+    await vi.waitFor(() => expect(document.querySelectorAll(".case-item")).toHaveLength(1));
+    document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')?.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.disabled).toBe(false));
+    document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.click();
+    expect(chooseStorageLocation).toHaveBeenCalledOnce();
+    expect(document.querySelector<HTMLButtonElement>('[data-action="choose-root"]')?.disabled).toBe(true);
+    selection.resolve({
+      location: "E:\\标注数据",
+      restored: { status: "no_session", scan: null, template: null, current_case_id: null, current_asset_id: null },
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelector(".storage-location output")?.textContent).toBe("E:\\标注数据");
+      expect(document.querySelectorAll(".case-item")).toHaveLength(0);
+      expect(document.body.textContent).toContain("原目录数据保留");
+      expect(document.body.textContent).not.toContain("当前模板：");
+    });
+  });
+
+  it.each([null, { code: "WORK_ROOT_UNAVAILABLE" }])("keeps the project when storage selection is cancelled or rejected: %s", async (failure) => {
+    installSyntheticMediaDom();
+    const chooseStorageLocation = failure ? vi.fn().mockRejectedValue(failure) : vi.fn().mockResolvedValue(null);
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({ chooseStorageLocation }) as never;
+    boot();
+    await vi.waitFor(() => expect(document.querySelectorAll(".case-item")).toHaveLength(1));
+    document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')?.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.disabled).toBe(false));
+    const location = document.querySelector(".storage-location output")?.textContent;
+    document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.click();
+    await vi.waitFor(() => {
+      expect(chooseStorageLocation).toHaveBeenCalledOnce();
+      expect(document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.disabled).toBe(false);
+    });
+    expect(document.querySelectorAll(".case-item")).toHaveLength(1);
+    expect(document.querySelector(".storage-location output")?.textContent).toBe(location);
+    if (failure) expect(document.body.textContent).toContain("更换保存位置失败");
+  });
+
+  it("disables storage selection while a region has unsaved edits", async () => {
+    await openSyntheticRefinement(loadedRefinementApi());
+    document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')?.click();
+    expect(document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.disabled).toBe(true);
+  });
+
+  it("ignores case navigation that finishes after switching storage", async () => {
+    installSyntheticMediaDom();
+    const previousNavigation = deferred<string[]>();
+    const representativeAssetIds = vi.fn().mockResolvedValueOnce([]).mockReturnValue(previousNavigation.promise);
+    const saveLastPosition = vi.fn().mockResolvedValue(undefined);
+    window.__GWP_API__ = loadedSyntheticAnnotationApi({
+      representativeAssetIds,
+      saveLastPosition,
+      chooseStorageLocation: vi.fn().mockResolvedValue({
+        location: "E:\\WORK-NEW",
+        restored: { status: "no_session", scan: null, template: null, current_case_id: null, current_asset_id: null },
+      }),
+    }) as never;
+    boot();
+    document.querySelector<HTMLButtonElement>('[data-action="storage-location"]')?.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.disabled).toBe(false));
+    document.querySelector<HTMLButtonElement>(".case-item")?.click();
+    expect(representativeAssetIds).toHaveBeenCalledTimes(2);
+    document.querySelector<HTMLButtonElement>('[data-action="choose-storage"]')?.click();
+    await vi.waitFor(() => expect(document.querySelectorAll(".case-item")).toHaveLength(0));
+    previousNavigation.resolve(["ASSET-SYNTHETIC"]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(saveLastPosition).not.toHaveBeenCalled();
+    expect(document.querySelectorAll(".case-item")).toHaveLength(0);
+    expect(document.querySelector(".storage-location output")?.textContent).toBe("E:\\WORK-NEW");
   });
 
   it("reloads project data using the backend-restored case and asset IDs", async () => {

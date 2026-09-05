@@ -2128,10 +2128,11 @@ fn validate_work_root_directory_metadata(metadata: &fs::Metadata) -> CoreResult<
     Ok(())
 }
 
-/// Called only from `Store::open`, which the service invokes after it has checked that the source
-/// root and this work root do not overlap. It is deliberately the first point that may create,
-/// probe, or otherwise mutate the work root.
-fn prepare_work_root_after_overlap_check(requested_work_root: &Path) -> CoreResult<PathBuf> {
+/// Prepares an application-owned directory. Project callers must check source/work overlap first;
+/// the per-user configuration directory also uses this validation without opening a database.
+pub(crate) fn prepare_work_root_after_overlap_check(
+    requested_work_root: &Path,
+) -> CoreResult<PathBuf> {
     validate_existing_work_root_components(requested_work_root)?;
 
     if let Some(storage_parent) = installation_storage_parent(requested_work_root) {
@@ -2278,7 +2279,10 @@ fn probe_work_root_writable(work_root: &Path) -> CoreResult<()> {
     fs::remove_file(&probe).map_err(|_| CoreError::WorkRootUnavailable)
 }
 
-fn read_optional_work_file(work_root: &Path, relative: &Path) -> CoreResult<Option<Vec<u8>>> {
+pub(crate) fn read_optional_work_file(
+    work_root: &Path,
+    relative: &Path,
+) -> CoreResult<Option<Vec<u8>>> {
     if !is_safe_relative_path(relative) {
         return Err(CoreError::InvalidWorkPath);
     }
@@ -2636,7 +2640,7 @@ fn insert_region_operation(
 /// The temporary file is always created in `destination.parent()`, so every replacement stays on
 /// the same volume. Windows requires ReplaceFileW for an atomic overwrite of an existing target;
 /// std::fs::rename does not provide that behavior there.
-fn replace_temp_file(temporary: &Path, destination: &Path) -> CoreResult<()> {
+pub(crate) fn replace_temp_file(temporary: &Path, destination: &Path) -> CoreResult<()> {
     #[cfg(windows)]
     {
         replace_temp_file_windows(temporary, destination)
